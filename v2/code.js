@@ -67,11 +67,191 @@ function serializeNode(node, origin, path) {
   return base;
 }
 
+function escapeHtml(value) {
+  return String(value == null ? "" : value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function cssIdent(value, fallback) {
+  const raw = String(value || fallback || "node")
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return raw || fallback || "node";
+}
+
+function cssNumber(value, fallback) {
+  const n = Number(value);
+  return Number.isFinite(n) ? Number(n.toFixed(2)) : fallback;
+}
+
+function htmlCssNodeLines(node, rootBounds, indexPath, depth) {
+  if (!node || typeof node !== "object") return [];
+  const bounds = node.bounds && typeof node.bounds === "object" ? node.bounds : {};
+  const type = normalizeType(node.type || "");
+  const isText = type === "text";
+  const name = node.name || type || "node";
+  const className = `node-${cssIdent(indexPath || "root", "root")}`;
+  const x = cssNumber(bounds.x, 0);
+  const y = cssNumber(bounds.y, 0);
+  const w = Math.max(1, cssNumber(bounds.width, 1));
+  const h = Math.max(1, cssNumber(bounds.height, 1));
+  const styleParts = [
+    `left:${x}px`,
+    `top:${y}px`,
+    `width:${w}px`,
+    `height:${h}px`,
+    `opacity:${typeof node.opacity === "number" ? node.opacity : 1}`,
+  ];
+  if (isText) {
+    const fs = typeof node.fontSize === "number" ? Math.max(1, cssNumber(node.fontSize, 16)) : Math.max(10, Math.min(48, h * 0.42));
+    styleParts.push(`font-size:${fs}px`, "font-weight:700", "line-height:1.05", "color:#111827", "white-space:pre-wrap");
+  } else {
+    styleParts.push("background:rgba(148,163,184,0.22)", "border:1px solid rgba(15,23,42,0.16)");
+  }
+  const indent = "  ".repeat(depth);
+  const tag = isText ? "div" : "div";
+  const label = isText ? node.characters || "" : "";
+  const children = Array.isArray(node.children) ? node.children : [];
+  const dataAttrs = `data-figma-id="${escapeHtml(node.id || "")}" data-name="${escapeHtml(name)}" data-type="${escapeHtml(type)}"`;
+  const lines = [
+    `${indent}<${tag} class="figma-node ${isText ? "figma-text" : "figma-shape"} ${className}" ${dataAttrs} style="${styleParts.join(";")}">`,
+  ];
+  if (isText) {
+    lines.push(`${indent}  ${escapeHtml(label)}`);
+  }
+  for (let i = 0; i < children.length; i++) {
+    const childPath = indexPath ? `${indexPath}-${i}` : String(i);
+    lines.push(...htmlCssNodeLines(children[i], rootBounds, childPath, depth + 1));
+  }
+  lines.push(`${indent}</${tag}>`);
+  return lines;
+}
+
+function rawJsonToHtmlCss(rawJson, bannerPngBase64, elementAssets) {
+  const bounds = rawJson && rawJson.bounds && typeof rawJson.bounds === "object" ? rawJson.bounds : {};
+  const width = Math.max(1, cssNumber(bounds.width, 1));
+  const height = Math.max(1, cssNumber(bounds.height, 1));
+  const title = escapeHtml(rawJson.name || "Figma export");
+  const children = Array.isArray(rawJson.children) ? rawJson.children : [];
+  const childLines = [];
+  const assets = Array.isArray(elementAssets) ? elementAssets : [];
+  if (bannerPngBase64) {
+    childLines.push(
+      `    <img class="figma-render" alt="${title}" src="data:image/png;base64,${bannerPngBase64}" />`,
+    );
+  }
+  if (assets.length > 0) {
+    for (const asset of assets) {
+      const b = asset.bounds || {};
+      const x = cssNumber(b.x, 0);
+      const y = cssNumber(b.y, 0);
+      const w = Math.max(1, cssNumber(b.width, 1));
+      const h = Math.max(1, cssNumber(b.height, 1));
+      childLines.push(
+        `    <img class="figma-node figma-asset" data-path="${escapeHtml(asset.path || "")}" data-figma-id="${escapeHtml(asset.id || "")}" data-name="${escapeHtml(asset.name || "")}" data-type="${escapeHtml(asset.type || "")}" style="left:${x}px;top:${y}px;width:${w}px;height:${h}px;opacity:${asset.opacity == null ? 1 : asset.opacity}" src="data:image/png;base64,${asset.pngBase64}" alt="${escapeHtml(asset.name || asset.path || "figma element")}" />`,
+      );
+    }
+  } else if (!bannerPngBase64) {
+    for (let i = 0; i < children.length; i++) {
+      childLines.push(...htmlCssNodeLines(children[i], bounds, String(i), 2));
+    }
+  }
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>${title}</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      background: #0f172a;
+      font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    .figma-banner {
+      position: relative;
+      width: ${width}px;
+      height: ${height}px;
+      overflow: hidden;
+      background: #fff;
+    }
+    .figma-node {
+      position: absolute;
+      overflow: hidden;
+    }
+    .figma-text {
+      background: transparent;
+      border: 0;
+      display: flex;
+      align-items: center;
+    }
+    .figma-render {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: fill;
+      display: block;
+      z-index: 0;
+    }
+    .figma-asset {
+      display: block;
+      object-fit: fill;
+      pointer-events: auto;
+      opacity: 0 !important;
+      z-index: 1;
+    }
+    .figma-asset:hover {
+      opacity: 0.18 !important;
+      outline: 1px dashed rgba(255,255,255,0.9);
+    }
+  </style>
+</head>
+<body>
+  <main class="figma-banner" data-figma-id="${escapeHtml(rawJson.id || "")}" data-name="${title}">
+${childLines.join("\n")}
+  </main>
+</body>
+</html>`;
+}
+
 async function exportFramePngBytes(node) {
   return await node.exportAsync({
     format: "PNG",
     constraint: { type: "SCALE", value: 1 }
   });
+}
+
+async function exportElementAssetsForHtml(root, rawJson, maxCount) {
+  const origin = getOrigin(root);
+  const entries = collectLeafElementRefs(root, maxCount);
+  const assets = [];
+  for (const { path, node } of entries) {
+    try {
+      const bytes = await exportFramePngBytes(node);
+      assets.push({
+        path,
+        id: node.id,
+        name: node.name,
+        type: normalizeType(node.type),
+        bounds: absoluteBox(node, origin),
+        opacity: typeof node.opacity === "number" ? Number(node.opacity.toFixed(3)) : 1,
+        pngBase64: uint8ToBase64(bytes),
+      });
+    } catch (e) {
+      console.warn("HTML export: failed exporting element", path, node && node.name, e);
+    }
+  }
+  return assets;
 }
 
 /** Max leaves packed into the element atlas. Keep in sync with backend MAX_ATLAS_REGIONS. */
@@ -565,9 +745,13 @@ function parseTargetSize(value, fallbackFrame) {
   }
   const parts = raw.split(/[,\sx×]+/i).map((part) => Number(part.trim())).filter((n) => Number.isFinite(n) && n > 0);
   if (parts.length < 2) {
-    throw new Error(`Target size must be width,height. Example: 1024,1280 (got ${raw})`);
+    throw new Error(`Target size must be widthxheight. Example: 1024x1280 (got ${raw})`);
   }
   return { width: Math.round(parts[0]), height: Math.round(parts[1]) };
+}
+
+function targetSizeName(targetResolution) {
+  return `${Math.round(targetResolution.width)}x${Math.round(targetResolution.height)}`;
 }
 
 async function callGnnPredict(gnnUrl, rawJson, targetResolution) {
@@ -599,6 +783,45 @@ async function callGnnPredict(gnnUrl, rawJson, targetResolution) {
   return data.predicted_json || data.final_json || data.output_json || data.graph || data;
 }
 
+async function callBannerRawTargetPipeline(backendUrl, bannerPngBase64, rawJson, targetResolution) {
+  const url = String(backendUrl || "").trim().replace(/\/+$/, "");
+  if (!url) throw new Error("Backend URL is empty.");
+  const response = await fetch(url + "/pipeline/banner-raw-to-target-json-json", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      banner_png_base64: bannerPngBase64,
+      raw_json: rawJson,
+      target_width: targetResolution.width,
+      target_height: targetResolution.height,
+      target_resolution: `${targetResolution.width}x${targetResolution.height}`,
+      raw_frame_index: 0,
+      top_k: 3,
+      max_new_tokens: 64,
+    }),
+  });
+  const text = await response.text();
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch (e) {
+    data = null;
+  }
+  if (!response.ok) {
+    const detail =
+      data && data.detail != null
+        ? typeof data.detail === "string"
+          ? data.detail
+          : JSON.stringify(data.detail)
+        : text || `HTTP ${response.status}`;
+    throw new Error(`Pipeline backend failed: ${detail}`);
+  }
+  if (!data || typeof data !== "object" || !data.final_json) {
+    throw new Error("Pipeline backend returned invalid JSON or missing final_json.");
+  }
+  return data;
+}
+
 function resizeNodeIfPossible(node, width, height) {
   if (!node || !("resizeWithoutConstraints" in node)) return;
   try {
@@ -610,6 +833,193 @@ function resizeNodeIfPossible(node, width, height) {
       /* ignore unsupported nodes */
     }
   }
+}
+
+function jsonBounds(item) {
+  const b = item && item.bounds && typeof item.bounds === "object" ? item.bounds : {};
+  return {
+    x: typeof b.x === "number" ? b.x : 0,
+    y: typeof b.y === "number" ? b.y : 0,
+    width: typeof b.width === "number" ? Math.max(1, b.width) : 1,
+    height: typeof b.height === "number" ? Math.max(1, b.height) : 1,
+  };
+}
+
+function figmaNodeTypeFromJson(item, isRoot) {
+  const type = normalizeType(item && item.type ? item.type : "");
+  const hasChildren = Array.isArray(item && item.children) && item.children.length > 0;
+  if (isRoot || hasChildren || type === "frame" || type === "group") return "FRAME";
+  if (type === "text") return "TEXT";
+  return "RECTANGLE";
+}
+
+async function createNodeFromJsonItem(item, parent, parentBounds, isRoot) {
+  if (!item || typeof item !== "object") return null;
+  const bounds = jsonBounds(item);
+  const figmaType = figmaNodeTypeFromJson(item, isRoot);
+  let node;
+
+  if (figmaType === "TEXT") {
+    await figma.loadFontAsync({ family: "Inter", style: "Regular" });
+    node = figma.createText();
+    node.characters = String(item.characters || item.name || "Text");
+    node.fontName = { family: "Inter", style: "Regular" };
+    node.fontSize = typeof item.fontSize === "number" ? Math.max(1, item.fontSize) : 16;
+    node.fills = [{ type: "SOLID", color: { r: 0.05, g: 0.06, b: 0.08 } }];
+  } else if (figmaType === "FRAME") {
+    node = figma.createFrame();
+    node.layoutMode = "NONE";
+    node.clipsContent = false;
+    node.fills = isRoot ? [{ type: "SOLID", color: { r: 1, g: 1, b: 1 } }] : [];
+  } else {
+    node = figma.createRectangle();
+    node.fills = [{ type: "SOLID", color: { r: 0.72, g: 0.78, b: 0.86 }, opacity: 0.28 }];
+    node.strokes = [{ type: "SOLID", color: { r: 0.34, g: 0.45, b: 0.58 } }];
+    node.strokeWeight = 1;
+  }
+
+  node.name = String(item.name || item.type || "json_node");
+  if (!isRoot) {
+    node.x = bounds.x - parentBounds.x;
+    node.y = bounds.y - parentBounds.y;
+  }
+  resizeNodeIfPossible(node, bounds.width, bounds.height);
+  parent.appendChild(node);
+
+  const children = Array.isArray(item.children) ? item.children : [];
+  for (const child of children) {
+    await createNodeFromJsonItem(child, node, bounds, false);
+  }
+  return node;
+}
+
+async function drawJsonTreeBesideSelection(finalJson, sourceFrame, targetResolution) {
+  if (!finalJson || typeof finalJson !== "object") {
+    throw new Error("final_json must be an object.");
+  }
+  const rootBounds = jsonBounds(finalJson);
+  const root = figma.createFrame();
+  root.name = targetSizeName(targetResolution);
+  root.x = sourceFrame.x + sourceFrame.width + 80;
+  root.y = sourceFrame.y;
+  root.layoutMode = "NONE";
+  root.clipsContent = false;
+  root.fills = [{ type: "SOLID", color: { r: 1, g: 1, b: 1 } }];
+  resizeNodeIfPossible(root, rootBounds.width, rootBounds.height);
+  figma.currentPage.appendChild(root);
+
+  const children = Array.isArray(finalJson.children) ? finalJson.children : [];
+  for (const child of children) {
+    await createNodeFromJsonItem(child, root, { x: 0, y: 0, width: rootBounds.width, height: rootBounds.height }, false);
+  }
+  return root;
+}
+
+function sameNumber(a, b, tolerance) {
+  return Math.abs((Number(a) || 0) - (Number(b) || 0)) <= tolerance;
+}
+
+function frameMatchesSize(frame, bounds, tolerance) {
+  if (!frame || !bounds) return false;
+  return sameNumber(frame.width, bounds.width, tolerance) && sameNumber(frame.height, bounds.height, tolerance);
+}
+
+function normalizedName(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function findCandidateFrameInCurrentPage(selectedCandidate, finalJson, selectedFrame) {
+  const candidate = selectedCandidate && typeof selectedCandidate === "object" ? selectedCandidate : {};
+  const candidateId = String(candidate.id || (finalJson && finalJson.id) || "").trim();
+  const candidateName = normalizedName(candidate.name || (finalJson && finalJson.name));
+  const candidateBounds =
+    candidate.bounds && typeof candidate.bounds === "object"
+      ? candidate.bounds
+      : finalJson && finalJson.bounds && typeof finalJson.bounds === "object"
+        ? finalJson.bounds
+        : null;
+
+  if (candidateId) {
+    try {
+      const byId = figma.getNodeById(candidateId);
+      if (byId && byId.type === "FRAME" && byId.id !== selectedFrame.id) {
+        return { frame: byId, reason: "id" };
+      }
+    } catch (e) {
+      console.warn("Candidate lookup by id failed:", candidateId, e);
+    }
+  }
+
+  const frames = figma.currentPage.findAll((node) => node.type === "FRAME" && node.id !== selectedFrame.id);
+  let best = null;
+  let bestScore = -Infinity;
+  for (const frame of frames) {
+    const nameMatch = candidateName && normalizedName(frame.name) === candidateName;
+    const sizeMatch = frameMatchesSize(frame, candidateBounds, 1);
+    if (!nameMatch && !sizeMatch) continue;
+    let score = 0;
+    if (nameMatch) score += 100;
+    if (sizeMatch) score += 50;
+    if (candidateBounds) {
+      score -= Math.abs(frame.width - (Number(candidateBounds.width) || 0)) / 1000;
+      score -= Math.abs(frame.height - (Number(candidateBounds.height) || 0)) / 1000;
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      best = frame;
+    }
+  }
+  return best ? { frame: best, reason: "name/size" } : { frame: null, reason: "not_found" };
+}
+
+function scaleCloneTree(node, sx, sy, isRoot) {
+  if (!node || typeof node !== "object") return 0;
+  let scaled = 0;
+  if (!isRoot) {
+    if (typeof node.x === "number") node.x = node.x * sx;
+    if (typeof node.y === "number") node.y = node.y * sy;
+  }
+  if ("width" in node && "height" in node) {
+    resizeNodeIfPossible(node, node.width * sx, node.height * sy);
+    scaled++;
+  }
+  if ("fontSize" in node && typeof node.fontSize === "number") {
+    try {
+      node.fontSize = Math.max(1, node.fontSize * Math.min(sx, sy));
+    } catch (e) {
+      console.warn("Failed scaling text font size:", node && node.name, e);
+    }
+  }
+  if ("children" in node && Array.isArray(node.children)) {
+    for (const child of node.children) {
+      scaled += scaleCloneTree(child, sx, sy, false);
+    }
+  }
+  return scaled;
+}
+
+function cloneCandidateFrameBesideSelection(candidateFrame, selectedFrame, finalJson, targetResolution) {
+  const clone = candidateFrame.clone();
+  clone.x = selectedFrame.x + selectedFrame.width + 80;
+  clone.y = selectedFrame.y;
+  clone.name = targetSizeName(targetResolution);
+  const targetBounds = jsonBounds(finalJson || {});
+  const sx = targetBounds.width / Math.max(1, candidateFrame.width);
+  const sy = targetBounds.height / Math.max(1, candidateFrame.height);
+  const scaled = scaleCloneTree(clone, sx, sy, true);
+  resizeNodeIfPossible(clone, targetBounds.width, targetBounds.height);
+  figma.currentPage.appendChild(clone);
+  const summary = {
+    applied: scaled,
+    missing: [],
+    scale_x: sx,
+    scale_y: sy,
+    source_width: candidateFrame.width,
+    source_height: candidateFrame.height,
+    target_width: targetBounds.width,
+    target_height: targetBounds.height,
+  };
+  return { clone, summary };
 }
 
 function applyPredictedJsonToClone(predictedJson, convertedFrame) {
@@ -1200,6 +1610,155 @@ function postError(message) {
 }
 
 figma.ui.onmessage = async (msg) => {
+  if (msg.type === "export-selected-frame-html-css") {
+    const selection = figma.currentPage.selection;
+    if (selection.length !== 1 || selection[0].type !== "FRAME") {
+      postError("Select exactly one frame.");
+      figma.ui.postMessage({ type: "html-css-export-result", ok: false });
+      sendSelectionInfo();
+      return;
+    }
+
+    try {
+      const selectedFrame = selection[0];
+      postStatus(`HTML/CSS export: serializing ${selectedFrame.name}...`);
+      const origin = getOrigin(selectedFrame);
+      const rawJson = serializeNode(selectedFrame, origin, "");
+      rawJson.templateId = "figma_plugin_html_css_export";
+      postStatus(`HTML/CSS export: exporting full banner render...`);
+      const bannerPngBytes = await exportFramePngBytes(selectedFrame);
+      const bannerPngBase64 = uint8ToBase64(bannerPngBytes);
+      postStatus(`HTML/CSS export: exporting inspectable element assets...`);
+      const elementAssets = await exportElementAssetsForHtml(
+        selectedFrame,
+        rawJson,
+        MAX_ELEMENT_LAYER_PNGS,
+      );
+      const html = rawJsonToHtmlCss(rawJson, bannerPngBase64, elementAssets);
+      figma.ui.postMessage({
+        type: "html-css-export-result",
+        ok: true,
+        html,
+        fileName: `${selectedFrame.name || "figma-export"}-${Math.round(selectedFrame.width)}x${Math.round(selectedFrame.height)}`,
+      });
+      postStatus(`HTML/CSS export ready (${elementAssets.length} element assets, ${html.length.toLocaleString()} chars).`);
+    } catch (err) {
+      console.error("HTML/CSS export failed:", err);
+      postError(String(err && err.message ? err.message : err));
+      figma.ui.postMessage({ type: "html-css-export-result", ok: false });
+    }
+    return;
+  }
+
+  if (msg.type === "pipeline-target-json-selected-frame") {
+    const selection = figma.currentPage.selection;
+    if (selection.length !== 1 || selection[0].type !== "FRAME") {
+      postError("Select exactly one frame.");
+      sendSelectionInfo();
+      return;
+    }
+
+    const selectedFrame = selection[0];
+    const backendUrl = String(msg.backendUrl || "").trim();
+    if (!backendUrl) {
+      postError("Backend URL is empty.");
+      return;
+    }
+
+    try {
+      const targetResolution = parseTargetSize(msg.targetSize, selectedFrame);
+      postStatus(`Pipeline: stamping original node ids for ${selectedFrame.name}...`);
+      const stampedNodeCount = stampOriginalNodeIds(selectedFrame);
+
+      postStatus("Pipeline: serializing selected Figma design...");
+      const origin = getOrigin(selectedFrame);
+      const rawJson = serializeNode(selectedFrame, origin, "");
+      rawJson.templateId = "figma_plugin_pipeline_source";
+
+      postStatus("Pipeline: exporting banner PNG...");
+      const pngBytes = await exportFramePngBytes(selectedFrame);
+      const pngBase64 = uint8ToBase64(pngBytes);
+
+      postStatus(
+        `Pipeline: calling backend for ${targetResolution.width}×${targetResolution.height} target JSON...`,
+      );
+      const result = await callBannerRawTargetPipeline(
+        backendUrl,
+        pngBase64,
+        rawJson,
+        targetResolution,
+      );
+
+      const selectedGuide = result.selected_candidate || {};
+      postStatus(`Pipeline: finding candidate frame "${selectedGuide.name || "unknown"}" in current page...`);
+      const lookup = findCandidateFrameInCurrentPage(selectedGuide, result.final_json, selectedFrame);
+      let convertedFrame;
+      let drawMode;
+      let applySummary = null;
+      if (lookup.frame) {
+        postStatus(`Pipeline: cloning matched candidate frame (${lookup.reason}) and scaling to target size...`);
+        const cloned = cloneCandidateFrameBesideSelection(
+          lookup.frame,
+          selectedFrame,
+          result.final_json,
+          targetResolution,
+        );
+        convertedFrame = cloned.clone;
+        applySummary = cloned.summary;
+        drawMode = "clone_matched_candidate_frame_scaled";
+      } else {
+        postStatus("Pipeline: candidate frame not found in current page; drawing returned JSON fallback...");
+        convertedFrame = await drawJsonTreeBesideSelection(result.final_json, selectedFrame, targetResolution);
+        drawMode = "create_from_returned_json_fallback";
+      }
+
+      figma.currentPage.selection = [convertedFrame];
+      figma.viewport.scrollAndZoomIntoView([selectedFrame, convertedFrame]);
+
+      figma.notify(
+        `Target clone created.\n` +
+          `Qwen class: ${result.category}\n` +
+          `Guide: ${selectedGuide.name || "unknown"}\n` +
+          `Mode: ${drawMode}\n` +
+          `Selected stamped nodes: ${stampedNodeCount}\n` +
+          (applySummary
+            ? `Scaled candidate nodes: ${applySummary.applied}\nScale: ${applySummary.scale_x.toFixed(3)} × ${applySummary.scale_y.toFixed(3)}`
+            : `Fallback drawn from JSON`),
+        { timeout: 8 },
+      );
+
+      figma.ui.postMessage({
+        type: "zone-classify-result",
+        ok: true,
+        result: {
+          pipeline: "banner_raw_to_target_json",
+          category: result.category,
+          selected_candidate: result.selected_candidate,
+          target_width: result.target_width,
+          target_height: result.target_height,
+          draw_mode: drawMode,
+          apply_summary: applySummary,
+        },
+      });
+      figma.ui.postMessage({ type: "done" });
+      sendSelectionInfo();
+    } catch (err) {
+      console.error("Pipeline target JSON failed:", err);
+      var pipelineMsg =
+        err && err.stack
+          ? err.message + "\n\n" + err.stack
+          : String(err && err.message ? err.message : err);
+      if (err && err.message === "Failed to fetch") {
+        pipelineMsg +=
+          "\n\nFigma only allows requests to origins listed in manifest.json networkAccess.devAllowedDomains. " +
+          "Make sure Backend URL exactly matches the manifest, then reload the development plugin.";
+      }
+      postError(pipelineMsg);
+      sendSelectionInfo();
+    }
+    return;
+  }
+
   if (msg.type === "classify-zone-selected-frame") {
     const selection = figma.currentPage.selection;
     const selectedFrames = selection.filter((node) => node && node.type === "FRAME");

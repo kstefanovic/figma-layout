@@ -39,9 +39,9 @@ def parse_aspect_ratio(value: str | float | int) -> float:
         if ":" in s:
             left, right = s.split(":", 1)
             ratio = float(left.strip()) / float(right.strip())
-        elif "x" in s:
-            left, right = s.split("x", 1)
-            ratio = float(left.strip()) / float(right.strip())
+        elif re.search(r"\d\s*[x×*,\s]\s*\d", s):
+            left, right = _split_resolution_parts(s)
+            ratio = left / right
         elif "/" in s:
             left, right = s.split("/", 1)
             ratio = float(left.strip()) / float(right.strip())
@@ -53,14 +53,18 @@ def parse_aspect_ratio(value: str | float | int) -> float:
     return ratio
 
 
+def _split_resolution_parts(value: str) -> tuple[float, float]:
+    parts = [p for p in re.split(r"\s*(?:x|×|\*|,|\s+)\s*", value.strip().lower()) if p]
+    if len(parts) != 2:
+        raise ValueError(f"target resolution must be WIDTHxHEIGHT, got {value!r}")
+    width = float(parts[0])
+    height = float(parts[1])
+    return width, height
+
+
 def parse_resolution(value: str) -> tuple[float, float]:
-    """Parse target resolution like '2280x360' into (width, height)."""
-    s = value.strip().lower()
-    if "x" not in s:
-        raise ValueError("target resolution must use WIDTHxHEIGHT, for example 2280x360")
-    left, right = s.split("x", 1)
-    width = float(left.strip())
-    height = float(right.strip())
+    """Parse target resolution like '2280x360', '600*300', '600,300'."""
+    width, height = _split_resolution_parts(value)
     if not math.isfinite(width) or not math.isfinite(height) or width <= 0 or height <= 0:
         raise ValueError(f"target resolution must be positive finite WIDTHxHEIGHT, got {value!r}")
     return width, height
@@ -279,10 +283,17 @@ def load_class_index(class_number: int, out_dir: Path = EMBEDDING_DIR) -> dict[s
         return json.load(f)
 
 
+def _resolution_from_query(value: str | float | int) -> tuple[float | None, float | None]:
+    if isinstance(value, str) and re.search(r"\d\s*[x×*,\s]\s*\d", value.strip().lower()):
+        return parse_resolution(value)
+    return None, None
+
+
 def search_index(class_number: int, aspect_ratio: str | float | int, top_k: int = 3, out_dir: Path = EMBEDDING_DIR) -> list[dict[str, Any]]:
     index = load_class_index(class_number, out_dir=out_dir)
     query = aspect_query_embedding(aspect_ratio)
     target_aspect = parse_aspect_ratio(aspect_ratio)
+    target_width, target_height = _resolution_from_query(aspect_ratio)
 
     scored: list[dict[str, Any]] = []
     for item in index.get("items", []):
@@ -290,17 +301,34 @@ def search_index(class_number: int, aspect_ratio: str | float | int, top_k: int 
         meta = item.get("meta", {})
         if not isinstance(emb, list):
             continue
+        bounds = meta.get("bounds") if isinstance(meta.get("bounds"), dict) else {}
+        width = bounds.get("width") if isinstance(bounds, dict) else None
+        height = bounds.get("height") if isinstance(bounds, dict) else None
         aspect = meta.get("aspect_ratio")
         aspect_error = abs(math.log((aspect or 1.0) / target_aspect)) if aspect else float("inf")
+        if (
+            target_width
+            and target_height
+            and isinstance(width, int | float)
+            and isinstance(height, int | float)
+            and width > 0
+            and height > 0
+        ):
+            width_error = abs(math.log(width / target_width))
+            height_error = abs(math.log(height / target_height))
+            resolution_error = math.sqrt(width_error * width_error + height_error * height_error)
+        else:
+            resolution_error = 0.0
         score = cosine(query, emb)
-        # Aspect ratio is the user's retrieval input, so combine vector similarity
-        # with an explicit aspect-distance penalty.
-        final_score = score - min(aspect_error, 10.0) * 0.35
+        # Prefer exact/near target resolution first, while keeping aspect and
+        # embedding similarity as secondary signals.
+        final_score = score - min(resolution_error, 10.0) * 1.15 - min(aspect_error, 10.0) * 0.45
         row = {
             **meta,
             "score": final_score,
             "embedding_score": score,
             "aspect_error": aspect_error,
+            "resolution_error": resolution_error,
         }
         scored.append(row)
 
@@ -378,6 +406,63 @@ def resize_figma_json_to_resolution(node: dict[str, Any], target_width: float, t
         out["bounds"]["y"] = 0
         out["bounds"]["width"] = target_width
         out["bounds"]["height"] = target_height
+    return out
+
+
+def _path_map(root: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    mapping: dict[str, dict[str, Any]] = {}
+
+    def walk(node: Any, path: str) -> None:
+        if not isinstance(node, dict):
+            return
+        mapping[path] = node
+        for index, child in enumerate(node.get("children") or []):
+            child_path = f"{path}/{index}" if path else str(index)
+            walk(child, child_path)
+
+    walk(root, "")
+    return mapping
+
+
+def resize_source_json_using_guide(
+    source_frame: dict[str, Any],
+    guide_frame: dict[str, Any],
+    target_width: float,
+    target_height: float,
+) -> dict[str, Any]:
+    """
+    Return a target JSON whose geometry is proportional to the selected best
+    candidate. Source ids/path/text are overlaid by matching tree position so a
+    Figma plugin clone of the source frame can still resolve nodes by id/path.
+    """
+    out = resize_figma_json_to_resolution(guide_frame, target_width, target_height)
+    source_by_path = _path_map(source_frame)
+
+    def walk(node: Any, path: str) -> None:
+        if not isinstance(node, dict):
+            return
+        source_node = source_by_path.get(path)
+        if isinstance(source_node, dict):
+            # Keep candidate-proportional geometry/name, but make ids/paths/text
+            # correspond to the selected source frame for plugin application.
+            if "id" in source_node:
+                node["id"] = source_node["id"]
+            if "path" in source_node:
+                node["path"] = source_node["path"]
+            elif path:
+                node["path"] = path
+            if "characters" in source_node:
+                node["characters"] = source_node["characters"]
+            for key in ("fontSize", "fontName", "textAlignHorizontal", "textAlignVertical"):
+                if key in source_node:
+                    node[key] = source_node[key]
+        elif path:
+            node["path"] = path
+        for index, child in enumerate(node.get("children") or []):
+            child_path = f"{path}/{index}" if path else str(index)
+            walk(child, child_path)
+
+    walk(out, "")
     return out
 
 

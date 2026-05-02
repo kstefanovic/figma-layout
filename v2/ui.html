@@ -75,6 +75,14 @@
       #classify-zone-btn:hover {
         background: #6d28d9;
       }
+
+      #html-export-btn {
+        background: #059669;
+      }
+
+      #copy-html-btn {
+        background: #475569;
+      }
     </style>
   </head>
   <body>
@@ -85,7 +93,7 @@
 
     <div class="row">
       <label for="backend-url">Backend URL</label>
-      <input id="backend-url" value="http://localhost:40039" />
+      <input id="backend-url" value="http://localhost:9298" />
     </div>
 
     <div class="row">
@@ -94,17 +102,39 @@
     </div>
 
     <div class="row">
-      <label for="target-size">Target Size (width,height)</label>
-      <input id="target-size" value="1024,1280" placeholder="1024,1280" />
+      <label for="target-size">Target Size (widthxheight)</label>
+      <input id="target-size" value="1024x1280" placeholder="1024x1280" />
     </div>
 
     <div class="row">
-      <button id="convert-btn">Convert Selected Frame</button>
+      <button id="pipeline-btn">Generate Target JSON + Draw Clone</button>
+    </div>
+
+    <div class="row">
+      <button id="convert-btn" type="button" style="background:#64748b">
+        Legacy Convert Selected Frame
+      </button>
     </div>
 
     <div class="row">
       <button id="classify-zone-btn" type="button" style="background: #7c3aed">
         Zone + text zones (v2 JSON)
+      </button>
+    </div>
+
+    <div class="row">
+      <button id="html-export-btn" type="button">
+        JSON to HTML/CSS Exporter
+      </button>
+    </div>
+
+    <div class="row">
+      <label>HTML/CSS export</label>
+      <textarea id="html-export-result" class="zone-result readonly" readonly>
+Select one frame, then click “JSON to HTML/CSS Exporter”.
+      </textarea>
+      <button id="copy-html-btn" type="button" style="margin-top: 8px">
+        Copy HTML/CSS
       </button>
     </div>
 
@@ -121,8 +151,12 @@
 
     <script>
       const statusEl = document.getElementById("status");
+      const pipelineBtn = document.getElementById("pipeline-btn");
       const convertBtn = document.getElementById("convert-btn");
       const classifyZoneBtn = document.getElementById("classify-zone-btn");
+      const htmlExportBtn = document.getElementById("html-export-btn");
+      const htmlExportResultEl = document.getElementById("html-export-result");
+      const copyHtmlBtn = document.getElementById("copy-html-btn");
       const zoneResultEl = document.getElementById("zone-result");
       const selectedFrameEl = document.getElementById("selected-frame");
 
@@ -153,11 +187,77 @@
         zoneResultEl.textContent = text;
       }
 
+      function setHtmlExportResult(text) {
+        htmlExportResultEl.value = text;
+      }
+
+      function safeFileName(value) {
+        return String(value || "figma-export")
+          .trim()
+          .replace(/[^a-zA-Z0-9._-]+/g, "-")
+          .replace(/^-+|-+$/g, "")
+          .slice(0, 80) || "figma-export";
+      }
+
+      function downloadTextFile(filename, text, mimeType) {
+        const blob = new Blob([text], { type: mimeType || "text/plain;charset=utf-8" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      }
+
+      function normalizeTargetSizeText(value) {
+        const raw = String(value || "").trim();
+        const parts = raw
+          .split(/[,\sx×]+/i)
+          .map((part) => part.trim())
+          .filter(Boolean);
+        if (parts.length >= 2 && /^\d+(\.\d+)?$/.test(parts[0]) && /^\d+(\.\d+)?$/.test(parts[1])) {
+          return `${Math.round(Number(parts[0]))}x${Math.round(Number(parts[1]))}`;
+        }
+        return raw;
+      }
+
+      const targetSizeEl = document.getElementById("target-size");
+      targetSizeEl.value = normalizeTargetSizeText(targetSizeEl.value || "1024x1280");
+      targetSizeEl.addEventListener("input", () => {
+        if (targetSizeEl.value.includes(",")) {
+          targetSizeEl.value = normalizeTargetSizeText(targetSizeEl.value);
+        }
+      });
+      targetSizeEl.addEventListener("blur", () => {
+        targetSizeEl.value = normalizeTargetSizeText(targetSizeEl.value);
+      });
+
+      pipelineBtn.onclick = () => {
+        const backendUrl = document.getElementById("backend-url").value.trim();
+        const targetSize = normalizeTargetSizeText(document.getElementById("target-size").value);
+        document.getElementById("target-size").value = targetSize;
+
+        setStatus("Preparing pipeline request...");
+
+        parent.postMessage(
+          {
+            pluginMessage: {
+              type: "pipeline-target-json-selected-frame",
+              backendUrl,
+              targetSize
+            }
+          },
+          "*"
+        );
+      };
+
       convertBtn.onclick = () => {
         const backendUrl = document.getElementById("backend-url").value.trim();
-        const targetPreset = document.getElementById("target-size").value.trim();
+        const targetPreset = normalizeTargetSizeText(document.getElementById("target-size").value);
+        document.getElementById("target-size").value = targetPreset;
         const convertMode = "apply_to_clone_fast";
-
         setStatus("Preparing request...");
 
         parent.postMessage(
@@ -176,7 +276,8 @@
       classifyZoneBtn.onclick = () => {
         const backendUrl = document.getElementById("backend-url").value.trim();
         const gnnUrl = document.getElementById("gnn-url").value.trim();
-        const targetSize = document.getElementById("target-size").value.trim();
+        const targetSize = normalizeTargetSizeText(document.getElementById("target-size").value);
+        document.getElementById("target-size").value = targetSize;
         setStatus("Zone + text zones (v2): exporting frame…");
         setZoneResult("…");
         parent.postMessage(
@@ -192,6 +293,35 @@
         );
       };
 
+      htmlExportBtn.onclick = () => {
+        setStatus("Exporting selected frame JSON to HTML/CSS...");
+        setHtmlExportResult("...");
+        parent.postMessage(
+          {
+            pluginMessage: {
+              type: "export-selected-frame-html-css"
+            }
+          },
+          "*"
+        );
+      };
+
+      copyHtmlBtn.onclick = async () => {
+        const text = htmlExportResultEl.value || "";
+        if (!text.trim()) {
+          setStatus("Nothing to copy.");
+          return;
+        }
+        try {
+          await navigator.clipboard.writeText(text);
+          setStatus("HTML/CSS copied to clipboard.");
+        } catch (_e) {
+          htmlExportResultEl.select();
+          document.execCommand("copy");
+          setStatus("HTML/CSS selected/copied.");
+        }
+      };
+
       window.onmessage = (event) => {
         const msg = event.data.pluginMessage;
         if (!msg) return;
@@ -204,6 +334,15 @@
           setStatus("Done.");
         } else if (msg.type === "selection-info") {
           setSelectedFrameInfo(msg.selection);
+        } else if (msg.type === "html-css-export-result") {
+          if (!msg.ok) {
+            setHtmlExportResult("Export failed. See status above.");
+            return;
+          }
+          const html = msg.html || "";
+          setHtmlExportResult(html);
+          downloadTextFile(`${safeFileName(msg.fileName)}.html`, html, "text/html;charset=utf-8");
+          setStatus(`HTML/CSS file exported: ${safeFileName(msg.fileName)}.html`);
         } else if (msg.type === "zone-classify-result") {
           if (!msg.ok || !msg.result) {
             setZoneResult("Request failed. See status above.");

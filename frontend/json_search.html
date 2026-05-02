@@ -224,7 +224,8 @@
             <h2>Candidate #${i + 1} ${escapeHtml(row.name || "(no name)")}</h2>
             <div class="meta">
               source: ${escapeHtml(row.source_file)} · frame_index: ${row.frame_index}<br>
-              aspect: ${fmt(row.aspect_ratio)} · score: ${fmt(row.score)} · aspect_error: ${fmt(row.aspect_error)}<br>
+              aspect: ${fmt(row.aspect_ratio)} · score: ${fmt(row.score)}<br>
+              aspect_error: ${fmt(row.aspect_error)} · resolution_error: ${fmt(row.resolution_error)}<br>
               raw_similarity: ${fmt(row.raw_similarity)} · selection_score: ${fmt(row.selection_score)}<br>
               id: ${escapeHtml(row.id || "")} · type: ${escapeHtml(row.type || "")} · leaves: ${row.leaf_count}
             </div>

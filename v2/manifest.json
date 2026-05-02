@@ -8,8 +8,9 @@
   "networkAccess": {
     "allowedDomains": ["https://theye-inference.onrender.com"],
     "devAllowedDomains": [
-      "http://localhost:40039",
-      "http://localhost:8000"
+      "http://localhost:9298",
+      "http://127.0.0.1:9298",
+      "http://213.184.224.88:9298"
     ]
   }
 }

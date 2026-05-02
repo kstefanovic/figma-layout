@@ -1,4 +1,5 @@
 import base64
+import binascii
 import json
 import os
 import re
@@ -29,10 +30,8 @@ from json_embedding import (
     build_all_indexes,
     parse_aspect_ratio,
     parse_resolution,
-    rerank_candidates_by_raw_similarity,
     resize_figma_json_to_resolution,
     search_index,
-    select_frame,
 )
 
 
@@ -152,6 +151,7 @@ class JsonEmbeddingCandidate(BaseModel):
     score: float
     embedding_score: float
     aspect_error: float
+    resolution_error: float | None = None
     raw_similarity: float | None = None
     selection_score: float | None = None
     full_json: dict[str, Any] | None = None
@@ -182,6 +182,17 @@ class BannerRawToTargetJsonResponse(BaseModel):
     selected_candidate: JsonEmbeddingCandidate
     candidates: list[JsonEmbeddingCandidate]
     final_json: dict[str, Any]
+
+
+class BannerRawToTargetJsonJsonRequest(BaseModel):
+    banner_png_base64: str
+    raw_json: Any
+    target_resolution: str | None = None
+    target_width: float | None = None
+    target_height: float | None = None
+    raw_frame_index: int = Field(default=0, ge=0)
+    top_k: int = Field(default=3, ge=1, le=20)
+    max_new_tokens: int = Field(default=64, ge=8, le=512)
 
 
 app = FastAPI(title="Public Qwen2.5-VL Backend")
@@ -249,6 +260,13 @@ def _data_uri(content: bytes, content_type: str | None) -> str:
     mime_type = content_type or "application/octet-stream"
     encoded = base64.b64encode(content).decode("ascii")
     return f"data:{mime_type};base64,{encoded}"
+
+
+def _decode_base64_bytes(value: str, field_name: str) -> bytes:
+    try:
+        return base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"{field_name} is not valid base64") from exc
 
 
 def _is_png(data: bytes, content_type: str | None) -> bool:
@@ -333,6 +351,49 @@ def _classify_banner_bytes(body: bytes, content_type: str | None, max_new_tokens
     return category, raw
 
 
+def _run_banner_raw_to_target_pipeline(
+    *,
+    banner_body: bytes,
+    banner_content_type: str | None,
+    uploaded_raw: Any,
+    target_resolution: str,
+    raw_frame_index: int,
+    top_k: int,
+    max_new_tokens: int,
+) -> BannerRawToTargetJsonResponse:
+    category, raw_model_text = _classify_banner_bytes(
+        banner_body, banner_content_type, max_new_tokens=max_new_tokens
+    )
+    try:
+        target_width, target_height = parse_resolution(target_resolution)
+        parsed_aspect = target_width / target_height
+        retrieved = attach_full_json(search_index(category, target_resolution, top_k=top_k))
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if not retrieved:
+        raise HTTPException(status_code=404, detail="No retrievable candidates found.")
+
+    selected = retrieved[0]
+    selected_json = selected.get("full_json")
+    if not isinstance(selected_json, dict):
+        raise HTTPException(status_code=500, detail="Selected candidate does not include full_json.")
+
+    final_json = resize_figma_json_to_resolution(selected_json, target_width, target_height)
+
+    return BannerRawToTargetJsonResponse(
+        category=category,
+        raw_model_text=raw_model_text[:2000],
+        target_width=target_width,
+        target_height=target_height,
+        aspect_ratio=parsed_aspect,
+        top_k=top_k,
+        selected_candidate=JsonEmbeddingCandidate(**selected),
+        candidates=[JsonEmbeddingCandidate(**row) for row in retrieved],
+        final_json=final_json,
+    )
+
+
 @app.get("/health")
 def health() -> dict[str, Any]:
     try:
@@ -391,7 +452,7 @@ def search_json_embeddings(
         raise HTTPException(status_code=400, detail=f"class_number must be one of {sorted(VALID_CLASSES)}")
     try:
         parsed_aspect = parse_aspect_ratio(aspect_ratio)
-        results = search_index(class_number, parsed_aspect, top_k=top_k)
+        results = search_index(class_number, aspect_ratio, top_k=top_k)
         if include_full_json:
             results = attach_full_json(results)
     except (FileNotFoundError, ValueError) as exc:
@@ -419,7 +480,7 @@ async def classify_banner_then_search_json(
 
     try:
         parsed_aspect = parse_aspect_ratio(target_resolution)
-        results = search_index(category, parsed_aspect, top_k=top_k)
+        results = search_index(category, target_resolution, top_k=top_k)
         if include_full_json:
             results = attach_full_json(results)
     except (FileNotFoundError, ValueError) as exc:
@@ -451,10 +512,6 @@ async def banner_raw_to_target_json(
     4. Use the selected candidate as the layout guide and resize its bboxes to target resolution.
     """
     banner_body = await file.read()
-    category, raw_model_text = _classify_banner_bytes(
-        banner_body, file.content_type, max_new_tokens=max_new_tokens
-    )
-
     raw_bytes = await raw_json.read()
     if len(raw_bytes) > FIGMA_MAX_JSON_BYTES:
         raise HTTPException(
@@ -463,34 +520,38 @@ async def banner_raw_to_target_json(
         )
     try:
         uploaded_raw = json.loads(raw_bytes.decode("utf-8"))
-        uploaded_frame = select_frame(uploaded_raw, raw_frame_index)
-        target_width, target_height = parse_resolution(target_resolution)
-        parsed_aspect = target_width / target_height
-        retrieved = attach_full_json(search_index(category, parsed_aspect, top_k=top_k))
-        ranked = rerank_candidates_by_raw_similarity(uploaded_frame, retrieved)
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, FileNotFoundError) as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    if not ranked:
-        raise HTTPException(status_code=404, detail="No retrievable candidates found.")
-
-    selected = ranked[0]
-    selected_json = selected.get("full_json")
-    if not isinstance(selected_json, dict):
-        raise HTTPException(status_code=500, detail="Selected candidate does not include full_json.")
-
-    final_json = resize_figma_json_to_resolution(selected_json, target_width, target_height)
-
-    return BannerRawToTargetJsonResponse(
-        category=category,
-        raw_model_text=raw_model_text[:2000],
-        target_width=target_width,
-        target_height=target_height,
-        aspect_ratio=parsed_aspect,
+    return _run_banner_raw_to_target_pipeline(
+        banner_body=banner_body,
+        banner_content_type=file.content_type,
+        uploaded_raw=uploaded_raw,
+        target_resolution=target_resolution,
+        raw_frame_index=raw_frame_index,
         top_k=top_k,
-        selected_candidate=JsonEmbeddingCandidate(**selected),
-        candidates=[JsonEmbeddingCandidate(**row) for row in ranked],
-        final_json=final_json,
+        max_new_tokens=max_new_tokens,
+    )
+
+
+@app.post("/pipeline/banner-raw-to-target-json-json", response_model=BannerRawToTargetJsonResponse)
+def banner_raw_to_target_json_json(request: BannerRawToTargetJsonJsonRequest) -> BannerRawToTargetJsonResponse:
+    target_resolution = request.target_resolution
+    if not target_resolution:
+        if not request.target_width or not request.target_height:
+            raise HTTPException(
+                status_code=400,
+                detail="Provide target_resolution or both target_width and target_height.",
+            )
+        target_resolution = f"{request.target_width}x{request.target_height}"
+    banner_body = _decode_base64_bytes(request.banner_png_base64, "banner_png_base64")
+    return _run_banner_raw_to_target_pipeline(
+        banner_body=banner_body,
+        banner_content_type="image/png",
+        uploaded_raw=request.raw_json,
+        target_resolution=target_resolution,
+        raw_frame_index=request.raw_frame_index,
+        top_k=request.top_k,
+        max_new_tokens=request.max_new_tokens,
     )
 
 
