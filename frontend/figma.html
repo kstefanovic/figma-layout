@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Figma banner → semantic mid JSON</title>
+  <title>Figma → semantic JSON</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,600;0,9..40,700&family=Fraunces:opsz,wght@9..144,600&display=swap" rel="stylesheet" />
@@ -212,12 +212,16 @@
 </head>
 <body>
   <main>
-    <nav class="topnav"><a href="/">← Image description</a></nav>
-    <h1>Figma banner + raw JSON → semantic mid JSON</h1>
+    <nav class="topnav">
+      <a href="/">← Image description</a>
+      <a href="/banner_category.html">Banner category (1–4)</a>
+      <a href="/json_search.html">JSON embedding search</a>
+    </nav>
+    <h1>Figma → semantic JSON (one Qwen pass)</h1>
     <p class="sub">
-      Upload the <strong>banner</strong> (full frame), the <strong>raw layout JSON</strong>, and a <strong>grid PNG</strong> where each cell shows
-      an element thumbnail and its <strong>id</strong>. The server sends <strong>banner first, grid second</strong> to Qwen together with leaf-node JSON
-      (bbox + ids). Use <strong>frame index</strong> for the correct top-level frame (e.g. <code>0</code> for <code>DOOH_1080x1920</code>).
+      Upload the <strong>full banner</strong>, the <strong>raw Figma JSON</strong>, and a <strong>grid PNG</strong> (each cell = element + raw <code>id</code>).
+      The backend sends <strong>banner → grid → instructions + full raw JSON</strong> to Qwen. The model returns <strong>only</strong> the rewritten JSON:
+      semantic <code>name</code> values, wrappers collapsed where appropriate, same ids/types/bounds/geometry rules as in the prompt (no separate mid-JSON step).
     </p>
 
     <div class="card">
@@ -248,37 +252,23 @@
         </div>
       </div>
 
-      <div class="params-grid">
+      <div class="params-grid" style="grid-template-columns: 1fr; max-width: 14rem;">
         <div class="param-field">
-          <span class="plabel" id="lbl-frame">Frame index</span>
-          <input type="number" id="frame-index" min="0" value="0" aria-labelledby="lbl-frame" />
-        </div>
-        <div class="param-field">
-          <span class="plabel" id="lbl-chunk">Nodes per model call</span>
-          <input type="number" id="chunk-size" min="5" max="80" value="40" aria-labelledby="lbl-chunk" />
-        </div>
-        <div class="param-field">
-          <span class="plabel" id="lbl-tokens">Max new tokens</span>
-          <input type="number" id="max-tokens" min="256" max="4096" value="3072" aria-labelledby="lbl-tokens" />
+          <span class="plabel" id="lbl-tokens">Max new tokens (model cap 4096)</span>
+          <input type="number" id="max-tokens" min="256" max="4096" value="4096" aria-labelledby="lbl-tokens" />
         </div>
       </div>
 
-      <button type="button" class="primary" id="go" disabled>Run Qwen naming</button>
+      <button type="button" class="primary" id="go" disabled>Convert with Qwen</button>
       <div class="status" id="busy"></div>
       <p class="meta" id="meta" hidden></p>
       <div id="warnings" hidden class="warn"></div>
     </div>
 
-    <div class="card" id="out-mid" hidden>
-      <h2>Mid JSON (leaf nodes, original names)</h2>
-      <button type="button" class="ghost" id="dl-mid">Download mid.json</button>
-      <textarea class="out" id="ta-mid" readonly></textarea>
-    </div>
-
-    <div class="card" id="out-sem" hidden>
-      <h2>Semantic mid JSON</h2>
-      <button type="button" class="ghost" id="dl-sem">Download semantic_mid.json</button>
-      <textarea class="out" id="ta-sem" readonly></textarea>
+    <div class="card" id="out-wrap" hidden>
+      <h2>Semantic Figma JSON</h2>
+      <button type="button" class="ghost" id="dl-out">Download semantic_figma.json</button>
+      <textarea class="out" id="ta-out" readonly></textarea>
     </div>
   </main>
   <script>
@@ -293,18 +283,12 @@
     const busy = document.getElementById("busy");
     const meta = document.getElementById("meta");
     const warnings = document.getElementById("warnings");
-    const frameIndex = document.getElementById("frame-index");
-    const chunkSize = document.getElementById("chunk-size");
     const maxTokens = document.getElementById("max-tokens");
-    const outMid = document.getElementById("out-mid");
-    const outSem = document.getElementById("out-sem");
-    const taMid = document.getElementById("ta-mid");
-    const taSem = document.getElementById("ta-sem");
-    const dlMid = document.getElementById("dl-mid");
-    const dlSem = document.getElementById("dl-sem");
+    const outWrap = document.getElementById("out-wrap");
+    const taOut = document.getElementById("ta-out");
+    const dlOut = document.getElementById("dl-out");
 
-    let lastMid = "";
-    let lastSem = "";
+    let lastOut = "";
 
     const imgOk = (f) =>
       f && (/^image\/(png|jpeg|webp)$/i.test(f.type) || /\.(png|jpe?g|webp)$/i.test(f.name || ""));
@@ -376,8 +360,7 @@
       a.click();
       URL.revokeObjectURL(a.href);
     }
-    dlMid.addEventListener("click", () => download("mid.json", lastMid));
-    dlSem.addEventListener("click", () => download("semantic_mid.json", lastSem));
+    dlOut.addEventListener("click", () => download("semantic_figma.json", lastOut));
 
     go.addEventListener("click", async () => {
       const b = bannerInput.files?.[0];
@@ -385,31 +368,24 @@
       const g = gridInput.files?.[0];
       if (!b || !j || !g) return;
 
-      const fi = Math.max(0, parseInt(String(frameIndex.value), 10) || 0);
-      frameIndex.value = String(fi);
-      const cs = Math.min(80, Math.max(5, parseInt(String(chunkSize.value), 10) || 40));
-      chunkSize.value = String(cs);
-      const mt = Math.min(4096, Math.max(256, parseInt(String(maxTokens.value), 10) || 3072));
+      const mt = Math.min(4096, Math.max(256, parseInt(String(maxTokens.value), 10) || 4096));
       maxTokens.value = String(mt);
 
       go.disabled = true;
       busy.className = "status";
-      busy.textContent = "Calling backend (may take a while for many chunks)…";
+      busy.textContent = "Calling Qwen (full JSON in one request — can take several minutes)…";
       meta.hidden = true;
       warnings.hidden = true;
-      outMid.hidden = true;
-      outSem.hidden = true;
+      outWrap.hidden = true;
 
       const fd = new FormData();
       fd.append("banner", b, b.name);
       fd.append("raw_json", j, j.name);
       fd.append("grid", g, g.name);
-      fd.append("frame_index", String(fi));
-      fd.append("chunk_size", String(cs));
       fd.append("max_new_tokens", String(mt));
 
       try {
-        const res = await fetch(API + "/figma/semantic-mid-json", { method: "POST", body: fd });
+        const res = await fetch(API + "/figma/convert-semantic-json", { method: "POST", body: fd });
         const text = await res.text();
         let data;
         try {
@@ -422,18 +398,11 @@
           throw new Error(typeof d === "string" ? d : JSON.stringify(d));
         }
 
-        lastMid = JSON.stringify(data.mid_json, null, 2);
-        lastSem = JSON.stringify(data.semantic_mid_json, null, 2);
-        taMid.value = lastMid;
-        taSem.value = lastSem;
-        outMid.hidden = false;
-        outSem.hidden = false;
+        lastOut = JSON.stringify(data.semantic_json, null, 2);
+        taOut.value = lastOut;
+        outWrap.hidden = false;
 
-        meta.textContent =
-          `Nodes: ${data.node_count} · Chunks: ${data.chunks_used} · frame_index: ${data.frame_index}` +
-          (data.used_reference_grid != null
-            ? ` · reference grid: ${data.used_reference_grid ? "yes" : "no"}`
-            : "");
+        meta.textContent = "Parsed model output as JSON.";
         meta.hidden = false;
 
         if (data.warnings && data.warnings.length) {

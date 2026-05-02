@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Banner category — 1–4</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;600;700&family=Fraunces:wght@600&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #0c1014;
+      --surface: #151b22;
+      --surface2: #1c252e;
+      --border: #2a3542;
+      --text: #e8eef4;
+      --muted: #8b9aab;
+      --accent: #4aa8f5;
+      --accent-dim: #2d7fc4;
+      --err: #ff6b6b;
+      --ok: #5fd4a0;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "DM Sans", system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      background-image: radial-gradient(ellipse 90% 50% at 50% -10%, rgba(74, 168, 245, 0.1), transparent);
+    }
+    main { max-width: 640px; margin: 0 auto; padding: 2rem 1.25rem 3rem; }
+    h1 {
+      font-family: "Fraunces", Georgia, serif;
+      font-size: 1.55rem;
+      font-weight: 600;
+      margin: 0 0 0.5rem;
+      letter-spacing: -0.02em;
+    }
+    .topnav { margin-bottom: 1.2rem; font-size: 0.9rem; display: flex; flex-wrap: wrap; gap: 0.75rem 1.25rem; }
+    .topnav a { color: var(--accent); text-decoration: none; }
+    .topnav a:hover { text-decoration: underline; }
+    .sub { color: var(--muted); font-size: 0.92rem; line-height: 1.55; margin-bottom: 1.5rem; }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 1.25rem 1.35rem;
+      margin-bottom: 1.25rem;
+    }
+    .upload-slot {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+    }
+    .upload-slot:focus-within { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(74, 168, 245, 0.2); }
+    .field-label {
+      display: block;
+      font-size: 0.68rem;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.07em;
+      padding: 0.6rem 0.85rem 0;
+    }
+    label.drop {
+      position: relative;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 96px;
+      padding: 0.65rem 0.85rem 0.85rem;
+      cursor: pointer;
+      font-size: 0.88rem;
+      text-align: center;
+    }
+    label.drop input { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; cursor: pointer; font-size: 0; }
+    .drop-hint { position: relative; z-index: 1; pointer-events: none; color: var(--muted); }
+    .drop-hint .accent { color: var(--accent); font-weight: 600; }
+    .fname { position: relative; z-index: 1; pointer-events: none; font-size: 0.78rem; margin-top: 0.35rem; font-family: ui-monospace, monospace; word-break: break-all; }
+    .fname.empty { color: var(--muted); font-family: inherit; }
+    .row { margin-top: 1rem; display: flex; flex-wrap: wrap; align-items: flex-end; gap: 1rem; }
+    .row label { font-size: 0.78rem; color: var(--muted); display: flex; flex-direction: column; gap: 0.35rem; }
+    .row input[type="number"] {
+      width: 5.5rem;
+      padding: 0.5rem 0.55rem;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      color: var(--text);
+      font-family: inherit;
+    }
+    button.primary {
+      font-family: inherit;
+      font-weight: 600;
+      padding: 0.65rem 1.25rem;
+      border-radius: 10px;
+      border: none;
+      cursor: pointer;
+      background: linear-gradient(180deg, var(--accent), var(--accent-dim));
+      color: #fff;
+      margin-top: 1rem;
+    }
+    button.primary:disabled { opacity: 0.45; cursor: not-allowed; }
+    .status { font-size: 0.88rem; margin-top: 0.65rem; color: var(--muted); }
+    .status.err { color: var(--err); }
+    .status.ok { color: var(--ok); }
+    .legend {
+      font-size: 0.82rem;
+      color: var(--muted);
+      line-height: 1.55;
+      margin: 0;
+      padding-left: 1.1rem;
+    }
+    .legend li { margin: 0.25rem 0; }
+    .result-wrap { text-align: center; padding: 1rem 0 0.5rem; }
+    .result-num {
+      font-family: "Fraunces", Georgia, serif;
+      font-size: 4.5rem;
+      font-weight: 600;
+      line-height: 1;
+      color: var(--accent);
+      text-shadow: 0 4px 24px rgba(74, 168, 245, 0.35);
+    }
+    .result-label { font-size: 1rem; color: var(--text); margin-top: 0.75rem; line-height: 1.4; }
+    .raw-pre {
+      margin-top: 1rem;
+      font-size: 0.72rem;
+      font-family: ui-monospace, monospace;
+      color: var(--muted);
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.65rem;
+      text-align: left;
+      white-space: pre-wrap;
+      word-break: break-word;
+      max-height: 160px;
+      overflow: auto;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <nav class="topnav">
+      <a href="/">Image description</a>
+      <a href="/figma.html">Figma semantic JSON</a>
+      <a href="/json_search.html">JSON embedding search</a>
+    </nav>
+    <h1>Banner → category (1–4)</h1>
+    <p class="sub">
+      Upload a banner image. The VLM returns which campaign it matches. Categories:
+    </p>
+    <ul class="legend">
+      <li><strong>1</strong> — Пряники прямо на ёлку</li>
+      <li><strong>2</strong> — Пряничный ровер</li>
+      <li><strong>3</strong> — Мегапорция оливье для гостей</li>
+      <li><strong>4</strong> — Еловый лимонад с малиной</li>
+    </ul>
+
+    <div class="card">
+      <div class="upload-slot">
+        <span class="field-label">Banner image</span>
+        <label class="drop" for="file">
+          <input type="file" id="file" accept="image/png,image/jpeg,image/webp" />
+          <span class="drop-hint">Choose <span class="accent">PNG / JPEG / WebP</span> or drop here</span>
+          <div class="fname empty" id="fname">No file</div>
+        </label>
+      </div>
+      <div class="row">
+        <label>Max new tokens <input type="number" id="max-tokens" min="8" max="512" value="64" /></label>
+      </div>
+      <button type="button" class="primary" id="go" disabled>Classify banner</button>
+      <div class="status" id="busy"></div>
+    </div>
+
+    <div class="card" id="out" hidden>
+      <div class="result-wrap">
+        <div class="result-num" id="cat-num">—</div>
+        <p class="result-label" id="cat-label"></p>
+      </div>
+      <p style="font-size:0.72rem;color:var(--muted);margin:0.5rem 0 0;">Model reply (debug)</p>
+      <pre class="raw-pre" id="raw"></pre>
+    </div>
+  </main>
+  <script>
+    const API = "";
+    const LABELS = {
+      1: "Пряники прямо на ёлку",
+      2: "Пряничный ровер",
+      3: "Мегапорция оливье для гостей",
+      4: "Еловый лимонад с малиной",
+    };
+
+    const fileInput = document.getElementById("file");
+    const fname = document.getElementById("fname");
+    const maxTokens = document.getElementById("max-tokens");
+    const go = document.getElementById("go");
+    const busy = document.getElementById("busy");
+    const out = document.getElementById("out");
+    const catNum = document.getElementById("cat-num");
+    const catLabel = document.getElementById("cat-label");
+    const rawEl = document.getElementById("raw");
+
+    const imgOk = (f) =>
+      f && (/^image\/(png|jpeg|webp)$/i.test(f.type) || /\.(png|jpe?g|webp)$/i.test(f.name || ""));
+
+    function refresh() {
+      const f = fileInput.files?.[0];
+      fname.textContent = f ? f.name : "No file";
+      fname.classList.toggle("empty", !f);
+      go.disabled = !(f && imgOk(f));
+    }
+    fileInput.addEventListener("change", refresh);
+
+    const slot = document.querySelector(".upload-slot");
+    ["dragenter", "dragover"].forEach((ev) => {
+      slot.addEventListener(ev, (e) => { e.preventDefault(); slot.style.borderColor = "var(--accent)"; });
+    });
+    ["dragleave", "drop"].forEach((ev) => {
+      slot.addEventListener(ev, (e) => { e.preventDefault(); slot.style.borderColor = ""; });
+    });
+    slot.addEventListener("drop", (e) => {
+      const files = e.dataTransfer?.files;
+      if (!files?.length) return;
+      const f = files[0];
+      if (!imgOk(f)) {
+        busy.textContent = "Use PNG, JPEG, or WebP.";
+        busy.className = "status err";
+        return;
+      }
+      const dt = new DataTransfer();
+      dt.items.add(f);
+      fileInput.files = dt.files;
+      fileInput.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+
+    go.addEventListener("click", async () => {
+      const f = fileInput.files?.[0];
+      if (!f) return;
+      const mt = Math.min(512, Math.max(8, parseInt(String(maxTokens.value), 10) || 64));
+      maxTokens.value = String(mt);
+
+      go.disabled = true;
+      busy.className = "status";
+      busy.textContent = "Calling /banner/category…";
+      out.hidden = true;
+
+      const fd = new FormData();
+      fd.append("file", f, f.name);
+      fd.append("max_new_tokens", String(mt));
+
+      try {
+        const res = await fetch(API + "/banner/category", { method: "POST", body: fd });
+        const text = await res.text();
+        let data;
+        try {
+          data = JSON.parse(text);
+        } catch {
+          throw new Error(text.slice(0, 300) || res.statusText);
+        }
+        if (!res.ok) {
+          const d = data.detail || data.message || JSON.stringify(data);
+          throw new Error(typeof d === "string" ? d : JSON.stringify(d));
+        }
+        const c = data.category;
+        catNum.textContent = String(c);
+        catLabel.textContent = LABELS[c] || "";
+        rawEl.textContent = data.raw_model_text || "";
+        out.hidden = false;
+        busy.textContent = "Done.";
+        busy.className = "status ok";
+      } catch (e) {
+        busy.textContent = e.message || String(e);
+        busy.className = "status err";
+      } finally {
+        go.disabled = !(fileInput.files?.[0] && imgOk(fileInput.files[0]));
+      }
+    });
+  </script>
+</body>
+</html>

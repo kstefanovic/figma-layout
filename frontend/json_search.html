@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>JSON embedding search</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;600;700&family=Fraunces:wght@600&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #0c1014;
+      --surface: #151b22;
+      --surface2: #1c252e;
+      --border: #2a3542;
+      --text: #e8eef4;
+      --muted: #8b9aab;
+      --accent: #4aa8f5;
+      --accent-dim: #2d7fc4;
+      --err: #ff6b6b;
+      --ok: #5fd4a0;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "DM Sans", system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      background-image: radial-gradient(ellipse 90% 50% at 50% -10%, rgba(74, 168, 245, 0.1), transparent);
+    }
+    main { max-width: 900px; margin: 0 auto; padding: 2rem 1.25rem 3rem; }
+    h1 { font-family: "Fraunces", Georgia, serif; font-size: 1.55rem; font-weight: 600; margin: 0 0 0.5rem; }
+    .topnav { margin-bottom: 1.2rem; font-size: 0.9rem; display: flex; flex-wrap: wrap; gap: 0.75rem 1.25rem; }
+    .topnav a { color: var(--accent); text-decoration: none; }
+    .topnav a:hover { text-decoration: underline; }
+    .sub { color: var(--muted); font-size: 0.92rem; line-height: 1.55; margin-bottom: 1.5rem; }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 1.25rem 1.35rem;
+      margin-bottom: 1.25rem;
+    }
+    .form-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 1rem;
+      align-items: end;
+    }
+    @media (max-width: 760px) { .form-grid { grid-template-columns: 1fr; } }
+    label { font-size: 0.78rem; color: var(--muted); display: flex; flex-direction: column; gap: 0.35rem; }
+    input, select {
+      width: 100%;
+      padding: 0.58rem 0.65rem;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--surface2);
+      color: var(--text);
+      font-family: inherit;
+      font-size: 0.92rem;
+    }
+    button {
+      font-family: inherit;
+      font-weight: 600;
+      padding: 0.65rem 1rem;
+      border-radius: 10px;
+      border: none;
+      cursor: pointer;
+      background: linear-gradient(180deg, var(--accent), var(--accent-dim));
+      color: #fff;
+    }
+    button.secondary {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      color: var(--text);
+    }
+    .status { font-size: 0.88rem; margin-top: 0.65rem; color: var(--muted); }
+    .status.err { color: var(--err); }
+    .status.ok { color: var(--ok); }
+    .results { display: grid; gap: 0.9rem; }
+    .result {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 0.9rem 1rem;
+    }
+    .result h2 { font-size: 1rem; margin: 0 0 0.35rem; }
+    .meta { color: var(--muted); font-size: 0.82rem; line-height: 1.45; }
+    pre {
+      margin: 0.65rem 0 0;
+      padding: 0.65rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      font-size: 0.72rem;
+      overflow: auto;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <nav class="topnav">
+      <a href="/">Image description</a>
+      <a href="/banner_category.html">Banner category</a>
+      <a href="/figma.html">Figma semantic JSON</a>
+    </nav>
+    <h1>JSON embedding search</h1>
+    <p class="sub">
+      Upload a banner and its source raw JSON, enter the target resolution, and run the merged pipeline:
+      Qwen determines class <code>1–4</code>, the backend retrieves candidates from that class, selects
+      the candidate most similar to your raw JSON, then returns a final JSON resized to the target resolution.
+    </p>
+
+    <div class="card">
+      <div class="form-grid">
+        <label>Banner image
+          <input id="banner-file" type="file" accept="image/png,image/jpeg,image/webp" />
+        </label>
+        <label>Source raw JSON
+          <input id="raw-json-file" type="file" accept=".json,application/json" />
+        </label>
+        <label>Target resolution
+          <input id="target-resolution" value="2280x360" placeholder="2280x360" />
+        </label>
+        <label>Top K
+          <input id="top-k" type="number" min="1" max="20" value="3" />
+        </label>
+        <button id="search" type="button">Generate target JSON</button>
+      </div>
+      <div style="margin-top:0.85rem; display:flex; gap:0.75rem; flex-wrap:wrap;">
+        <button id="build" class="secondary" type="button">Rebuild indexes</button>
+      </div>
+      <div id="status" class="status"></div>
+    </div>
+
+    <div class="card" id="results-card" hidden>
+      <div class="results" id="results"></div>
+    </div>
+  </main>
+
+  <script>
+    const API = "";
+    const statusEl = document.getElementById("status");
+    const resultsCard = document.getElementById("results-card");
+    const resultsEl = document.getElementById("results");
+
+    function setStatus(text, cls = "") {
+      statusEl.className = "status" + (cls ? " " + cls : "");
+      statusEl.textContent = text;
+    }
+
+    document.getElementById("build").addEventListener("click", async () => {
+      setStatus("Building indexes...");
+      resultsCard.hidden = true;
+      try {
+        const res = await fetch(API + "/json-embeddings/build", { method: "POST" });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || JSON.stringify(data));
+        setStatus("Built: " + data.indexes.map((x) => `class ${x.class_number}: ${x.count}`).join(", "), "ok");
+      } catch (err) {
+        setStatus(err.message || String(err), "err");
+      }
+    });
+
+    document.getElementById("search").addEventListener("click", async () => {
+      const file = document.getElementById("banner-file").files?.[0];
+      const rawJson = document.getElementById("raw-json-file").files?.[0];
+      const target = document.getElementById("target-resolution").value.trim();
+      const topK = document.getElementById("top-k").value || "3";
+      if (!file) {
+        setStatus("Choose a banner image.", "err");
+        return;
+      }
+      if (!rawJson) {
+        setStatus("Choose a source raw JSON file.", "err");
+        return;
+      }
+      if (!target) {
+        setStatus("Enter a target resolution like 2280x360.", "err");
+        return;
+      }
+      setStatus("Classifying banner, retrieving candidates, selecting layout guide, and resizing JSON...");
+      resultsCard.hidden = true;
+      resultsEl.innerHTML = "";
+      try {
+        const fd = new FormData();
+        fd.append("file", file, file.name);
+        fd.append("raw_json", rawJson, rawJson.name);
+        fd.append("target_resolution", target);
+        fd.append("top_k", topK);
+        const res = await fetch(API + "/pipeline/banner-raw-to-target-json", { method: "POST", body: fd });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || JSON.stringify(data));
+
+        const finalJsonText = JSON.stringify(data.final_json || null, null, 2);
+        const selected = data.selected_candidate || {};
+        const selectedDiv = document.createElement("div");
+        selectedDiv.className = "result";
+        selectedDiv.innerHTML = `
+          <h2>Selected guide: ${escapeHtml(selected.name || "(no name)")}</h2>
+          <div class="meta">
+            Qwen class: ${data.category} · target: ${fmt(data.target_width)}x${fmt(data.target_height)} · aspect: ${fmt(data.aspect_ratio)}<br>
+            source: ${escapeHtml(selected.source_file || "")} · frame_index: ${selected.frame_index}<br>
+            raw_similarity: ${fmt(selected.raw_similarity)} · selection_score: ${fmt(selected.selection_score)}
+          </div>
+          <button type="button" data-final-download style="margin-top:0.65rem;">Download final target JSON</button>
+          <details open style="margin-top:0.65rem;">
+            <summary style="cursor:pointer;color:var(--accent);">Show final target-resolution JSON</summary>
+            <pre>${escapeHtml(finalJsonText)}</pre>
+          </details>
+        `;
+        resultsEl.appendChild(selectedDiv);
+        selectedDiv.querySelector("[data-final-download]")?.addEventListener("click", () => {
+          download(`target_${Math.round(data.target_width)}x${Math.round(data.target_height)}.json`, finalJsonText);
+        });
+
+        for (const [i, row] of (data.candidates || []).entries()) {
+          const div = document.createElement("div");
+          div.className = "result";
+          const fullJsonText = JSON.stringify(row.full_json || null, null, 2);
+          div.innerHTML = `
+            <h2>Candidate #${i + 1} ${escapeHtml(row.name || "(no name)")}</h2>
+            <div class="meta">
+              source: ${escapeHtml(row.source_file)} · frame_index: ${row.frame_index}<br>
+              aspect: ${fmt(row.aspect_ratio)} · score: ${fmt(row.score)} · aspect_error: ${fmt(row.aspect_error)}<br>
+              raw_similarity: ${fmt(row.raw_similarity)} · selection_score: ${fmt(row.selection_score)}<br>
+              id: ${escapeHtml(row.id || "")} · type: ${escapeHtml(row.type || "")} · leaves: ${row.leaf_count}
+            </div>
+            <button type="button" data-download="${i}" style="margin-top:0.65rem;">Download full JSON</button>
+            <details style="margin-top:0.65rem;">
+              <summary style="cursor:pointer;color:var(--accent);">Show full retrieved JSON</summary>
+              <pre>${escapeHtml(fullJsonText)}</pre>
+            </details>
+          `;
+          resultsEl.appendChild(div);
+          div.querySelector("[data-download]")?.addEventListener("click", () => {
+            download(`candidate_class${row.class_number}_frame${row.frame_index}.json`, fullJsonText);
+          });
+        }
+        resultsCard.hidden = false;
+        setStatus(
+          `Done. Qwen class: ${data.category} · selected frame_index: ${selected.frame_index} · VLM raw: ${data.raw_model_text}`,
+          "ok"
+        );
+      } catch (err) {
+        setStatus(err.message || String(err), "err");
+      }
+    });
+
+    function escapeHtml(s) {
+      const d = document.createElement("div");
+      d.textContent = String(s);
+      return d.innerHTML;
+    }
+
+    function fmt(v) {
+      const n = Number(v);
+      return Number.isFinite(n) ? n.toFixed(6) : String(v);
+    }
+
+    function download(name, text) {
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(new Blob([text], { type: "application/json" }));
+      a.download = name;
+      a.click();
+      URL.revokeObjectURL(a.href);
+    }
+  </script>
+</body>
+</html>

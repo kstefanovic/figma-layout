@@ -1,6 +1,7 @@
 import base64
 import json
 import os
+import re
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -12,13 +13,26 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from figma_semantic import (
+    FIGMA_CONVERT_PROMPT,
     apply_semantic_names,
     build_naming_user_prompt,
     chunk_list,
+    extract_first_json_value,
     flatten_raw_to_mid,
     mid_node_prompt_slice,
     missing_name_ids,
     parse_names_object,
+)
+from json_embedding import (
+    VALID_CLASSES,
+    attach_full_json,
+    build_all_indexes,
+    parse_aspect_ratio,
+    parse_resolution,
+    rerank_candidates_by_raw_similarity,
+    resize_figma_json_to_resolution,
+    search_index,
+    select_frame,
 )
 
 
@@ -38,7 +52,21 @@ PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 PROMPT_MAX_LEN = 8000
 FIGMA_MAX_JSON_BYTES = int(os.getenv("FIGMA_MAX_JSON_BYTES", str(52 * 1024 * 1024)))
 FIGMA_SEMANTIC_MAX_CHUNKS = int(os.getenv("FIGMA_SEMANTIC_MAX_CHUNKS", "80"))
+FIGMA_CONVERT_TIMEOUT = float(os.getenv("FIGMA_CONVERT_TIMEOUT", str(max(REQUEST_TIMEOUT, 900.0))))
 FRONTEND_DIR = Path(__file__).resolve().parent / "frontend"
+
+BANNER_VLM_CATEGORY_PROMPT = """You classify one retail / food banner image into exactly ONE of four campaigns.
+
+The four categories (match by main visual theme — product, hero, colors, headline; OCR need not be exact):
+
+1. Пряники прямо на ёлку
+2. Пряничный ровер
+3. Мегапорция оливье для гостей
+4. Еловый лимонад с малиной
+
+Output rules:
+- Reply with ONLY the digit 1, 2, 3, or 4.
+- Single line. No other words, no JSON, no markdown, no explanation."""
 
 
 class ContentItem(BaseModel):
@@ -86,6 +114,76 @@ class FigmaSemanticMidResponse(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class FigmaConvertSemanticResponse(BaseModel):
+    """Single-shot full raw JSON → semantic JSON (model rewrites tree and names)."""
+
+    semantic_json: Any
+    warnings: list[str] = Field(default_factory=list)
+
+
+class BannerCategoryResponse(BaseModel):
+    """VLM banner classification into campaign 1–4."""
+
+    category: int = Field(..., ge=1, le=4, description="Campaign index 1–4 per product brief")
+    raw_model_text: str = Field(default="", description="Trimmed model output used for parsing")
+
+
+class JsonEmbeddingBuildItem(BaseModel):
+    class_number: int
+    count: int
+    source_file: str
+
+
+class JsonEmbeddingBuildResponse(BaseModel):
+    indexes: list[JsonEmbeddingBuildItem]
+
+
+class JsonEmbeddingCandidate(BaseModel):
+    class_number: int
+    source_file: str
+    frame_index: int
+    id: str | None = None
+    name: str | None = None
+    type: str | None = None
+    bounds: dict[str, Any] | None = None
+    aspect_ratio: float | None = None
+    node_count: int
+    leaf_count: int
+    score: float
+    embedding_score: float
+    aspect_error: float
+    raw_similarity: float | None = None
+    selection_score: float | None = None
+    full_json: dict[str, Any] | None = None
+
+
+class JsonEmbeddingSearchResponse(BaseModel):
+    class_number: int
+    aspect_ratio: float
+    top_k: int
+    candidates: list[JsonEmbeddingCandidate]
+
+
+class BannerSearchPipelineResponse(BaseModel):
+    category: int = Field(..., ge=1, le=4)
+    raw_model_text: str = ""
+    aspect_ratio: float
+    top_k: int
+    candidates: list[JsonEmbeddingCandidate]
+
+
+class BannerRawToTargetJsonResponse(BaseModel):
+    category: int = Field(..., ge=1, le=4)
+    raw_model_text: str = ""
+    target_width: float
+    target_height: float
+    aspect_ratio: float
+    top_k: int
+    selected_candidate: JsonEmbeddingCandidate
+    candidates: list[JsonEmbeddingCandidate]
+    final_json: dict[str, Any]
+
+
 app = FastAPI(title="Public Qwen2.5-VL Backend")
 app.add_middleware(
     CORSMiddleware,
@@ -129,12 +227,13 @@ def _messages_for_model(request: ChatRequest) -> list[dict[str, Any]]:
     return [{"role": "user", "content": _content_from_request(request)}]
 
 
-def _call_model(payload: dict[str, Any]) -> dict[str, Any]:
+def _call_model(payload: dict[str, Any], *, timeout: float | None = None) -> dict[str, Any]:
+    t = REQUEST_TIMEOUT if timeout is None else timeout
     try:
         response = requests.post(
             _model_url("/generate"),
             json=payload,
-            timeout=REQUEST_TIMEOUT,
+            timeout=t,
         )
         response.raise_for_status()
     except requests.RequestException as exc:
@@ -163,6 +262,77 @@ def _normalize_category(text: str) -> str:
     return line.strip()[:200] if line else ""
 
 
+def _parse_banner_category_1_to_4(text: str) -> int:
+    """Extract integer 1–4 from VLM reply (digit only, JSON, or first matching token)."""
+    raw = (text or "").strip()
+    if not raw:
+        raise ValueError("empty model response")
+
+    inner = raw
+    fence = re.search(r"```(?:json|text)?\s*([\s\S]*?)```", raw, re.IGNORECASE)
+    if fence:
+        inner = fence.group(1).strip()
+
+    if inner.startswith("{") or inner.startswith("["):
+        try:
+            parsed = extract_first_json_value(inner)
+        except (ValueError, json.JSONDecodeError):
+            parsed = None
+        if isinstance(parsed, dict):
+            for key in ("category", "class", "label", "id", "campaign"):
+                v = parsed.get(key)
+                if isinstance(v, bool):
+                    continue
+                if isinstance(v, int) and 1 <= v <= 4:
+                    return v
+                if isinstance(v, str) and v.strip().isdigit():
+                    n = int(v.strip())
+                    if 1 <= n <= 4:
+                        return n
+        if isinstance(parsed, list) and len(parsed) == 1:
+            only = parsed[0]
+            if isinstance(only, int) and 1 <= only <= 4:
+                return only
+
+    for line in inner.splitlines():
+        s = line.strip()
+        if re.fullmatch(r"[1-4]", s):
+            return int(s)
+
+    m = re.search(r"\b([1-4])\b", inner)
+    if m:
+        return int(m.group(1))
+
+    raise ValueError(f"no digit 1–4 found in: {inner[:300]!r}")
+
+
+def _classify_banner_bytes(body: bytes, content_type: str | None, max_new_tokens: int = 64) -> tuple[int, str]:
+    if not body:
+        raise HTTPException(status_code=400, detail="Empty file.")
+
+    image = _data_uri(body, content_type)
+    request = ChatRequest(
+        prompt=BANNER_VLM_CATEGORY_PROMPT,
+        image=image,
+        max_new_tokens=max_new_tokens,
+    )
+    result = _call_model(
+        {
+            "messages": _messages_for_model(request),
+            "max_new_tokens": max_new_tokens,
+        }
+    )
+    raw = (result.get("response") or "").strip()
+    try:
+        category = _parse_banner_category_1_to_4(raw)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"VLM output could not be parsed as 1–4: {exc}. Raw: {raw[:500]!r}",
+        ) from exc
+    return category, raw
+
+
 @app.get("/health")
 def health() -> dict[str, Any]:
     try:
@@ -175,6 +345,153 @@ def health() -> dict[str, Any]:
         "model_service_url": MODEL_SERVICE_URL,
         "model": model_health,
     }
+
+
+@app.post("/banner/category", response_model=BannerCategoryResponse)
+async def banner_category(
+    file: UploadFile = File(..., description="Banner PNG (or JPEG/WebP)"),
+    max_new_tokens: int = Form(64, ge=8, le=512),
+) -> BannerCategoryResponse:
+    """VLM picks which of four Yandex Lavka-style campaigns the banner belongs to (output 1–4)."""
+    body = await file.read()
+    category, raw = _classify_banner_bytes(body, file.content_type, max_new_tokens=max_new_tokens)
+
+    return BannerCategoryResponse(category=category, raw_model_text=raw[:2000])
+
+
+@app.post("/json-embeddings/build", response_model=JsonEmbeddingBuildResponse)
+def build_json_embeddings() -> JsonEmbeddingBuildResponse:
+    """Build one local embedding index for each class: raw_jsons/1.json ... raw_jsons/4.json."""
+    try:
+        indexes = build_all_indexes()
+    except (FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return JsonEmbeddingBuildResponse(
+        indexes=[
+            JsonEmbeddingBuildItem(
+                class_number=int(index["class_number"]),
+                count=int(index["count"]),
+                source_file=str(index["source_file"]),
+            )
+            for index in indexes
+        ]
+    )
+
+
+@app.get("/json-embeddings/search", response_model=JsonEmbeddingSearchResponse)
+def search_json_embeddings(
+    class_number: int = Query(..., ge=1, le=4, description="Select one of the 4 class indexes"),
+    aspect_ratio: str = Query(..., description="Aspect ratio: 16:9, 1080x1920, 1.777, etc."),
+    top_k: int = Query(3, ge=1, le=20),
+    include_full_json: bool = Query(True, description="Attach the full retrieved top-level Figma JSON frame"),
+) -> JsonEmbeddingSearchResponse:
+    """Select class embedding, then retrieve top candidates by requested aspect ratio."""
+    if class_number not in VALID_CLASSES:
+        raise HTTPException(status_code=400, detail=f"class_number must be one of {sorted(VALID_CLASSES)}")
+    try:
+        parsed_aspect = parse_aspect_ratio(aspect_ratio)
+        results = search_index(class_number, parsed_aspect, top_k=top_k)
+        if include_full_json:
+            results = attach_full_json(results)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return JsonEmbeddingSearchResponse(
+        class_number=class_number,
+        aspect_ratio=parsed_aspect,
+        top_k=top_k,
+        candidates=[JsonEmbeddingCandidate(**row) for row in results],
+    )
+
+
+@app.post("/pipeline/banner-search", response_model=BannerSearchPipelineResponse)
+async def classify_banner_then_search_json(
+    file: UploadFile = File(..., description="Banner PNG/JPEG/WebP to classify"),
+    target_resolution: str = Form(..., description="Target resolution or aspect ratio: 2280x360, 16:9, 1.777"),
+    top_k: int = Form(3, ge=1, le=20),
+    max_new_tokens: int = Form(64, ge=8, le=512),
+    include_full_json: bool = Form(True),
+) -> BannerSearchPipelineResponse:
+    """One flow: classify banner into class 1–4, then search that class index by target resolution."""
+    body = await file.read()
+    category, raw = _classify_banner_bytes(body, file.content_type, max_new_tokens=max_new_tokens)
+
+    try:
+        parsed_aspect = parse_aspect_ratio(target_resolution)
+        results = search_index(category, parsed_aspect, top_k=top_k)
+        if include_full_json:
+            results = attach_full_json(results)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return BannerSearchPipelineResponse(
+        category=category,
+        raw_model_text=raw[:2000],
+        aspect_ratio=parsed_aspect,
+        top_k=top_k,
+        candidates=[JsonEmbeddingCandidate(**row) for row in results],
+    )
+
+
+@app.post("/pipeline/banner-raw-to-target-json", response_model=BannerRawToTargetJsonResponse)
+async def banner_raw_to_target_json(
+    file: UploadFile = File(..., description="Banner PNG/JPEG/WebP to classify"),
+    raw_json: UploadFile = File(..., description="Source raw Figma JSON to compare against retrieved candidates"),
+    target_resolution: str = Form(..., description="Exact target resolution, for example 2280x360"),
+    raw_frame_index: int = Form(0, ge=0),
+    top_k: int = Form(3, ge=1, le=20),
+    max_new_tokens: int = Form(64, ge=8, le=512),
+) -> BannerRawToTargetJsonResponse:
+    """
+    One flow:
+    1. Classify banner into class 1-4.
+    2. Retrieve top candidates from that class by target resolution/aspect.
+    3. Rerank those candidates by similarity to uploaded raw JSON.
+    4. Use the selected candidate as the layout guide and resize its bboxes to target resolution.
+    """
+    banner_body = await file.read()
+    category, raw_model_text = _classify_banner_bytes(
+        banner_body, file.content_type, max_new_tokens=max_new_tokens
+    )
+
+    raw_bytes = await raw_json.read()
+    if len(raw_bytes) > FIGMA_MAX_JSON_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"raw_json exceeds limit of {FIGMA_MAX_JSON_BYTES} bytes.",
+        )
+    try:
+        uploaded_raw = json.loads(raw_bytes.decode("utf-8"))
+        uploaded_frame = select_frame(uploaded_raw, raw_frame_index)
+        target_width, target_height = parse_resolution(target_resolution)
+        parsed_aspect = target_width / target_height
+        retrieved = attach_full_json(search_index(category, parsed_aspect, top_k=top_k))
+        ranked = rerank_candidates_by_raw_similarity(uploaded_frame, retrieved)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if not ranked:
+        raise HTTPException(status_code=404, detail="No retrievable candidates found.")
+
+    selected = ranked[0]
+    selected_json = selected.get("full_json")
+    if not isinstance(selected_json, dict):
+        raise HTTPException(status_code=500, detail="Selected candidate does not include full_json.")
+
+    final_json = resize_figma_json_to_resolution(selected_json, target_width, target_height)
+
+    return BannerRawToTargetJsonResponse(
+        category=category,
+        raw_model_text=raw_model_text[:2000],
+        target_width=target_width,
+        target_height=target_height,
+        aspect_ratio=parsed_aspect,
+        top_k=top_k,
+        selected_candidate=JsonEmbeddingCandidate(**selected),
+        candidates=[JsonEmbeddingCandidate(**row) for row in ranked],
+        final_json=final_json,
+    )
 
 
 @app.post("/chat", response_model=ChatResponse)
@@ -653,6 +970,74 @@ async def figma_semantic_mid_json(
         used_reference_grid=used_grid,
         warnings=warnings,
     )
+
+
+@app.post("/figma/convert-semantic-json", response_model=FigmaConvertSemanticResponse)
+async def figma_convert_semantic_json(
+    banner: UploadFile = File(..., description="Full Figma banner export image"),
+    raw_json: UploadFile = File(..., description="Raw Figma layout JSON"),
+    grid: UploadFile = File(..., description="Grid image: each cell = element + raw JSON id"),
+    max_new_tokens: int = Form(4096, ge=256, le=4096),
+) -> FigmaConvertSemanticResponse:
+    warnings: list[str] = []
+
+    raw_bytes = await raw_json.read()
+    if len(raw_bytes) > FIGMA_MAX_JSON_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"raw_json exceeds limit of {FIGMA_MAX_JSON_BYTES} bytes.",
+        )
+    try:
+        raw = json.loads(raw_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON: {exc}") from exc
+
+    banner_body = await banner.read()
+    grid_body = await grid.read()
+    if not banner_body or not grid_body:
+        raise HTTPException(status_code=400, detail="banner and grid must be non-empty files.")
+
+    banner_uri = _data_uri(banner_body, banner.content_type)
+    grid_uri = _data_uri(grid_body, grid.content_type)
+
+    raw_text = json.dumps(raw, ensure_ascii=False, separators=(",", ":"))
+    user_text = (
+        FIGMA_CONVERT_PROMPT
+        + "\n\nRaw Figma JSON (apply the rules above; output only the transformed JSON):\n"
+        + raw_text
+    )
+
+    user_content: list[ContentItem] = [
+        ContentItem(type="image", image=banner_uri),
+        ContentItem(type="image", image=grid_uri),
+        ContentItem(type="text", text=user_text),
+    ]
+    request = ChatRequest(
+        messages=[ChatMessage(role="user", content=user_content)],
+        max_new_tokens=max_new_tokens,
+    )
+
+    response_text = ""
+    try:
+        result = _call_model(
+            {
+                "messages": _messages_for_model(request),
+                "max_new_tokens": max_new_tokens,
+            },
+            timeout=FIGMA_CONVERT_TIMEOUT,
+        )
+        response_text = result.get("response", "")
+        semantic_json = extract_first_json_value(response_text)
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        snippet = (response_text if isinstance(response_text, str) else "")[:1200]
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not parse model output as JSON: {exc}. Output starts with: {snippet!r}",
+        ) from exc
+
+    return FigmaConvertSemanticResponse(semantic_json=semantic_json, warnings=warnings)
 
 
 if FRONTEND_DIR.is_dir():

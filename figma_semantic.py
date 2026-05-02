@@ -4,7 +4,91 @@ from __future__ import annotations
 
 import json
 import re
+import textwrap
 from typing import Any
+
+# Full raw JSON → semantic Figma JSON (single Qwen call: banner + grid + raw text).
+FIGMA_CONVERT_PROMPT = textwrap.dedent(
+    """
+    You are a strict Figma semantic JSON converter.
+
+    Inputs:
+    1. Full banner image.
+    2. Grid image where each cell shows one element crop and its raw JSON id.
+    3. Raw Figma JSON with anonymous names.
+
+    Goal:
+    Convert the raw Figma JSON into clean semantic JSON.
+
+    Important rules:
+    - Output ONLY valid JSON.
+    - Do not explain.
+    - Do not create mid_json.
+    - Do not invent new elements.
+    - Do not change id, type, bounds, characters, visible, opacity, or geometry.
+    - Use the full banner image for global context.
+    - Use the grid image to understand each element by its raw JSON id.
+    - Use raw JSON ids exactly as provided.
+    - Replace anonymous "name" values with semantic names.
+    - Remove/collapse unnecessary wrapper groups/frames only when they have no independent visual meaning.
+    - When removing a wrapper, preserve all meaningful children and promote them to the correct semantic parent.
+    - Keep useful semantic containers such as brand_group, headline_group, hero_group, product_visual_group, legal_group, age_badge_group, decoration_group, background_group.
+    - Build a correct nested hierarchy by semantic meaning, not by the original raw hierarchy.
+    - Exact bbox already exists in raw JSON. Do not estimate bbox.
+
+    Semantic naming vocabulary:
+    banner_root
+    background_group
+    base_background
+    brand_group
+    brand_name_yandex
+    brand_mark
+    brand_name_lavka
+    headline_group
+    headline_text
+    headline_line
+    delivery_info_group
+    delivery_time_text
+    subheadline_text
+    legal_group
+    legal_text
+    age_badge_group
+    age_badge_text
+    hero_group
+    product_visual_group
+    main_product
+    product_packshot
+    product_label
+    offer_group
+    price_group
+    current_price
+    old_price
+    discount_badge_group
+    discount_badge_text
+    decoration_group
+    sparkle
+    star_decoration
+    ornament
+    overlay_effect_group
+    glow_effect
+    shine_effect
+
+    Naming rules:
+    - Main brand/logo area: brand_group.
+    - Yandex text/vector: brand_name_yandex.
+    - Lavka text/vector: brand_name_lavka.
+    - Heart/logo mark: brand_mark.
+    - Headline: the main advertising/product message, usually the largest and/or boldest text block.
+    - Delivery promise like "от 15 минут": delivery_info_group / delivery_time_text.
+    - Tiny disclaimer text near bottom: legal_group / legal_text.
+    - "0+", "6+", "12+", "16+", "18+": age_badge_group / age_badge_text.
+    - Product/photo/person area: hero_group or product_visual_group.
+    - Stars/snowflakes/lights/confetti: decoration_group.
+    - Large color/photo background: background_group.
+
+    Return the modified semantic JSON in the same general Figma JSON structure, with semantic "name" values and unnecessary wrappers collapsed.
+    """
+).strip()
 
 
 def _is_leaf(node: dict[str, Any]) -> bool:
@@ -128,6 +212,30 @@ def extract_first_json_object(text: str) -> Any:
             if depth == 0:
                 return json.loads(t[start : i + 1])
     raise ValueError("Unbalanced braces in model JSON output")
+
+
+def extract_first_json_value(text: str) -> Any:
+    """Parse first top-level JSON object or array from model text (handles ```json fences)."""
+    t = text.strip()
+    fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", t, re.IGNORECASE)
+    if fence:
+        t = fence.group(1).strip()
+    brace = t.find("{")
+    bracket = t.find("[")
+    if brace < 0 and bracket < 0:
+        raise ValueError("No JSON object or array found in model output")
+    if brace < 0:
+        start = bracket
+    elif bracket < 0:
+        start = brace
+    else:
+        start = min(brace, bracket)
+    decoder = json.JSONDecoder()
+    try:
+        value, _end = decoder.raw_decode(t[start:])
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid JSON in model output: {exc}") from exc
+    return value
 
 
 def parse_names_object(text: str) -> dict[str, str]:

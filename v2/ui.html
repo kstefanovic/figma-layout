@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Qwen Layout Converter</title>
+    <style>
+      body {
+        font-family: Inter, system-ui, sans-serif;
+        margin: 0;
+        padding: 16px;
+        color: #111;
+      }
+
+      .row {
+        margin-bottom: 12px;
+      }
+
+      label {
+        display: block;
+        font-size: 12px;
+        font-weight: 600;
+        margin-bottom: 6px;
+      }
+
+      input, select, button, textarea {
+        width: 100%;
+        box-sizing: border-box;
+        padding: 8px 10px;
+        font-size: 13px;
+      }
+
+      textarea {
+        resize: none;
+        min-height: 78px;
+        font-family: Inter, system-ui, sans-serif;
+      }
+
+      button {
+        background: #18a0fb;
+        color: white;
+        border: none;
+        border-radius: 6px;
+        cursor: pointer;
+      }
+
+      button:hover {
+        background: #0d8ae6;
+      }
+
+      #status {
+        font-size: 12px;
+        color: #555;
+        min-height: 24px;
+        white-space: pre-wrap;
+      }
+
+      .readonly {
+        background: #f7f7f7;
+        color: #333;
+      }
+
+      .zone-result {
+        min-height: 160px;
+        max-height: 280px;
+        overflow: auto;
+        white-space: pre;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        font-size: 11px;
+        line-height: 1.4;
+        padding: 10px;
+        border-radius: 6px;
+        border: 1px solid #e5e5e5;
+      }
+
+      #classify-zone-btn:hover {
+        background: #6d28d9;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="row">
+      <label for="selected-frame">Selected Figma Design</label>
+      <textarea id="selected-frame" class="readonly" readonly>No frame selected.</textarea>
+    </div>
+
+    <div class="row">
+      <label for="backend-url">Backend URL</label>
+      <input id="backend-url" value="http://localhost:40039" />
+    </div>
+
+    <div class="row">
+      <label for="gnn-url">Local GNN Predict URL</label>
+      <input id="gnn-url" value="http://localhost:8000" />
+    </div>
+
+    <div class="row">
+      <label for="target-size">Target Size (width,height)</label>
+      <input id="target-size" value="1024,1280" placeholder="1024,1280" />
+    </div>
+
+    <div class="row">
+      <button id="convert-btn">Convert Selected Frame</button>
+    </div>
+
+    <div class="row">
+      <button id="classify-zone-btn" type="button" style="background: #7c3aed">
+        Zone + text zones (v2 JSON)
+      </button>
+    </div>
+
+    <div class="row">
+      <label>Zone classification (Qwen v2)</label>
+      <div id="zone-result" class="zone-result readonly">
+        Run the purple button on one selected frame. Pretty-printed JSON from
+        POST /api/v2/analyze-text-zone-visual-json (orientation, zone_type,
+        text_zone.groups: brand_group, headline_group, optional age_badge, legal_text).
+      </div>
+    </div>
+
+    <div id="status"></div>
+
+    <script>
+      const statusEl = document.getElementById("status");
+      const convertBtn = document.getElementById("convert-btn");
+      const classifyZoneBtn = document.getElementById("classify-zone-btn");
+      const zoneResultEl = document.getElementById("zone-result");
+      const selectedFrameEl = document.getElementById("selected-frame");
+
+      function setStatus(message) {
+        statusEl.textContent = message;
+      }
+
+      function setSelectedFrameInfo(info) {
+        if (!info || !info.hasSelection) {
+          selectedFrameEl.value = "No frame selected.";
+          return;
+        }
+
+        if (!info.isFrame) {
+          selectedFrameEl.value =
+            `Selected node is not a frame.\nName: ${info.name}\nType: ${info.type}`;
+          return;
+        }
+
+        selectedFrameEl.value =
+          `Name: ${info.name}\n` +
+          `Type: ${info.type}\n` +
+          `ID: ${info.id}\n` +
+          `Size: ${info.width} × ${info.height}`;
+      }
+
+      function setZoneResult(text) {
+        zoneResultEl.textContent = text;
+      }
+
+      convertBtn.onclick = () => {
+        const backendUrl = document.getElementById("backend-url").value.trim();
+        const targetPreset = document.getElementById("target-size").value.trim();
+        const convertMode = "apply_to_clone_fast";
+
+        setStatus("Preparing request...");
+
+        parent.postMessage(
+          {
+            pluginMessage: {
+              type: "convert-selected-frame",
+              backendUrl,
+              targetPreset,
+              convertMode
+            }
+          },
+          "*"
+        );
+      };
+
+      classifyZoneBtn.onclick = () => {
+        const backendUrl = document.getElementById("backend-url").value.trim();
+        const gnnUrl = document.getElementById("gnn-url").value.trim();
+        const targetSize = document.getElementById("target-size").value.trim();
+        setStatus("Zone + text zones (v2): exporting frame…");
+        setZoneResult("…");
+        parent.postMessage(
+          {
+            pluginMessage: {
+              type: "classify-zone-selected-frame",
+              backendUrl,
+              gnnUrl,
+              targetSize
+            }
+          },
+          "*"
+        );
+      };
+
+      window.onmessage = (event) => {
+        const msg = event.data.pluginMessage;
+        if (!msg) return;
+
+        if (msg.type === "status") {
+          setStatus(msg.message);
+        } else if (msg.type === "error") {
+          setStatus("Error: " + msg.message);
+        } else if (msg.type === "done") {
+          setStatus("Done.");
+        } else if (msg.type === "selection-info") {
+          setSelectedFrameInfo(msg.selection);
+        } else if (msg.type === "zone-classify-result") {
+          if (!msg.ok || !msg.result) {
+            setZoneResult("Request failed. See status above.");
+            return;
+          }
+          try {
+            setZoneResult(JSON.stringify(msg.result, null, 2));
+          } catch (e) {
+            setZoneResult(String(msg.result));
+          }
+        }
+      };
+    </script>
+  </body>
+</html>
