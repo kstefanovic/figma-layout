@@ -1,0 +1,461 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Figma banner → semantic mid JSON</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,600;0,9..40,700&family=Fraunces:opsz,wght@9..144,600&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #0c1014;
+      --surface: #151b22;
+      --surface2: #1c252e;
+      --border: #2a3542;
+      --border-focus: #3d9cf0;
+      --text: #e8eef4;
+      --muted: #8b9aab;
+      --accent: #4aa8f5;
+      --accent-dim: #2d7fc4;
+      --err: #ff6b6b;
+      --ok: #5fd4a0;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "DM Sans", system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      background-image: radial-gradient(ellipse 90% 60% at 50% -15%, rgba(74, 168, 245, 0.08), transparent);
+    }
+    main { max-width: 1000px; margin: 0 auto; padding: 2rem 1.25rem 4rem; }
+    h1 {
+      font-family: "Fraunces", Georgia, serif;
+      font-size: 1.6rem;
+      margin: 0 0 0.5rem;
+      letter-spacing: -0.02em;
+      font-weight: 600;
+    }
+    .topnav { margin-bottom: 1.25rem; font-size: 0.9rem; }
+    .topnav a { color: var(--accent); text-decoration: none; }
+    .topnav a:hover { text-decoration: underline; }
+    .sub { color: var(--muted); font-size: 0.92rem; line-height: 1.6; margin-bottom: 1.75rem; max-width: 52rem; }
+    .sub code { font-size: 0.85em; padding: 0.1em 0.35em; border-radius: 4px; background: var(--surface2); border: 1px solid var(--border); }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 1.35rem 1.4rem;
+      margin-bottom: 1.25rem;
+    }
+    .grid-uploads {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 1rem;
+    }
+    @media (max-width: 880px) { .grid-uploads { grid-template-columns: 1fr; } }
+
+    .upload-slot {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+      transition: border-color 0.15s, box-shadow 0.15s;
+    }
+    .upload-slot:hover { border-color: #3d4d5c; }
+    .upload-slot:focus-within {
+      border-color: var(--border-focus);
+      box-shadow: 0 0 0 2px rgba(74, 168, 245, 0.2);
+    }
+    .upload-slot.dragover {
+      border-color: var(--accent);
+      background: rgba(74, 168, 245, 0.06);
+    }
+    .field-label {
+      display: block;
+      font-size: 0.68rem;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.07em;
+      padding: 0.65rem 0.85rem 0;
+      margin-bottom: 0.15rem;
+    }
+    label.drop {
+      position: relative;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 0.4rem;
+      min-height: 100px;
+      padding: 0.75rem 0.85rem 0.9rem;
+      cursor: pointer;
+      font-size: 0.88rem;
+      line-height: 1.45;
+      text-align: center;
+      border: none;
+      margin: 0;
+    }
+    label.drop input[type="file"] {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      opacity: 0;
+      cursor: pointer;
+      font-size: 0;
+      z-index: 0;
+    }
+    .drop-hint,
+    .fname {
+      position: relative;
+      z-index: 1;
+      pointer-events: none;
+    }
+    .drop-hint { color: var(--muted); }
+    .drop-hint .accent { color: var(--accent); font-weight: 600; }
+    .fname {
+      font-size: 0.78rem;
+      color: var(--text);
+      font-family: ui-monospace, monospace;
+      word-break: break-all;
+      max-width: 100%;
+      padding: 0 0.5rem;
+      opacity: 0.9;
+    }
+    .fname.empty { color: var(--muted); font-family: inherit; }
+
+    .params-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 1rem 1.25rem;
+      margin-top: 1.35rem;
+      padding-top: 1.25rem;
+      border-top: 1px solid var(--border);
+    }
+    @media (max-width: 700px) { .params-grid { grid-template-columns: 1fr; } }
+    .param-field .plabel {
+      display: block;
+      font-size: 0.78rem;
+      font-weight: 600;
+      color: var(--muted);
+      margin-bottom: 0.4rem;
+    }
+    .param-field input[type="number"] {
+      width: 100%;
+      max-width: 10rem;
+      padding: 0.55rem 0.65rem;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      color: var(--text);
+      font-family: inherit;
+      font-size: 0.9rem;
+    }
+    .param-field input[type="number"]:focus {
+      outline: none;
+      border-color: var(--border-focus);
+      box-shadow: 0 0 0 2px rgba(74, 168, 245, 0.15);
+    }
+
+    button.primary {
+      font-family: inherit;
+      font-weight: 600;
+      font-size: 0.95rem;
+      padding: 0.7rem 1.35rem;
+      border-radius: 10px;
+      border: none;
+      cursor: pointer;
+      background: linear-gradient(180deg, var(--accent), var(--accent-dim));
+      color: #fff;
+      margin-top: 1.1rem;
+      box-shadow: 0 2px 10px rgba(74, 168, 245, 0.25);
+    }
+    button.primary:hover:not(:disabled) { filter: brightness(1.05); }
+    button.primary:disabled { opacity: 0.42; cursor: not-allowed; box-shadow: none; }
+    button.ghost {
+      font-family: inherit;
+      font-size: 0.85rem;
+      padding: 0.45rem 0.85rem;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--surface2);
+      color: var(--text);
+      cursor: pointer;
+      margin-right: 0.5rem;
+      margin-top: 0.35rem;
+    }
+    button.ghost:hover { border-color: #4a5a6a; }
+    .status { font-size: 0.88rem; color: var(--muted); margin-top: 0.65rem; }
+    .status.err { color: var(--err); }
+    .status.ok { color: var(--ok); }
+    .meta { font-size: 0.82rem; color: var(--muted); margin: 0.55rem 0 0; line-height: 1.45; }
+    textarea.out {
+      width: 100%;
+      min-height: 220px;
+      font-family: ui-monospace, monospace;
+      font-size: 0.72rem;
+      line-height: 1.35;
+      padding: 0.65rem;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      color: var(--text);
+      resize: vertical;
+    }
+    h2 { font-size: 0.82rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin: 0 0 0.5rem; }
+    .warn { background: rgba(255, 107, 107, 0.1); border: 1px solid rgba(255, 107, 107, 0.45); color: #ffc9c9; padding: 0.75rem; border-radius: 10px; font-size: 0.85rem; white-space: pre-wrap; margin-top: 0.75rem; }
+  </style>
+</head>
+<body>
+  <main>
+    <nav class="topnav"><a href="/">← Image description</a></nav>
+    <h1>Figma banner + raw JSON → semantic mid JSON</h1>
+    <p class="sub">
+      Upload the <strong>banner</strong> (full frame), the <strong>raw layout JSON</strong>, and a <strong>grid PNG</strong> where each cell shows
+      an element thumbnail and its <strong>id</strong>. The server sends <strong>banner first, grid second</strong> to Qwen together with leaf-node JSON
+      (bbox + ids). Use <strong>frame index</strong> for the correct top-level frame (e.g. <code>0</code> for <code>DOOH_1080x1920</code>).
+    </p>
+
+    <div class="card">
+      <div class="grid-uploads">
+        <div class="upload-slot" data-slot="banner">
+          <span class="field-label">Banner image</span>
+          <label class="drop" for="banner">
+            <input type="file" id="banner" accept="image/png,image/jpeg,image/webp" />
+            <span class="drop-hint">Choose file <span class="accent">or drop</span> here</span>
+            <div class="fname empty" id="banner-name">No file</div>
+          </label>
+        </div>
+        <div class="upload-slot" data-slot="json">
+          <span class="field-label">Raw JSON</span>
+          <label class="drop" for="rawjson">
+            <input type="file" id="rawjson" accept=".json,application/json" />
+            <span class="drop-hint">Choose <span class="accent">.json</span> or drop here</span>
+            <div class="fname empty" id="json-name">No file</div>
+          </label>
+        </div>
+        <div class="upload-slot" data-slot="grid">
+          <span class="field-label">Grid PNG (element + id per cell)</span>
+          <label class="drop" for="grid">
+            <input type="file" id="grid" accept="image/png,image/jpeg,image/webp" />
+            <span class="drop-hint">Choose file <span class="accent">or drop</span> here</span>
+            <div class="fname empty" id="grid-name">No file</div>
+          </label>
+        </div>
+      </div>
+
+      <div class="params-grid">
+        <div class="param-field">
+          <span class="plabel" id="lbl-frame">Frame index</span>
+          <input type="number" id="frame-index" min="0" value="0" aria-labelledby="lbl-frame" />
+        </div>
+        <div class="param-field">
+          <span class="plabel" id="lbl-chunk">Nodes per model call</span>
+          <input type="number" id="chunk-size" min="5" max="80" value="40" aria-labelledby="lbl-chunk" />
+        </div>
+        <div class="param-field">
+          <span class="plabel" id="lbl-tokens">Max new tokens</span>
+          <input type="number" id="max-tokens" min="256" max="4096" value="3072" aria-labelledby="lbl-tokens" />
+        </div>
+      </div>
+
+      <button type="button" class="primary" id="go" disabled>Run Qwen naming</button>
+      <div class="status" id="busy"></div>
+      <p class="meta" id="meta" hidden></p>
+      <div id="warnings" hidden class="warn"></div>
+    </div>
+
+    <div class="card" id="out-mid" hidden>
+      <h2>Mid JSON (leaf nodes, original names)</h2>
+      <button type="button" class="ghost" id="dl-mid">Download mid.json</button>
+      <textarea class="out" id="ta-mid" readonly></textarea>
+    </div>
+
+    <div class="card" id="out-sem" hidden>
+      <h2>Semantic mid JSON</h2>
+      <button type="button" class="ghost" id="dl-sem">Download semantic_mid.json</button>
+      <textarea class="out" id="ta-sem" readonly></textarea>
+    </div>
+  </main>
+  <script>
+    const API = "";
+    const bannerInput = document.getElementById("banner");
+    const jsonInput = document.getElementById("rawjson");
+    const gridInput = document.getElementById("grid");
+    const bannerName = document.getElementById("banner-name");
+    const jsonName = document.getElementById("json-name");
+    const gridName = document.getElementById("grid-name");
+    const go = document.getElementById("go");
+    const busy = document.getElementById("busy");
+    const meta = document.getElementById("meta");
+    const warnings = document.getElementById("warnings");
+    const frameIndex = document.getElementById("frame-index");
+    const chunkSize = document.getElementById("chunk-size");
+    const maxTokens = document.getElementById("max-tokens");
+    const outMid = document.getElementById("out-mid");
+    const outSem = document.getElementById("out-sem");
+    const taMid = document.getElementById("ta-mid");
+    const taSem = document.getElementById("ta-sem");
+    const dlMid = document.getElementById("dl-mid");
+    const dlSem = document.getElementById("dl-sem");
+
+    let lastMid = "";
+    let lastSem = "";
+
+    const imgOk = (f) =>
+      f && (/^image\/(png|jpeg|webp)$/i.test(f.type) || /\.(png|jpe?g|webp)$/i.test(f.name || ""));
+
+    function setFileName(el, name, isEmpty) {
+      el.textContent = name;
+      el.classList.toggle("empty", isEmpty);
+    }
+
+    function refresh() {
+      const b = bannerInput.files?.[0];
+      const j = jsonInput.files?.[0];
+      const g = gridInput.files?.[0];
+      setFileName(bannerName, b ? b.name : "No file", !b);
+      setFileName(jsonName, j ? j.name : "No file", !j);
+      setFileName(gridName, g ? g.name : "No file", !g);
+      go.disabled = !(b && j && g && imgOk(b) && imgOk(g));
+    }
+    bannerInput.addEventListener("change", refresh);
+    jsonInput.addEventListener("change", refresh);
+    gridInput.addEventListener("change", refresh);
+
+    /** A label associated with the file input opens the picker once; never also call input.click() on the same zone. */
+    function wireDropSlot(slotSelector, input, acceptCheck) {
+      const slot = document.querySelector(slotSelector);
+      if (!slot) return;
+      ["dragenter", "dragover"].forEach((ev) => {
+        slot.addEventListener(ev, (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          slot.classList.add("dragover");
+        });
+      });
+      ["dragleave", "drop"].forEach((ev) => {
+        slot.addEventListener(ev, (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          if (ev !== "drop") slot.classList.remove("dragover");
+        });
+      });
+      slot.addEventListener("drop", (e) => {
+        slot.classList.remove("dragover");
+        const files = e.dataTransfer?.files;
+        if (!files?.length) return;
+        const f = files[0];
+        if (!acceptCheck(f)) {
+          busy.textContent = "That file type is not accepted here.";
+          busy.className = "status err";
+          return;
+        }
+        const dt = new DataTransfer();
+        dt.items.add(f);
+        input.files = dt.files;
+        input.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+    }
+    wireDropSlot('[data-slot="banner"]', bannerInput, imgOk);
+    wireDropSlot('[data-slot="grid"]', gridInput, imgOk);
+    wireDropSlot(
+      '[data-slot="json"]',
+      jsonInput,
+      (f) => f && (f.type === "application/json" || /\.json$/i.test(f.name || ""))
+    );
+
+    function download(name, text) {
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(new Blob([text], { type: "application/json" }));
+      a.download = name;
+      a.click();
+      URL.revokeObjectURL(a.href);
+    }
+    dlMid.addEventListener("click", () => download("mid.json", lastMid));
+    dlSem.addEventListener("click", () => download("semantic_mid.json", lastSem));
+
+    go.addEventListener("click", async () => {
+      const b = bannerInput.files?.[0];
+      const j = jsonInput.files?.[0];
+      const g = gridInput.files?.[0];
+      if (!b || !j || !g) return;
+
+      const fi = Math.max(0, parseInt(String(frameIndex.value), 10) || 0);
+      frameIndex.value = String(fi);
+      const cs = Math.min(80, Math.max(5, parseInt(String(chunkSize.value), 10) || 40));
+      chunkSize.value = String(cs);
+      const mt = Math.min(4096, Math.max(256, parseInt(String(maxTokens.value), 10) || 3072));
+      maxTokens.value = String(mt);
+
+      go.disabled = true;
+      busy.className = "status";
+      busy.textContent = "Calling backend (may take a while for many chunks)…";
+      meta.hidden = true;
+      warnings.hidden = true;
+      outMid.hidden = true;
+      outSem.hidden = true;
+
+      const fd = new FormData();
+      fd.append("banner", b, b.name);
+      fd.append("raw_json", j, j.name);
+      fd.append("grid", g, g.name);
+      fd.append("frame_index", String(fi));
+      fd.append("chunk_size", String(cs));
+      fd.append("max_new_tokens", String(mt));
+
+      try {
+        const res = await fetch(API + "/figma/semantic-mid-json", { method: "POST", body: fd });
+        const text = await res.text();
+        let data;
+        try {
+          data = JSON.parse(text);
+        } catch {
+          throw new Error(text.slice(0, 400) || res.statusText);
+        }
+        if (!res.ok) {
+          const d = data.detail || data.message || JSON.stringify(data);
+          throw new Error(typeof d === "string" ? d : JSON.stringify(d));
+        }
+
+        lastMid = JSON.stringify(data.mid_json, null, 2);
+        lastSem = JSON.stringify(data.semantic_mid_json, null, 2);
+        taMid.value = lastMid;
+        taSem.value = lastSem;
+        outMid.hidden = false;
+        outSem.hidden = false;
+
+        meta.textContent =
+          `Nodes: ${data.node_count} · Chunks: ${data.chunks_used} · frame_index: ${data.frame_index}` +
+          (data.used_reference_grid != null
+            ? ` · reference grid: ${data.used_reference_grid ? "yes" : "no"}`
+            : "");
+        meta.hidden = false;
+
+        if (data.warnings && data.warnings.length) {
+          warnings.textContent = data.warnings.join("\n");
+          warnings.hidden = false;
+        }
+
+        busy.textContent = "Done.";
+        busy.className = "status ok";
+      } catch (e) {
+        busy.textContent = e.message || String(e);
+        busy.className = "status err";
+      } finally {
+        go.disabled = !(
+          bannerInput.files?.[0] &&
+          jsonInput.files?.[0] &&
+          gridInput.files?.[0] &&
+          imgOk(bannerInput.files[0]) &&
+          imgOk(gridInput.files[0])
+        );
+      }
+    });
+  </script>
+</body>
+</html>

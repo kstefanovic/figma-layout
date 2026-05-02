@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Image description — Qwen</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,600;0,9..40,700;1,9..40,400&family=Fraunces:opsz,wght@9..144,600&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #0f1419;
+      --surface: #1a222c;
+      --border: #2d3a47;
+      --text: #e8eef4;
+      --muted: #8b9aab;
+      --accent: #3d9cf0;
+      --accent-dim: #2563a8;
+      --err: #ff6b6b;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "DM Sans", system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      background-image:
+        radial-gradient(ellipse 80% 50% at 50% -20%, rgba(61, 156, 240, 0.15), transparent);
+    }
+    main {
+      max-width: 720px;
+      margin: 0 auto;
+      padding: 2.5rem 1.25rem 4rem;
+    }
+    h1 {
+      font-family: "Fraunces", Georgia, serif;
+      font-weight: 600;
+      font-size: 1.75rem;
+      letter-spacing: -0.02em;
+      margin: 0 0 0.35rem;
+    }
+    .sub {
+      color: var(--muted);
+      font-size: 0.95rem;
+      margin-bottom: 2rem;
+      line-height: 1.5;
+    }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.25rem 1.35rem;
+      margin-bottom: 1.5rem;
+    }
+    label.file-label {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 0.5rem;
+      min-height: 160px;
+      border: 2px dashed var(--border);
+      border-radius: 10px;
+      cursor: pointer;
+      transition: border-color 0.2s, background 0.2s;
+    }
+    label.file-label:hover, label.file-label.dragover {
+      border-color: var(--accent);
+      background: rgba(61, 156, 240, 0.06);
+    }
+    label.file-label strong { color: var(--accent); }
+    input[type="file"] { display: none; }
+    .row-inline {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0.75rem;
+      margin-top: 1rem;
+    }
+    .row-inline label { font-size: 0.85rem; color: var(--muted); }
+    .row-inline input[type="number"] {
+      width: 5.5rem;
+      padding: 0.45rem 0.5rem;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      color: var(--text);
+      font-family: inherit;
+    }
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+      margin-top: 1rem;
+      align-items: center;
+    }
+    button {
+      font-family: inherit;
+      font-weight: 600;
+      font-size: 0.95rem;
+      padding: 0.65rem 1.25rem;
+      border-radius: 8px;
+      border: none;
+      cursor: pointer;
+      background: linear-gradient(180deg, var(--accent), var(--accent-dim));
+      color: #fff;
+      box-shadow: 0 2px 8px rgba(61, 156, 240, 0.35);
+    }
+    button:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+      box-shadow: none;
+    }
+    .preview-wrap {
+      margin-top: 1rem;
+      text-align: center;
+    }
+    .preview-wrap img {
+      max-width: 100%;
+      max-height: 280px;
+      object-fit: contain;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+    }
+    .status {
+      font-size: 0.9rem;
+      color: var(--muted);
+    }
+    .status.error { color: var(--err); }
+    .results h2 {
+      font-size: 1rem;
+      font-weight: 600;
+      margin: 0 0 0.75rem;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+    .description {
+      margin: 0;
+      font-size: 0.95rem;
+      line-height: 1.6;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    code { font-size: 0.8rem; background: var(--bg); padding: 0.15rem 0.4rem; border-radius: 4px; }
+    .field-label {
+      display: block;
+      font-size: 0.8rem;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 0.45rem;
+    }
+    textarea#prompt {
+      width: 100%;
+      min-height: 120px;
+      padding: 0.75rem 0.85rem;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      color: var(--text);
+      font-family: inherit;
+      font-size: 0.9rem;
+      line-height: 1.45;
+      resize: vertical;
+    }
+    textarea#prompt:focus {
+      outline: none;
+      border-color: var(--accent);
+      box-shadow: 0 0 0 2px rgba(61, 156, 240, 0.2);
+    }
+    .prompt-hint {
+      font-size: 0.8rem;
+      color: var(--muted);
+      margin-top: 0.4rem;
+    }
+    .topnav { margin-bottom: 1rem; font-size: 0.9rem; }
+    .topnav a { color: var(--accent); text-decoration: none; }
+    .topnav a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <main>
+    <nav class="topnav"><a href="/figma.html">Figma: semantic mid JSON</a></nav>
+    <h1>Image → detailed description</h1>
+    <p class="sub">
+      Upload <strong>one</strong> image per run. Edit the prompt if you want; Qwen returns a full description.
+      Open this page from the same host as the API (e.g. <code id="origin-hint"></code>).
+    </p>
+
+    <div class="card">
+      <label class="field-label" for="prompt">Prompt</label>
+      <textarea id="prompt"></textarea>
+      <p class="prompt-hint">This text is sent with your image to the model.</p>
+    </div>
+
+    <div class="card">
+      <label class="file-label" id="drop-zone">
+        <input type="file" id="file" accept="image/png,image/jpeg,image/webp" />
+        <span>Drop one image here or <strong>browse</strong></span>
+        <span class="status" id="file-name">No file selected</span>
+      </label>
+      <div class="preview-wrap" id="preview-wrap" hidden>
+        <img id="preview" alt="Preview" />
+      </div>
+      <div class="row-inline">
+        <label for="max-tokens">Max new tokens</label>
+        <input type="number" id="max-tokens" min="64" max="4096" value="512" />
+      </div>
+      <div class="actions">
+        <button type="button" id="submit" disabled>Describe image</button>
+        <span class="status" id="busy"></span>
+      </div>
+    </div>
+
+    <div class="card results" id="results-wrap" hidden>
+      <h2>Description</h2>
+      <p class="description" id="description"></p>
+    </div>
+  </main>
+  <script>
+    const DEFAULT_PROMPT =
+      "Provide a detailed description of this image. Cover: main subjects and their actions, " +
+      "setting and background, colors and lighting, composition and perspective, any visible text " +
+      "or UI, materials and textures, mood or atmosphere, and other notable details. Write in " +
+      "clear prose; use multiple sentences or short paragraphs as needed.";
+
+    const API = "";
+    document.getElementById("origin-hint").textContent = window.location.origin + "/";
+    document.getElementById("prompt").value = DEFAULT_PROMPT;
+
+    const input = document.getElementById("file");
+    const dropZone = document.getElementById("drop-zone");
+    const fileName = document.getElementById("file-name");
+    const previewWrap = document.getElementById("preview-wrap");
+    const preview = document.getElementById("preview");
+    const maxTokens = document.getElementById("max-tokens");
+    const submit = document.getElementById("submit");
+    const busy = document.getElementById("busy");
+    const resultsWrap = document.getElementById("results-wrap");
+    const description = document.getElementById("description");
+    const promptEl = document.getElementById("prompt");
+
+    const allowed = (f) =>
+      /^image\/(png|jpeg|webp)$/i.test(f.type) ||
+      /\.(png|jpe?g|webp)$/i.test(f.name || "");
+
+    function setSingleFile(file) {
+      if (!file || !allowed(file)) {
+        busy.textContent = "Please use PNG, JPEG, or WebP.";
+        busy.classList.add("error");
+        return false;
+      }
+      busy.classList.remove("error");
+      busy.textContent = "";
+      const dt = new DataTransfer();
+      dt.items.add(file);
+      input.files = dt.files;
+      refreshUI();
+      return true;
+    }
+
+    function refreshUI() {
+      const f = input.files?.[0];
+      fileName.textContent = f ? f.name : "No file selected";
+      submit.disabled = !f;
+      if (!f) {
+        previewWrap.hidden = true;
+        preview.removeAttribute("src");
+        return;
+      }
+      const url = URL.createObjectURL(f);
+      preview.onload = () => URL.revokeObjectURL(url);
+      preview.src = url;
+      previewWrap.hidden = false;
+    }
+
+    input.addEventListener("change", () => {
+      const f = input.files?.[0];
+      if (f && !allowed(f)) {
+        input.value = "";
+        busy.textContent = "Please use PNG, JPEG, or WebP.";
+        busy.classList.add("error");
+        refreshUI();
+        return;
+      }
+      busy.classList.remove("error");
+      busy.textContent = "";
+      refreshUI();
+    });
+
+    ["dragenter", "dragover"].forEach((ev) => {
+      dropZone.addEventListener(ev, (e) => {
+        e.preventDefault();
+        dropZone.classList.add("dragover");
+      });
+    });
+    ["dragleave", "drop"].forEach((ev) => {
+      dropZone.addEventListener(ev, (e) => {
+        e.preventDefault();
+        dropZone.classList.remove("dragover");
+      });
+    });
+    dropZone.addEventListener("drop", (e) => {
+      const dt = e.dataTransfer;
+      const list = dt?.files?.length ? Array.from(dt.files).filter(allowed) : [];
+      if (!list.length) {
+        busy.textContent = "Drop one PNG, JPEG, or WebP file.";
+        busy.classList.add("error");
+        return;
+      }
+      setSingleFile(list[0]);
+    });
+
+    submit.addEventListener("click", async () => {
+      const file = input.files?.[0];
+      if (!file) return;
+      const mt = Math.min(4096, Math.max(64, parseInt(String(maxTokens.value), 10) || 512));
+      maxTokens.value = String(mt);
+
+      submit.disabled = true;
+      busy.textContent = "Calling model…";
+      busy.classList.remove("error");
+      resultsWrap.hidden = true;
+
+      const fd = new FormData();
+      fd.append("file", file, file.name);
+      fd.append("prompt", (promptEl.value || "").trim() || DEFAULT_PROMPT);
+      fd.append("max_new_tokens", String(mt));
+
+      try {
+        const res = await fetch(API + "/analyze-image", { method: "POST", body: fd });
+        const text = await res.text();
+        let data;
+        try {
+          data = JSON.parse(text);
+        } catch {
+          throw new Error(text.slice(0, 200) || res.statusText);
+        }
+        if (!res.ok) {
+          const detail = data.detail || data.message || JSON.stringify(data);
+          throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+        }
+        description.textContent = data.response || "";
+        resultsWrap.hidden = false;
+        busy.textContent = "Done.";
+      } catch (err) {
+        busy.textContent = err.message || String(err);
+        busy.classList.add("error");
+      } finally {
+        submit.disabled = !input.files?.length;
+      }
+    });
+  </script>
+</body>
+</html>
