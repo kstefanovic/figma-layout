@@ -3,10 +3,14 @@ import binascii
 import json
 import os
 import re
+import uuid
+from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import requests
+from PIL import Image
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -54,6 +58,9 @@ PROMPT_MAX_LEN = 8000
 FIGMA_MAX_JSON_BYTES = int(os.getenv("FIGMA_MAX_JSON_BYTES", str(52 * 1024 * 1024)))
 FIGMA_SEMANTIC_MAX_CHUNKS = int(os.getenv("FIGMA_SEMANTIC_MAX_CHUNKS", "80"))
 FIGMA_CONVERT_TIMEOUT = float(os.getenv("FIGMA_CONVERT_TIMEOUT", str(max(REQUEST_TIMEOUT, 900.0))))
+FIGMA_SEMANTIC_RUNS_DIR = Path(
+    os.getenv("FIGMA_SEMANTIC_RUNS_DIR", "runs/figma_convert_semantic_json"),
+).resolve()
 FRONTEND_DIR = Path(__file__).resolve().parent / "frontend"
 
 BANNER_VLM_CATEGORY_PROMPT = """You classify one retail / food banner image into exactly ONE of six campaigns.
@@ -269,6 +276,57 @@ def _data_uri(content: bytes, content_type: str | None) -> str:
     mime_type = content_type or "application/octet-stream"
     encoded = base64.b64encode(content).decode("ascii")
     return f"data:{mime_type};base64,{encoded}"
+
+
+def _new_figma_semantic_run_id() -> str:
+    """UTC wall time + random suffix so each call has a unique, sortable folder name."""
+    ts = datetime.now(timezone.utc)
+    return f"{ts.strftime('%Y%m%dT%H%M%S')}_{ts.microsecond:06d}Z_{uuid.uuid4().hex[:10]}"
+
+
+def _persist_figma_semantic_run_inputs(
+    run_dir: Path,
+    *,
+    run_id: str,
+    max_new_tokens: int,
+    banner_body: bytes,
+    grid_body: bytes,
+    raw_bytes: bytes,
+    banner_content_type: str | None,
+    grid_content_type: str | None,
+    banner_filename: str | None,
+    raw_json_filename: str | None,
+    grid_filename: str | None,
+) -> dict[str, Any]:
+    """Write banner, grid, and raw JSON bytes under ``run_dir``; return meta fields (without status)."""
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "input_banner.png").write_bytes(banner_body)
+    (run_dir / "input_grid.png").write_bytes(grid_body)
+    (run_dir / "input_raw.json").write_bytes(raw_bytes)
+    started = datetime.now(timezone.utc).isoformat()
+    return {
+        "run_id": run_id,
+        "run_dir": str(run_dir),
+        "endpoint": "/figma/convert-semantic-json",
+        "started_at_utc": started,
+        "max_new_tokens": max_new_tokens,
+        "upload_filenames": {
+            "banner": (banner_filename or "").strip() or None,
+            "raw_json": (raw_json_filename or "").strip() or None,
+            "grid": (grid_filename or "").strip() or None,
+        },
+        "input_files": {
+            "input_banner.png": {"bytes": len(banner_body), "content_type": banner_content_type or ""},
+            "input_grid.png": {"bytes": len(grid_body), "content_type": grid_content_type or ""},
+            "input_raw.json": {"bytes": len(raw_bytes)},
+        },
+    }
+
+
+def _write_figma_semantic_run_meta(run_dir: Path, meta: dict[str, Any]) -> None:
+    payload = dict(meta)
+    payload["finished_at_utc"] = datetime.now(timezone.utc).isoformat()
+    (run_dir / "meta.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def _decode_base64_bytes(value: str, field_name: str) -> bytes:
@@ -1061,6 +1119,9 @@ async def figma_convert_semantic_json(
     max_new_tokens: int = Form(4096, ge=256, le=4096),
 ) -> FigmaConvertSemanticResponse:
     warnings: list[str] = []
+    run_id = _new_figma_semantic_run_id()
+    run_dir = FIGMA_SEMANTIC_RUNS_DIR / run_id
+    meta_base: dict[str, Any] | None = None
 
     raw_bytes = await raw_json.read()
     if len(raw_bytes) > FIGMA_MAX_JSON_BYTES:
@@ -1068,15 +1129,47 @@ async def figma_convert_semantic_json(
             status_code=413,
             detail=f"raw_json exceeds limit of {FIGMA_MAX_JSON_BYTES} bytes.",
         )
-    try:
-        raw = json.loads(raw_bytes.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid JSON: {exc}") from exc
 
     banner_body = await banner.read()
     grid_body = await grid.read()
     if not banner_body or not grid_body:
         raise HTTPException(status_code=400, detail="banner and grid must be non-empty files.")
+
+    try:
+        meta_base = _persist_figma_semantic_run_inputs(
+            run_dir,
+            run_id=run_id,
+            max_new_tokens=max_new_tokens,
+            banner_body=banner_body,
+            grid_body=grid_body,
+            raw_bytes=raw_bytes,
+            banner_content_type=banner.content_type,
+            grid_content_type=grid.content_type,
+            banner_filename=banner.filename,
+            raw_json_filename=raw_json.filename,
+            grid_filename=grid.filename,
+        )
+    except OSError as exc:
+        warnings.append(f"Run artifacts not saved under {run_dir}: {exc}")
+        meta_base = None
+
+    try:
+        raw = json.loads(raw_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        if meta_base is not None:
+            try:
+                _write_figma_semantic_run_meta(
+                    run_dir,
+                    {
+                        **meta_base,
+                        "status": "error",
+                        "error": "invalid_raw_json",
+                        "detail": str(exc),
+                    },
+                )
+            except OSError:
+                pass
+        raise HTTPException(status_code=400, detail=f"Invalid JSON: {exc}") from exc
 
     banner_uri = _data_uri(banner_body, banner.content_type)
     grid_uri = _data_uri(grid_body, grid.content_type)
@@ -1099,6 +1192,7 @@ async def figma_convert_semantic_json(
     )
 
     response_text = ""
+    semantic_json: Any = None
     try:
         result = _call_model(
             {
@@ -1109,14 +1203,64 @@ async def figma_convert_semantic_json(
         )
         response_text = result.get("response", "")
         semantic_json = extract_first_json_value(response_text)
-    except HTTPException:
+    except HTTPException as he:
+        if meta_base is not None:
+            try:
+                detail = he.detail
+                if not isinstance(detail, str):
+                    detail = json.dumps(detail, ensure_ascii=False)
+                _write_figma_semantic_run_meta(
+                    run_dir,
+                    {
+                        **meta_base,
+                        "status": "error",
+                        "error": "model_service_http",
+                        "http_status": he.status_code,
+                        "detail": detail,
+                    },
+                )
+            except OSError:
+                pass
         raise
     except ValueError as exc:
+        if meta_base is not None:
+            try:
+                raw_out = response_text if isinstance(response_text, str) else ""
+                (run_dir / "model_response_raw.txt").write_text(raw_out, encoding="utf-8", errors="replace")
+                _write_figma_semantic_run_meta(
+                    run_dir,
+                    {
+                        **meta_base,
+                        "status": "error",
+                        "error": "semantic_json_parse_failed",
+                        "detail": str(exc),
+                        "output_files": ["model_response_raw.txt"],
+                    },
+                )
+            except OSError:
+                pass
         snippet = (response_text if isinstance(response_text, str) else "")[:1200]
         raise HTTPException(
             status_code=502,
             detail=f"Could not parse model output as JSON: {exc}. Output starts with: {snippet!r}",
         ) from exc
+
+    if meta_base is not None:
+        try:
+            (run_dir / "output_semantic.json").write_text(
+                json.dumps(semantic_json, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            _write_figma_semantic_run_meta(
+                run_dir,
+                {
+                    **meta_base,
+                    "status": "ok",
+                    "output_files": ["output_semantic.json"],
+                },
+            )
+        except OSError as exc:
+            warnings.append(f"Run output not written to {run_dir}: {exc}")
 
     return FigmaConvertSemanticResponse(semantic_json=semantic_json, warnings=warnings)
 

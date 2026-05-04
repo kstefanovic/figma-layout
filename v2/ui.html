@@ -72,15 +72,20 @@
         border: 1px solid #e5e5e5;
       }
 
-      #classify-zone-btn:hover {
-        background: #6d28d9;
+      #semantic-json-btn {
+        background: #0d9488;
+      }
+
+      #semantic-json-btn:hover {
+        background: #0f766e;
       }
 
       #html-export-btn {
         background: #059669;
       }
 
-      #copy-html-btn {
+      #copy-html-btn,
+      #copy-semantic-btn {
         background: #475569;
       }
     </style>
@@ -97,11 +102,6 @@
     </div>
 
     <div class="row">
-      <label for="gnn-url">Local GNN Predict URL</label>
-      <input id="gnn-url" value="http://localhost:8000" />
-    </div>
-
-    <div class="row">
       <label for="target-size">Target Size (widthxheight)</label>
       <input id="target-size" value="1024x1280" placeholder="1024x1280" />
     </div>
@@ -111,15 +111,25 @@
     </div>
 
     <div class="row">
-      <button id="convert-btn" type="button" style="background:#64748b">
-        Legacy Convert Selected Frame
+      <label for="semantic-max-tokens">Semantic JSON — max new tokens (256–4096)</label>
+      <input id="semantic-max-tokens" type="number" min="256" max="4096" value="4096" />
+    </div>
+
+    <div class="row">
+      <button id="semantic-json-btn" type="button">
+        Banner + grid PNG + raw JSON → semantic JSON (Qwen)
       </button>
     </div>
 
     <div class="row">
-      <button id="classify-zone-btn" type="button" style="background: #7c3aed">
-        Zone + text zones (v2 JSON)
-      </button>
+      <label>Semantic JSON result</label>
+      <textarea id="semantic-json-result" class="zone-result readonly" readonly>
+Select one frame, then run “Banner + grid PNG + raw JSON → semantic JSON”.
+      </textarea>
+      <div style="display: flex; gap: 8px; margin-top: 8px">
+        <button id="copy-semantic-btn" type="button" style="flex: 1">Copy JSON</button>
+        <button id="download-semantic-btn" type="button" style="flex: 1; background: #334155">Download .json</button>
+      </div>
     </div>
 
     <div class="row">
@@ -138,27 +148,21 @@ Select one frame, then click “JSON to HTML/CSS Exporter”.
       </button>
     </div>
 
-    <div class="row">
-      <label>Zone classification (Qwen v2)</label>
-      <div id="zone-result" class="zone-result readonly">
-        Run the purple button on one selected frame. Pretty-printed JSON from
-        POST /api/v2/analyze-text-zone-visual-json (orientation, zone_type,
-        text_zone.groups: brand_group, headline_group, optional age_badge, legal_text).
-      </div>
-    </div>
-
     <div id="status"></div>
 
     <script>
       const statusEl = document.getElementById("status");
       const pipelineBtn = document.getElementById("pipeline-btn");
-      const convertBtn = document.getElementById("convert-btn");
-      const classifyZoneBtn = document.getElementById("classify-zone-btn");
+      const semanticJsonBtn = document.getElementById("semantic-json-btn");
+      const semanticMaxTokensEl = document.getElementById("semantic-max-tokens");
+      const semanticJsonResultEl = document.getElementById("semantic-json-result");
+      const copySemanticBtn = document.getElementById("copy-semantic-btn");
+      const downloadSemanticBtn = document.getElementById("download-semantic-btn");
       const htmlExportBtn = document.getElementById("html-export-btn");
       const htmlExportResultEl = document.getElementById("html-export-result");
       const copyHtmlBtn = document.getElementById("copy-html-btn");
-      const zoneResultEl = document.getElementById("zone-result");
       const selectedFrameEl = document.getElementById("selected-frame");
+      let lastSemanticFileBase = "semantic_figma";
 
       function setStatus(message) {
         statusEl.textContent = message;
@@ -181,10 +185,6 @@ Select one frame, then click “JSON to HTML/CSS Exporter”.
           `Type: ${info.type}\n` +
           `ID: ${info.id}\n` +
           `Size: ${info.width} × ${info.height}`;
-      }
-
-      function setZoneResult(text) {
-        zoneResultEl.textContent = text;
       }
 
       function setHtmlExportResult(text) {
@@ -234,6 +234,57 @@ Select one frame, then click “JSON to HTML/CSS Exporter”.
         targetSizeEl.value = normalizeTargetSizeText(targetSizeEl.value);
       });
 
+      semanticJsonBtn.onclick = () => {
+        const backendUrl = document.getElementById("backend-url").value.trim();
+        const mt = Math.min(
+          4096,
+          Math.max(256, parseInt(String(semanticMaxTokensEl.value), 10) || 4096),
+        );
+        semanticMaxTokensEl.value = String(mt);
+        setStatus("Building banner + grid + raw JSON and calling backend…");
+        semanticJsonResultEl.value = "…";
+        parent.postMessage(
+          {
+            pluginMessage: {
+              type: "semantic-json-grid-selected-frame",
+              backendUrl,
+              maxNewTokens: mt,
+            },
+          },
+          "*",
+        );
+      };
+
+      copySemanticBtn.onclick = async () => {
+        const text = semanticJsonResultEl.value || "";
+        if (!text.trim() || text.trim() === "…") {
+          setStatus("Nothing to copy.");
+          return;
+        }
+        try {
+          await navigator.clipboard.writeText(text);
+          setStatus("Semantic JSON copied.");
+        } catch (_e) {
+          semanticJsonResultEl.select();
+          document.execCommand("copy");
+          setStatus("Semantic JSON selected / copied.");
+        }
+      };
+
+      downloadSemanticBtn.onclick = () => {
+        const text = semanticJsonResultEl.value || "";
+        if (!text.trim() || text.trim() === "…") {
+          setStatus("No JSON to download.");
+          return;
+        }
+        downloadTextFile(
+          `${safeFileName(lastSemanticFileBase)}.json`,
+          text,
+          "application/json;charset=utf-8",
+        );
+        setStatus("Downloaded " + safeFileName(lastSemanticFileBase) + ".json");
+      };
+
       pipelineBtn.onclick = () => {
         const backendUrl = document.getElementById("backend-url").value.trim();
         const targetSize = normalizeTargetSizeText(document.getElementById("target-size").value);
@@ -246,46 +297,6 @@ Select one frame, then click “JSON to HTML/CSS Exporter”.
             pluginMessage: {
               type: "pipeline-target-json-selected-frame",
               backendUrl,
-              targetSize
-            }
-          },
-          "*"
-        );
-      };
-
-      convertBtn.onclick = () => {
-        const backendUrl = document.getElementById("backend-url").value.trim();
-        const targetPreset = normalizeTargetSizeText(document.getElementById("target-size").value);
-        document.getElementById("target-size").value = targetPreset;
-        const convertMode = "apply_to_clone_fast";
-        setStatus("Preparing request...");
-
-        parent.postMessage(
-          {
-            pluginMessage: {
-              type: "convert-selected-frame",
-              backendUrl,
-              targetPreset,
-              convertMode
-            }
-          },
-          "*"
-        );
-      };
-
-      classifyZoneBtn.onclick = () => {
-        const backendUrl = document.getElementById("backend-url").value.trim();
-        const gnnUrl = document.getElementById("gnn-url").value.trim();
-        const targetSize = normalizeTargetSizeText(document.getElementById("target-size").value);
-        document.getElementById("target-size").value = targetSize;
-        setStatus("Zone + text zones (v2): exporting frame…");
-        setZoneResult("…");
-        parent.postMessage(
-          {
-            pluginMessage: {
-              type: "classify-zone-selected-frame",
-              backendUrl,
-              gnnUrl,
               targetSize
             }
           },
@@ -343,16 +354,14 @@ Select one frame, then click “JSON to HTML/CSS Exporter”.
           setHtmlExportResult(html);
           downloadTextFile(`${safeFileName(msg.fileName)}.html`, html, "text/html;charset=utf-8");
           setStatus(`HTML/CSS file exported: ${safeFileName(msg.fileName)}.html`);
-        } else if (msg.type === "zone-classify-result") {
-          if (!msg.ok || !msg.result) {
-            setZoneResult("Request failed. See status above.");
+        } else if (msg.type === "semantic-json-result") {
+          if (!msg.ok || !msg.jsonText) {
+            semanticJsonResultEl.value = msg.error || "Request failed. See status above.";
             return;
           }
-          try {
-            setZoneResult(JSON.stringify(msg.result, null, 2));
-          } catch (e) {
-            setZoneResult(String(msg.result));
-          }
+          lastSemanticFileBase = safeFileName(msg.fileName || "semantic_figma");
+          semanticJsonResultEl.value = msg.jsonText;
+          setStatus(`Semantic JSON ready (${(msg.jsonText.length / 1024).toFixed(1)} KB). Use Copy or Download.`);
         }
       };
     </script>

@@ -1,12 +1,10 @@
 /**
- * Figma plugin main thread. HTTP contract for ``POST …/api/convert`` is documented in
- * ``API_CONVERT_CONTRACT.md``. Raster payload is **two** Base64 PNGs only: full banner +
- * one element atlas (no per-hash image library).
- *
- * ``POST …/api/v2/analyze-text-zone-visual-json`` (JSON ``banner_png_base64``, same style as ``/api/convert``):
- * orientation, zone_type, and ``text_zone.groups`` (brand_group, headline_group, optional age_badge, legal_text + normalized bboxes) — banner only; no atlas/raw tree.
+ * Figma plugin main thread. Flows:
+ * - ``POST …/pipeline/banner-raw-to-target-json-json`` — banner + raw JSON + target size → layout clone.
+ * - ``POST …/figma/convert-semantic-json`` — banner + element grid PNG + raw JSON (atlas regions) → semantic JSON via Qwen.
+ * - HTML/CSS export from serialized JSON + assets (local).
  */
-figma.showUI(__html__, { width: 400, height: 580 });
+figma.showUI(__html__, { width: 400, height: 720 });
 
 function normalizeType(type) {
   return String(type || "").toLowerCase().replace(/_/g, " ");
@@ -358,13 +356,14 @@ function makeAtlasCellFrame(x, y, width, height) {
 /**
  * Clone leaves into one off-screen frame, pack in rows with large spacing, draw visible
  * bounding boxes, and export a **single** PNG atlas capped to 1920 x 1028.
- * Returns Base64 PNG + region list in final exported pixel coords. Names/paths match ``raw_json``.
+ * Returns PNG bytes + Base64 + region list in final exported pixel coords. Names/paths match ``raw_json``.
  */
 async function buildElementAtlasPngAndRegions(root, maxCount) {
   const entries = collectLeafElementRefs(root, maxCount);
   if (!entries.length) {
     return {
       atlasPngBase64: "",
+      atlasPngBytes: new Uint8Array(0),
       regions: [],
       atlasSize: { width: 0, height: 0, source_width: 0, source_height: 0, scale: 1 },
     };
@@ -386,6 +385,15 @@ async function buildElementAtlasPngAndRegions(root, maxCount) {
   let rowH = 0;
 
   try {
+    let atlasFontReady = false;
+    try {
+      await figma.loadFontAsync({ family: "Inter", style: "Regular" });
+      atlasFontReady = true;
+    } catch (fontErr) {
+      console.warn("buildElementAtlas: could not load Inter for id labels", fontErr);
+    }
+    const ID_LABEL_EXTRA = atlasFontReady ? 24 : 0;
+
     for (const { path, node } of entries) {
       let clone;
       try {
@@ -410,7 +418,7 @@ async function buildElementAtlasPngAndRegions(root, maxCount) {
       const cw = clone.width;
       const ch = clone.height;
       const cellW = cw + ATLAS_CELL_PADDING * 2;
-      const cellH = ch + ATLAS_CELL_PADDING * 2;
+      const cellH = ch + ATLAS_CELL_PADDING * 2 + ID_LABEL_EXTRA;
 
       if (curX + cellW + ATLAS_GAP > ATLAS_MAX_ROW_WIDTH && curX > 0) {
         curY += rowH + ATLAS_GAP;
@@ -426,6 +434,23 @@ async function buildElementAtlasPngAndRegions(root, maxCount) {
       const bboxRect = makeBoundingBoxRect(ATLAS_CELL_PADDING, ATLAS_CELL_PADDING, cw, ch, 1);
       cell.appendChild(bboxRect);
       bboxRects.push(bboxRect);
+
+      if (atlasFontReady) {
+        try {
+          const idLabel = figma.createText();
+          idLabel.name = "__atlas_id_label__";
+          idLabel.fontName = { family: "Inter", style: "Regular" };
+          idLabel.fontSize = Math.min(11, Math.max(8, Math.round(cw / 22)));
+          const rawId = String(node.id || path || "");
+          idLabel.characters = rawId.length > 40 ? rawId.slice(0, 37) + "…" : rawId;
+          idLabel.fills = [{ type: "SOLID", color: { r: 0.1, g: 0.1, b: 0.12 } }];
+          cell.appendChild(idLabel);
+          idLabel.x = ATLAS_CELL_PADDING;
+          idLabel.y = ATLAS_CELL_PADDING + ch + 4;
+        } catch (te) {
+          console.warn("buildElementAtlas: id label failed", path, te);
+        }
+      }
 
       layoutRegions.push({
         path,
@@ -481,6 +506,7 @@ async function buildElementAtlasPngAndRegions(root, maxCount) {
       }),
     );
     return {
+      atlasPngBytes: new Uint8Array(bytes),
       atlasPngBase64: uint8ToBase64(bytes),
       regions,
       atlasSize: {
@@ -570,6 +596,72 @@ function uint8ToBase64(bytes) {
   }
 
   return result;
+}
+
+function concatUint8Arrays(pieces) {
+  let total = 0;
+  for (const p of pieces) {
+    total += p.length;
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const p of pieces) {
+    out.set(p, offset);
+    offset += p.length;
+  }
+  return out;
+}
+
+/** UTF-8 encode string to bytes (Figma main thread has no FormData/Blob). */
+function utf8Bytes(s) {
+  const str = String(s);
+  if (typeof TextEncoder !== "undefined") {
+    return new TextEncoder().encode(str);
+  }
+  const bytes = [];
+  for (let i = 0; i < str.length; i++) {
+    let c = str.charCodeAt(i);
+    if (c < 0x80) {
+      bytes.push(c);
+    } else if (c < 0x800) {
+      bytes.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));
+    } else if (c < 0xd800 || c >= 0xe000) {
+      bytes.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
+    } else {
+      i++;
+      c = 0x10000 + (((c & 0x3ff) << 10) | (str.charCodeAt(i) & 0x3ff));
+      bytes.push(
+        0xf0 | (c >> 18),
+        0x80 | ((c >> 12) & 0x3f),
+        0x80 | ((c >> 6) & 0x3f),
+        0x80 | (c & 0x3f),
+      );
+    }
+  }
+  return new Uint8Array(bytes);
+}
+
+/**
+ * multipart/form-data without FormData (not available in Figma plugin sandbox).
+ * @param {string} boundary
+ * @param {{ name: string, filename?: string | null, contentType: string, body: Uint8Array }}[] parts
+ */
+function buildMultipartFormDataBody(boundary, parts) {
+  const chunks = [];
+  for (const part of parts) {
+    chunks.push(utf8Bytes("--" + boundary + "\r\n"));
+    let head = 'Content-Disposition: form-data; name="' + part.name + '"';
+    if (part.filename) {
+      head += '; filename="' + part.filename + '"';
+    }
+    head += "\r\nContent-Type: " + part.contentType + "\r\n\r\n";
+    chunks.push(utf8Bytes(head));
+    const body = part.body instanceof Uint8Array ? part.body : new Uint8Array(part.body);
+    chunks.push(body);
+    chunks.push(utf8Bytes("\r\n"));
+  }
+  chunks.push(utf8Bytes("--" + boundary + "--\r\n"));
+  return concatUint8Arrays(chunks);
 }
 
 function stampOriginalNodeIds(root) {
@@ -697,44 +789,6 @@ function setSemanticName(node, itemOrName) {
   return true;
 }
 
-function cloneFrameBeside(sourceFrame) {
-  const convertedFrame = sourceFrame.clone();
-  convertedFrame.x = sourceFrame.x + sourceFrame.width + 80;
-  convertedFrame.y = sourceFrame.y;
-  convertedFrame.name = sourceFrame.name;
-  figma.currentPage.appendChild(convertedFrame);
-  return convertedFrame;
-}
-
-function selectionBounds(nodes) {
-  let minX = Infinity;
-  let minY = Infinity;
-  let maxX = -Infinity;
-  let maxY = -Infinity;
-  for (const node of nodes) {
-    if (!node || !("absoluteTransform" in node) || !("width" in node) || !("height" in node)) continue;
-    const t = node.absoluteTransform;
-    const x = t[0][2];
-    const y = t[1][2];
-    minX = Math.min(minX, x);
-    minY = Math.min(minY, y);
-    maxX = Math.max(maxX, x + node.width);
-    maxY = Math.max(maxY, y + node.height);
-  }
-  if (!Number.isFinite(minX)) return { x: 0, y: 0, width: 0, height: 0, right: 0, bottom: 0 };
-  return { x: minX, y: minY, width: maxX - minX, height: maxY - minY, right: maxX, bottom: maxY };
-}
-
-function cloneFrameToSemanticOutputArea(sourceFrame, selectionBox, index) {
-  const gap = Math.max(800, selectionBox.width * 0.45);
-  const convertedFrame = sourceFrame.clone();
-  convertedFrame.x = selectionBox.right + gap;
-  convertedFrame.y = selectionBox.y + index * (sourceFrame.height + 120);
-  convertedFrame.name = sourceFrame.name;
-  figma.currentPage.appendChild(convertedFrame);
-  return convertedFrame;
-}
-
 function parseTargetSize(value, fallbackFrame) {
   const raw = String(value || "").trim();
   if (!raw || raw.toLowerCase() === "same") {
@@ -752,35 +806,6 @@ function parseTargetSize(value, fallbackFrame) {
 
 function targetSizeName(targetResolution) {
   return `${Math.round(targetResolution.width)}x${Math.round(targetResolution.height)}`;
-}
-
-async function callGnnPredict(gnnUrl, rawJson, targetResolution) {
-  const url = String(gnnUrl || "").trim();
-  if (!url) throw new Error("GNN Predict URL is empty.");
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      raw_json: rawJson,
-      origin_graph: rawJson,
-      target_resolution: targetResolution,
-      target_width: targetResolution.width,
-      target_height: targetResolution.height,
-    }),
-  });
-  const text = await response.text();
-  let data = null;
-  try {
-    data = text ? JSON.parse(text) : null;
-  } catch (e) {
-    data = null;
-  }
-  if (!response.ok) {
-    const detail = data && data.detail != null ? JSON.stringify(data.detail) : text || `HTTP ${response.status}`;
-    throw new Error(`GNN predict failed: ${detail}`);
-  }
-  if (!data || typeof data !== "object") throw new Error("Invalid JSON from GNN predictor.");
-  return data.predicted_json || data.final_json || data.output_json || data.graph || data;
 }
 
 async function callBannerRawTargetPipeline(backendUrl, bannerPngBase64, rawJson, targetResolution) {
@@ -1727,19 +1752,6 @@ figma.ui.onmessage = async (msg) => {
         { timeout: 8 },
       );
 
-      figma.ui.postMessage({
-        type: "zone-classify-result",
-        ok: true,
-        result: {
-          pipeline: "banner_raw_to_target_json",
-          category: result.category,
-          selected_candidate: result.selected_candidate,
-          target_width: result.target_width,
-          target_height: result.target_height,
-          draw_mode: drawMode,
-          apply_summary: applySummary,
-        },
-      });
       figma.ui.postMessage({ type: "done" });
       sendSelectionInfo();
     } catch (err) {
@@ -1759,320 +1771,135 @@ figma.ui.onmessage = async (msg) => {
     return;
   }
 
-  if (msg.type === "classify-zone-selected-frame") {
+  if (msg.type === "semantic-json-grid-selected-frame") {
     const selection = figma.currentPage.selection;
-    const selectedFrames = selection.filter((node) => node && node.type === "FRAME");
-    if (selectedFrames.length === 0 || selectedFrames.length !== selection.length) {
-      postError("Select one or more frames only.");
+    if (selection.length !== 1 || selection[0].type !== "FRAME") {
+      postError("Select exactly one frame.");
       sendSelectionInfo();
       return;
     }
+
+    const selectedFrame = selection[0];
     const backendUrl = String(msg.backendUrl || "").trim().replace(/\/+$/, "");
     if (!backendUrl) {
       postError("Backend URL is empty.");
       return;
     }
-    const gnnUrl = String(msg.gnnUrl || "").trim();
-    if (!gnnUrl) {
-      postError("GNN Predict URL is empty.");
-      return;
-    }
-    const requestUrl = backendUrl + "/api/v2/analyze-text-zone-visual-json";
-    try {
-      const box = selectionBounds(selectedFrames);
-      const convertedFrames = [];
-      const results = [];
-      for (let i = 0; i < selectedFrames.length; i++) {
-        const frame = selectedFrames[i];
-        const targetResolution = parseTargetSize(msg.targetSize, frame);
-        postStatus(`GNN ${i + 1}/${selectedFrames.length}: ${frame.name} → ${targetResolution.width}×${targetResolution.height}`);
-        const stampedNodeCount = stampOriginalNodeIds(frame);
-        const origin = getOrigin(frame);
-        const rawJson = serializeNode(frame, origin, "");
-        rawJson.templateId = "figma_plugin";
-        const predictedJson = await callGnnPredict(gnnUrl, rawJson, targetResolution);
-        const convertedFrame = cloneFrameToSemanticOutputArea(frame, box, i);
-        const gnnApplySummary = applyPredictedJsonToClone(predictedJson, convertedFrame);
-        convertedFrames.push(convertedFrame);
 
-        postStatus(`Backend semantics ${i + 1}/${selectedFrames.length}: ${convertedFrame.name}`);
-        const generatedOrigin = getOrigin(convertedFrame);
-        const generatedRawJson = serializeNode(convertedFrame, generatedOrigin, "");
-        generatedRawJson.templateId = "figma_plugin_gnn_generated";
-        const pngBytes = await exportFramePngBytes(convertedFrame);
-        const pngBase64 = uint8ToBase64(pngBytes);
-        console.log("POST analyze-text-zone-visual:", requestUrl, "frame:", convertedFrame.name, "gnn:", gnnApplySummary);
-        const requestBody = { banner_png_base64: pngBase64, raw_json: generatedRawJson };
-        const response = await fetch(requestUrl, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify(requestBody),
-        });
-        const text = await response.text();
-        let data = null;
-        try {
-          data = text ? JSON.parse(text) : null;
-        } catch (parseErr) {
-          data = null;
-        }
-        if (!response.ok) {
-          const detail =
-            data && typeof data === "object" && data.detail != null
-              ? typeof data.detail === "string"
-                ? data.detail
-                : JSON.stringify(data.detail)
-              : text || "HTTP " + String(response.status);
-          throw new Error(`Frame ${i + 1}/${selectedFrames.length} (${frame.name}): ${detail}`);
-        }
-        if (!data || typeof data !== "object") {
-          throw new Error(`Invalid JSON from backend for frame ${frame.name}.`);
-        }
-        let finalSummary = null;
-        if (data.final_json && typeof data.final_json === "object") {
-          finalSummary = applyFinalJsonToClone(data.final_json, convertedFrame);
-          console.log("Final JSON clone summary:", frame.name, finalSummary, "stamped:", stampedNodeCount, "gnn:", gnnApplySummary);
-        }
-        results.push({ frame: frame.name, result: data, summary: finalSummary, gnn: gnnApplySummary });
-      }
-      postStatus(`Zone + text-zone analysis complete for ${selectedFrames.length} frame(s).`);
-      figma.ui.postMessage({
-        type: "zone-classify-result",
-        ok: true,
-        result: results.length === 1 ? results[0].result : { batch: results },
-      });
-      if (convertedFrames.length > 0) {
-        figma.currentPage.selection = convertedFrames;
-        figma.viewport.scrollAndZoomIntoView([...selectedFrames, ...convertedFrames]);
-      }
-      figma.notify(
-        `Processed ${selectedFrames.length} frame(s); created ${convertedFrames.length} semantic clone(s).`,
-        { timeout: 6 },
+    const maxNewTokens = Math.min(4096, Math.max(256, parseInt(String(msg.maxNewTokens || "4096"), 10) || 4096));
+
+    try {
+      postStatus("Semantic JSON: stamping node ids…");
+      stampOriginalNodeIds(selectedFrame);
+
+      postStatus("Semantic JSON: serializing raw JSON…");
+      const origin = getOrigin(selectedFrame);
+      const rawJson = serializeNode(selectedFrame, origin, "");
+      rawJson.templateId = "figma_plugin_semantic_grid";
+
+      postStatus("Semantic JSON: exporting banner PNG…");
+      const bannerBytes = await exportFramePngBytes(selectedFrame);
+
+      postStatus("Semantic JSON: building element grid PNG…");
+      const { atlasPngBytes, regions, atlasSize } = await buildElementAtlasPngAndRegions(
+        selectedFrame,
+        MAX_ELEMENT_LAYER_PNGS,
       );
+      if (!atlasPngBytes || !atlasPngBytes.length) {
+        throw new Error("Grid atlas export failed (empty PNG).");
+      }
+      if (!regions.length) {
+        throw new Error("Grid atlas has no regions (no packable leaf elements).");
+      }
+      injectAtlasRegionsIntoRawJson(rawJson, regions);
+      attachAtlasMetadataToRawJson(rawJson, atlasSize, regions);
+
+      const requestUrl = `${backendUrl}/figma/convert-semantic-json`;
+      postStatus("Semantic JSON: calling backend + Qwen (may take several minutes)…");
+
+      const jsonStr = JSON.stringify(rawJson);
+      const bannerU8 =
+        bannerBytes instanceof Uint8Array ? bannerBytes : new Uint8Array(bannerBytes);
+
+      const boundary =
+        "----figmaSemantic" +
+        Math.random().toString(36).slice(2) +
+        Date.now().toString(36) +
+        Math.random().toString(36).slice(2);
+      const mpBody = buildMultipartFormDataBody(boundary, [
+        { name: "banner", filename: "banner.png", contentType: "image/png", body: bannerU8 },
+        { name: "grid", filename: "elements.png", contentType: "image/png", body: atlasPngBytes },
+        {
+          name: "raw_json",
+          filename: "raw.json",
+          contentType: "application/json; charset=utf-8",
+          body: utf8Bytes(jsonStr),
+        },
+        {
+          name: "max_new_tokens",
+          filename: null,
+          contentType: "text/plain; charset=utf-8",
+          body: utf8Bytes(String(maxNewTokens)),
+        },
+      ]);
+
+      const response = await fetch(requestUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "multipart/form-data; boundary=" + boundary,
+        },
+        body: mpBody,
+      });
+      const responseText = await response.text();
+      let data = null;
+      try {
+        data = responseText ? JSON.parse(responseText) : null;
+      } catch (_parseErr) {
+        data = null;
+      }
+
+      if (!response.ok) {
+        const detail =
+          data && typeof data === "object" && data.detail != null
+            ? typeof data.detail === "string"
+              ? data.detail
+              : JSON.stringify(data.detail)
+            : responseText || "HTTP " + String(response.status);
+        throw new Error(detail);
+      }
+
+      if (!data || typeof data !== "object" || !("semantic_json" in data)) {
+        throw new Error("Backend response missing semantic_json.");
+      }
+
+      const pretty = JSON.stringify(data.semantic_json, null, 2);
+      figma.ui.postMessage({
+        type: "semantic-json-result",
+        ok: true,
+        jsonText: pretty,
+        fileName: `${selectedFrame.name || "semantic"}-${Math.round(selectedFrame.width)}x${Math.round(selectedFrame.height)}`,
+      });
+      postStatus("Semantic JSON: done.");
       figma.ui.postMessage({ type: "done" });
       sendSelectionInfo();
     } catch (err) {
-      console.error("Analyze text-zone visual failed:", err);
-      var msgText =
-        err && err.stack
-          ? err.message + "\n\n" + err.stack
-          : String(err && err.message ? err.message : err);
+      console.error("Semantic JSON grid flow failed:", err);
+      let errText =
+        err && err.stack ? err.message + "\n\n" + err.stack : String(err && err.message ? err.message : err);
       if (err && err.message === "Failed to fetch") {
-        msgText +=
-          "\n\nFigma only allows requests to origins listed in manifest.json " +
-          "networkAccess.devAllowedDomains (scheme, host, and port must match exactly). " +
-          "Example: http://localhost:30079 and http://127.0.0.1:30079 are different. " +
-          "After changing manifest.json, reload the plugin from Plugins → Development.";
+        errText +=
+          "\n\nFigma only allows requests to origins listed in manifest.json networkAccess.devAllowedDomains. " +
+          "Match Backend URL exactly, then reload the plugin.";
       }
-      postError(msgText);
-      figma.ui.postMessage({ type: "zone-classify-result", ok: false });
+      postError(errText);
+      figma.ui.postMessage({
+        type: "semantic-json-result",
+        ok: false,
+        error: err && err.message ? err.message : String(err),
+      });
       sendSelectionInfo();
     }
     return;
-  }
-
-  if (msg.type !== "convert-selected-frame") return;
-
-  const selection = figma.currentPage.selection;
-
-  if (selection.length !== 1 || selection[0].type !== "FRAME") {
-    postError("Select exactly one frame.");
-    sendSelectionInfo();
-    return;
-  }
-
-  const selectedFrame = selection[0];
-  const origin = getOrigin(selectedFrame);
-
-  try {
-    console.log("Selected frame:", {
-      id: selectedFrame.id,
-      name: selectedFrame.name
-    });
-
-    const stampedNodeCount = stampOriginalNodeIds(selectedFrame);
-    console.log("Number of original nodes stamped:", stampedNodeCount);
-
-    postStatus("Step 1/5: Serializing selected frame...");
-
-    let rawJson = serializeNode(selectedFrame, origin, "");
-    rawJson.templateId = "figma_plugin";
-
-    postStatus("Step 2/5: Exporting banner.png...");
-    const pngBytes = await exportFramePngBytes(selectedFrame);
-
-    postStatus("Step 3/5: Encoding banner.png...");
-    const pngBase64 = uint8ToBase64(pngBytes);
-
-    postStatus("Step 4/5: Building elements.png with visible bounding boxes…");
-    const {
-      atlasPngBase64: elementAtlasPngBase64,
-      regions: elementAtlasRegions,
-      atlasSize: elementAtlasSize,
-    } =
-      await buildElementAtlasPngAndRegions(selectedFrame, MAX_ELEMENT_LAYER_PNGS);
-    injectAtlasRegionsIntoRawJson(rawJson, elementAtlasRegions);
-    attachAtlasMetadataToRawJson(rawJson, elementAtlasSize, elementAtlasRegions);
-    console.log("Element atlas regions:", elementAtlasRegions.length);
-    console.log("elements.png size:", elementAtlasSize);
-
-    let targetWidth = selectedFrame.width;
-    let targetHeight = selectedFrame.height;
-
-    if (msg.targetPreset && msg.targetPreset !== "same") {
-      const parsedTarget = parseTargetSize(msg.targetPreset, selectedFrame);
-      targetWidth = parsedTarget.width;
-      targetHeight = parsedTarget.height;
-    }
-
-    const requestUrl = `${msg.backendUrl}/api/convert`;
-    console.log("Calling backend:", requestUrl);
-
-    postStatus("Step 5/5: Calling backend...");
-
-    const requestedMode = String(msg.convertMode || "apply_to_clone_fast").trim();
-    const useQwen = requestedMode === "apply_to_clone_vlm";
-    const qwenMode = requestedMode === "apply_to_clone_vlm" ? "scene_only" : undefined;
-
-    let response;
-
-    try {
-      // Backend ``ConvertRequest`` uses ``extra='allow'`` so forward-compatible keys are kept.
-      const requestBody = {
-        banner_png_base64: pngBase64,
-        raw_json: rawJson,
-        target_width: targetWidth,
-        target_height: targetHeight,
-        mode: requestedMode || "apply_to_clone_fast",
-        use_qwen: useQwen,
-        element_atlas_png_base64: elementAtlasPngBase64,
-        element_atlas_regions: elementAtlasRegions,
-        element_atlas_regions_count: elementAtlasRegions.length,
-      };
-      if (qwenMode) {
-        requestBody.qwen_mode = qwenMode;
-      }
-
-      let bodyString;
-      try {
-        bodyString = JSON.stringify(requestBody);
-      } catch (stringifyErr) {
-        console.error("JSON.stringify(requestBody) failed:", stringifyErr);
-        throw new Error(
-          `Failed to serialize request (try fewer layers or smaller frame): ${
-            stringifyErr && stringifyErr.message ? stringifyErr.message : stringifyErr
-          }`,
-        );
-      }
-
-      const approxMb = (bodyString.length / (1024 * 1024)).toFixed(2);
-      console.log(
-        "POST /api/convert payload:",
-        bodyString.length,
-        "chars (~",
-        approxMb,
-        "MB), atlas regions:",
-        elementAtlasRegions.length,
-      );
-      postStatus(
-        `Sending ~${approxMb} MB (banner.png + elements.png + raw JSON, ${elementAtlasRegions.length} boxes). Backend will flatten raw JSON to mid.json…`,
-      );
-
-      response = await fetch(requestUrl, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: bodyString,
-      });
-    } catch (e) {
-      console.error("Fetch failed before response:", e);
-      throw new Error(`Fetch failed for ${requestUrl}: ${e && e.message ? e.message : e}`);
-    }
-
-    if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`Backend error ${response.status}: ${text}`);
-    }
-
-    const result = await response.json();
-    console.log("Backend result:", result);
-    if (result.debug && result.debug.mid_json_path) {
-      console.log("Backend mid.json:", result.debug.mid_json_path);
-    }
-
-    if (!result || typeof result !== "object") {
-      throw new Error("Backend response is invalid.");
-    }
-
-    const supportedModes = new Set([
-      "apply_to_clone",
-      "apply_to_clone_fast",
-      "apply_to_clone_vlm",
-      "full_layout_debug"
-    ]);
-    if (result.mode && !supportedModes.has(result.mode)) {
-      throw new Error(`Unsupported backend mode: ${result.mode}`);
-    }
-
-    postStatus("Applying semantics to cloned frame...");
-    const convertedFrame = cloneFrameBeside(selectedFrame);
-    console.log("Converted frame:", {
-      id: convertedFrame.id,
-      name: convertedFrame.name
-    });
-
-    const semanticSummary = applySemanticsToClone(result, convertedFrame);
-    console.log("Total cloned nodes:", semanticSummary.mapped);
-    console.log("Updates received:", semanticSummary.updatesReceived);
-    console.log("Updates applied by id:", semanticSummary.updatesAppliedById);
-    console.log("Updates applied by path:", semanticSummary.updatesAppliedByPath);
-    console.log("Semantic elements received:", semanticSummary.semanticElementsReceived);
-    console.log("Semantic elements applied:", semanticSummary.semanticElementsApplied);
-    console.log("Semantic groups received:", semanticSummary.semanticGroupsReceived);
-    console.log("Semantic groups applied:", semanticSummary.semanticGroupsApplied);
-    if (result.debug && result.debug.mid_json_path) {
-      console.log("Mid JSON used by backend:", result.debug.mid_json_path);
-    }
-    console.log("Renamed visible containers:", semanticSummary.renamedVisibleContainers);
-    console.log("Groups created:", semanticSummary.groupsCreated);
-    console.log("Groups skipped:", semanticSummary.groupsSkipped);
-    console.log("Unmatched backend ids:", semanticSummary.missingSourceIds);
-    console.log("Unmatched backend paths:", semanticSummary.missingPaths);
-    console.log("Nodes still generic names:", semanticSummary.remainingGeneric);
-
-    figma.currentPage.selection = [convertedFrame];
-    figma.viewport.scrollAndZoomIntoView([selectedFrame, convertedFrame]);
-
-    figma.notify(
-      `Converted frame created with semantic naming.\n` +
-        `Stamped nodes: ${stampedNodeCount}\n` +
-        `Mapped cloned nodes: ${semanticSummary.mapped}\n` +
-        `Updates: ${semanticSummary.updatesReceived}\n` +
-        `Updates by id/path: ${semanticSummary.updatesAppliedById}/${semanticSummary.updatesAppliedByPath}\n` +
-        `Semantic elements: ${semanticSummary.semanticElementsReceived}\n` +
-        `Semantic elements applied: ${semanticSummary.semanticElementsApplied}\n` +
-        `Semantic groups: ${semanticSummary.semanticGroupsReceived}\n` +
-        `Semantic groups applied: ${semanticSummary.semanticGroupsApplied}\n` +
-        `Renamed visible containers: ${semanticSummary.renamedVisibleContainers}\n` +
-        `Groups created: ${semanticSummary.groupsCreated}\n` +
-        `Groups skipped: ${semanticSummary.groupsSkipped}\n` +
-        `Missing source ids: ${semanticSummary.missingSourceIds.length}\n` +
-        `Missing paths: ${semanticSummary.missingPaths.length}\n` +
-        `Generic names remaining: ${semanticSummary.remainingGeneric.length}`,
-      { timeout: 8 }
-    );
-
-    figma.ui.postMessage({ type: "done" });
-    sendSelectionInfo();
-  } catch (err) {
-    console.error("Convert failed:", err);
-    postError(
-      err && err.stack
-        ? `${err.message}\n\n${err.stack}`
-        : String(err && err.message ? err.message : err)
-    );
   }
 };
 
