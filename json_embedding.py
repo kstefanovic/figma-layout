@@ -1,10 +1,7 @@
 """Local Figma JSON embedding indexes grouped by class number.
 
 The raw files are expected at:
-  raw_jsons/1.json
-  raw_jsons/2.json
-  raw_jsons/3.json
-  raw_jsons/4.json
+  raw_jsons/1.json … raw_jsons/6.json (one file per class number).
 
 Each raw file can contain many top-level Figma frame JSON objects. This module
 embeds each top-level frame and stores one index per class.
@@ -25,7 +22,9 @@ from typing import Any
 RAW_JSON_DIR = Path("raw_jsons")
 EMBEDDING_DIR = Path("json_embeddings")
 EMBED_DIM = 256
-VALID_CLASSES = {1, 2, 3, 4}
+VALID_CLASSES = frozenset({1, 2, 3, 4, 5, 6})
+MIN_CLASS_NUMBER = min(VALID_CLASSES)
+MAX_CLASS_NUMBER = max(VALID_CLASSES)
 
 
 def parse_aspect_ratio(value: str | float | int) -> float:
@@ -470,7 +469,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Build/query local Figma JSON embedding indexes.")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("build", help="Build all class indexes from raw_jsons/{1,2,3,4}.json")
+    sub.add_parser("build", help=f"Build all class indexes from raw_jsons/{{1..{MAX_CLASS_NUMBER}}}.json")
 
     q = sub.add_parser("query", help="Query top candidates by class number and aspect ratio")
     q.add_argument("class_number", type=int, choices=sorted(VALID_CLASSES))

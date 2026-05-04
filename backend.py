@@ -25,6 +25,8 @@ from figma_semantic import (
     parse_names_object,
 )
 from json_embedding import (
+    MAX_CLASS_NUMBER,
+    MIN_CLASS_NUMBER,
     VALID_CLASSES,
     attach_full_json,
     build_all_indexes,
@@ -54,17 +56,19 @@ FIGMA_SEMANTIC_MAX_CHUNKS = int(os.getenv("FIGMA_SEMANTIC_MAX_CHUNKS", "80"))
 FIGMA_CONVERT_TIMEOUT = float(os.getenv("FIGMA_CONVERT_TIMEOUT", str(max(REQUEST_TIMEOUT, 900.0))))
 FRONTEND_DIR = Path(__file__).resolve().parent / "frontend"
 
-BANNER_VLM_CATEGORY_PROMPT = """You classify one retail / food banner image into exactly ONE of four campaigns.
+BANNER_VLM_CATEGORY_PROMPT = """You classify one retail / food banner image into exactly ONE of six campaigns.
 
-The four categories (match by main visual theme — product, hero, colors, headline; OCR need not be exact):
+The six categories (match by main visual theme — product, hero, colors, headline; OCR need not be exact):
 
 1. Пряники прямо на ёлку
 2. Пряничный ровер
 3. Мегапорция оливье для гостей
 4. Еловый лимонад с малиной
+5. Имбирный пряничный латте
+6. Праздничная вишня в шоколаде
 
 Output rules:
-- Reply with ONLY the digit 1, 2, 3, or 4.
+- Reply with ONLY the digit 1, 2, 3, 4, 5, or 6.
 - Single line. No other words, no JSON, no markdown, no explanation."""
 
 
@@ -121,9 +125,14 @@ class FigmaConvertSemanticResponse(BaseModel):
 
 
 class BannerCategoryResponse(BaseModel):
-    """VLM banner classification into campaign 1–4."""
+    """VLM banner classification into campaign 1–6."""
 
-    category: int = Field(..., ge=1, le=4, description="Campaign index 1–4 per product brief")
+    category: int = Field(
+        ...,
+        ge=MIN_CLASS_NUMBER,
+        le=MAX_CLASS_NUMBER,
+        description="Campaign index per product brief",
+    )
     raw_model_text: str = Field(default="", description="Trimmed model output used for parsing")
 
 
@@ -165,7 +174,7 @@ class JsonEmbeddingSearchResponse(BaseModel):
 
 
 class BannerSearchPipelineResponse(BaseModel):
-    category: int = Field(..., ge=1, le=4)
+    category: int = Field(..., ge=MIN_CLASS_NUMBER, le=MAX_CLASS_NUMBER)
     raw_model_text: str = ""
     aspect_ratio: float
     top_k: int
@@ -173,7 +182,7 @@ class BannerSearchPipelineResponse(BaseModel):
 
 
 class BannerRawToTargetJsonResponse(BaseModel):
-    category: int = Field(..., ge=1, le=4)
+    category: int = Field(..., ge=MIN_CLASS_NUMBER, le=MAX_CLASS_NUMBER)
     raw_model_text: str = ""
     target_width: float
     target_height: float
@@ -280,8 +289,8 @@ def _normalize_category(text: str) -> str:
     return line.strip()[:200] if line else ""
 
 
-def _parse_banner_category_1_to_4(text: str) -> int:
-    """Extract integer 1–4 from VLM reply (digit only, JSON, or first matching token)."""
+def _parse_banner_category(text: str) -> int:
+    """Extract campaign index from VLM reply (digit only, JSON, or first matching token)."""
     raw = (text or "").strip()
     if not raw:
         raise ValueError("empty model response")
@@ -290,6 +299,9 @@ def _parse_banner_category_1_to_4(text: str) -> int:
     fence = re.search(r"```(?:json|text)?\s*([\s\S]*?)```", raw, re.IGNORECASE)
     if fence:
         inner = fence.group(1).strip()
+
+    def _in_range(n: int) -> bool:
+        return MIN_CLASS_NUMBER <= n <= MAX_CLASS_NUMBER
 
     if inner.startswith("{") or inner.startswith("["):
         try:
@@ -301,27 +313,30 @@ def _parse_banner_category_1_to_4(text: str) -> int:
                 v = parsed.get(key)
                 if isinstance(v, bool):
                     continue
-                if isinstance(v, int) and 1 <= v <= 4:
+                if isinstance(v, int) and _in_range(v):
                     return v
                 if isinstance(v, str) and v.strip().isdigit():
                     n = int(v.strip())
-                    if 1 <= n <= 4:
+                    if _in_range(n):
                         return n
         if isinstance(parsed, list) and len(parsed) == 1:
             only = parsed[0]
-            if isinstance(only, int) and 1 <= only <= 4:
+            if isinstance(only, int) and _in_range(only):
                 return only
 
+    digit_class = rf"[{MIN_CLASS_NUMBER}-{MAX_CLASS_NUMBER}]"
     for line in inner.splitlines():
         s = line.strip()
-        if re.fullmatch(r"[1-4]", s):
+        if re.fullmatch(digit_class, s):
             return int(s)
 
-    m = re.search(r"\b([1-4])\b", inner)
+    m = re.search(rf"\b({digit_class})\b", inner)
     if m:
         return int(m.group(1))
 
-    raise ValueError(f"no digit 1–4 found in: {inner[:300]!r}")
+    raise ValueError(
+        f"no digit {MIN_CLASS_NUMBER}–{MAX_CLASS_NUMBER} found in: {inner[:300]!r}"
+    )
 
 
 def _classify_banner_bytes(body: bytes, content_type: str | None, max_new_tokens: int = 64) -> tuple[int, str]:
@@ -342,11 +357,11 @@ def _classify_banner_bytes(body: bytes, content_type: str | None, max_new_tokens
     )
     raw = (result.get("response") or "").strip()
     try:
-        category = _parse_banner_category_1_to_4(raw)
+        category = _parse_banner_category(raw)
     except ValueError as exc:
         raise HTTPException(
             status_code=502,
-            detail=f"VLM output could not be parsed as 1–4: {exc}. Raw: {raw[:500]!r}",
+            detail=f"VLM output could not be parsed as {MIN_CLASS_NUMBER}–{MAX_CLASS_NUMBER}: {exc}. Raw: {raw[:500]!r}",
         ) from exc
     return category, raw
 
@@ -413,7 +428,7 @@ async def banner_category(
     file: UploadFile = File(..., description="Banner PNG (or JPEG/WebP)"),
     max_new_tokens: int = Form(64, ge=8, le=512),
 ) -> BannerCategoryResponse:
-    """VLM picks which of four Yandex Lavka-style campaigns the banner belongs to (output 1–4)."""
+    """VLM picks which Yandex Lavka-style campaign the banner belongs to (output 1–6)."""
     body = await file.read()
     category, raw = _classify_banner_bytes(body, file.content_type, max_new_tokens=max_new_tokens)
 
@@ -422,7 +437,7 @@ async def banner_category(
 
 @app.post("/json-embeddings/build", response_model=JsonEmbeddingBuildResponse)
 def build_json_embeddings() -> JsonEmbeddingBuildResponse:
-    """Build one local embedding index for each class: raw_jsons/1.json ... raw_jsons/4.json."""
+    """Build one local embedding index per class: raw_jsons/{n}.json for each configured class."""
     try:
         indexes = build_all_indexes()
     except (FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
@@ -442,7 +457,12 @@ def build_json_embeddings() -> JsonEmbeddingBuildResponse:
 
 @app.get("/json-embeddings/search", response_model=JsonEmbeddingSearchResponse)
 def search_json_embeddings(
-    class_number: int = Query(..., ge=1, le=4, description="Select one of the 4 class indexes"),
+    class_number: int = Query(
+        ...,
+        ge=MIN_CLASS_NUMBER,
+        le=MAX_CLASS_NUMBER,
+        description="Select one of the campaign class indexes",
+    ),
     aspect_ratio: str = Query(..., description="Aspect ratio: 16:9, 1080x1920, 1.777, etc."),
     top_k: int = Query(3, ge=1, le=20),
     include_full_json: bool = Query(True, description="Attach the full retrieved top-level Figma JSON frame"),
@@ -474,7 +494,7 @@ async def classify_banner_then_search_json(
     max_new_tokens: int = Form(64, ge=8, le=512),
     include_full_json: bool = Form(True),
 ) -> BannerSearchPipelineResponse:
-    """One flow: classify banner into class 1–4, then search that class index by target resolution."""
+    """One flow: classify banner into a campaign class, then search that class index by target resolution."""
     body = await file.read()
     category, raw = _classify_banner_bytes(body, file.content_type, max_new_tokens=max_new_tokens)
 
@@ -506,7 +526,7 @@ async def banner_raw_to_target_json(
 ) -> BannerRawToTargetJsonResponse:
     """
     One flow:
-    1. Classify banner into class 1-4.
+    1. Classify banner into a campaign class (1–6).
     2. Retrieve top candidates from that class by target resolution/aspect.
     3. Rerank those candidates by similarity to uploaded raw JSON.
     4. Use the selected candidate as the layout guide and resize its bboxes to target resolution.
