@@ -330,7 +330,7 @@ function makeBoundingBoxRect(x, y, width, height, exportScale) {
   rect.resizeWithoutConstraints(Math.max(1, width), Math.max(1, height));
   rect.fills = [];
   rect.strokes = [{ type: "SOLID", color: ATLAS_BOX_COLOR }];
-  rect.strokeWeight = Math.max(4, 6 / Math.max(exportScale, 0.01));
+  rect.strokeWeight = 1;
   rect.strokeAlign = "INSIDE";
   return rect;
 }
@@ -351,6 +351,25 @@ function makeAtlasCellFrame(x, y, width, height) {
   ];
   cell.resizeWithoutConstraints(Math.max(1, width), Math.max(1, height));
   return cell;
+}
+
+/** Load a legible UI font for atlas id labels (Figma availability varies). */
+async function loadAtlasLabelFont() {
+  const candidates = [
+    { family: "Inter", style: "Bold" },
+    { family: "Inter", style: "Regular" },
+    { family: "Roboto", style: "Bold" },
+    { family: "Roboto", style: "Regular" },
+  ];
+  for (const f of candidates) {
+    try {
+      await figma.loadFontAsync(f);
+      return f;
+    } catch (_e) {
+      /* try next */
+    }
+  }
+  return null;
 }
 
 /**
@@ -385,14 +404,8 @@ async function buildElementAtlasPngAndRegions(root, maxCount) {
   let rowH = 0;
 
   try {
-    let atlasFontReady = false;
-    try {
-      await figma.loadFontAsync({ family: "Inter", style: "Regular" });
-      atlasFontReady = true;
-    } catch (fontErr) {
-      console.warn("buildElementAtlas: could not load Inter for id labels", fontErr);
-    }
-    const ID_LABEL_EXTRA = atlasFontReady ? 24 : 0;
+    const labelFont = await loadAtlasLabelFont();
+    const headerH = labelFont ? 46 : 0;
 
     for (const { path, node } of entries) {
       let clone;
@@ -418,7 +431,7 @@ async function buildElementAtlasPngAndRegions(root, maxCount) {
       const cw = clone.width;
       const ch = clone.height;
       const cellW = cw + ATLAS_CELL_PADDING * 2;
-      const cellH = ch + ATLAS_CELL_PADDING * 2 + ID_LABEL_EXTRA;
+      const cellH = headerH + ATLAS_CELL_PADDING + ch + ATLAS_CELL_PADDING;
 
       if (curX + cellW + ATLAS_GAP > ATLAS_MAX_ROW_WIDTH && curX > 0) {
         curY += rowH + ATLAS_GAP;
@@ -428,29 +441,41 @@ async function buildElementAtlasPngAndRegions(root, maxCount) {
 
       const cell = makeAtlasCellFrame(curX, curY, cellW, cellH);
       atlas.appendChild(cell);
-      cell.appendChild(clone);
-      clone.x = ATLAS_CELL_PADDING;
-      clone.y = ATLAS_CELL_PADDING;
-      const bboxRect = makeBoundingBoxRect(ATLAS_CELL_PADDING, ATLAS_CELL_PADDING, cw, ch, 1);
-      cell.appendChild(bboxRect);
-      bboxRects.push(bboxRect);
 
-      if (atlasFontReady) {
+      if (labelFont) {
+        const hdr = figma.createRectangle();
+        hdr.name = "__atlas_cell_header_bg__";
+        hdr.resize(cellW, headerH);
+        hdr.x = 0;
+        hdr.y = 0;
+        hdr.fills = [{ type: "SOLID", color: { r: 0.92, g: 0.93, b: 0.95 } }];
+        hdr.strokes = [{ type: "SOLID", color: { r: 0.72, g: 0.76, b: 0.82 } }];
+        hdr.strokeWeight = 1;
+        hdr.strokeAlign = "INSIDE";
+        cell.appendChild(hdr);
         try {
           const idLabel = figma.createText();
           idLabel.name = "__atlas_id_label__";
-          idLabel.fontName = { family: "Inter", style: "Regular" };
-          idLabel.fontSize = Math.min(11, Math.max(8, Math.round(cw / 22)));
+          idLabel.fontName = labelFont;
+          idLabel.fontSize = Math.min(20, Math.max(14, Math.round(headerH * 0.48)));
           const rawId = String(node.id || path || "");
-          idLabel.characters = rawId.length > 40 ? rawId.slice(0, 37) + "…" : rawId;
-          idLabel.fills = [{ type: "SOLID", color: { r: 0.1, g: 0.1, b: 0.12 } }];
+          const idText = rawId.length > 40 ? rawId.slice(0, 37) + "…" : rawId;
+          idLabel.characters = `id:${idText}`;
+          idLabel.fills = [{ type: "SOLID", color: { r: 0.05, g: 0.08, b: 0.12 } }];
           cell.appendChild(idLabel);
-          idLabel.x = ATLAS_CELL_PADDING;
-          idLabel.y = ATLAS_CELL_PADDING + ch + 4;
+          idLabel.x = 6;
+          idLabel.y = Math.max(2, (headerH - idLabel.height) / 2);
         } catch (te) {
           console.warn("buildElementAtlas: id label failed", path, te);
         }
       }
+
+      cell.appendChild(clone);
+      clone.x = ATLAS_CELL_PADDING;
+      clone.y = headerH + ATLAS_CELL_PADDING;
+      const bboxRect = makeBoundingBoxRect(ATLAS_CELL_PADDING, headerH + ATLAS_CELL_PADDING, cw, ch, 1);
+      cell.appendChild(bboxRect);
+      bboxRects.push(bboxRect);
 
       layoutRegions.push({
         path,
@@ -458,7 +483,7 @@ async function buildElementAtlasPngAndRegions(root, maxCount) {
         name: node.name,
         type: normalizeType(node.type),
         atlas_x: Math.round(curX + ATLAS_CELL_PADDING),
-        atlas_y: Math.round(curY + ATLAS_CELL_PADDING),
+        atlas_y: Math.round(curY + headerH + ATLAS_CELL_PADDING),
         atlas_width: Math.round(cw),
         atlas_height: Math.round(ch),
         cell_x: Math.round(curX),
@@ -481,7 +506,7 @@ async function buildElementAtlasPngAndRegions(root, maxCount) {
     const finalH = Math.max(1, Math.ceil(maxB));
     const scale = atlasExportScale(finalW, finalH);
     for (const bboxRect of bboxRects) {
-      bboxRect.strokeWeight = Math.max(4, 6 / Math.max(scale, 0.01));
+      bboxRect.strokeWeight = Math.max(1, Math.min(2, 0.75 + scale));
     }
 
     if ("resizeWithoutConstraints" in atlas) {
@@ -566,7 +591,8 @@ function attachAtlasMetadataToRawJson(rawJson, atlasSize, regions) {
     scale: atlasSize && atlasSize.scale ? atlasSize.scale : 1,
     region_count: Array.isArray(regions) ? regions.length : 0,
     bbox_gap_px: ATLAS_GAP,
-    bbox_style: "red stroke inside each element region",
+    bbox_style:
+      "each cell: grey header strip with id:<node_id> text, then element thumbnail; red stroke around thumbnail",
   };
 }
 
@@ -1678,6 +1704,7 @@ figma.ui.onmessage = async (msg) => {
   if (msg.type === "pipeline-target-json-selected-frame") {
     const selection = figma.currentPage.selection;
     if (selection.length !== 1 || selection[0].type !== "FRAME") {
+      figma.ui.postMessage({ type: "pipeline-busy", busy: false });
       postError("Select exactly one frame.");
       sendSelectionInfo();
       return;
@@ -1686,11 +1713,13 @@ figma.ui.onmessage = async (msg) => {
     const selectedFrame = selection[0];
     const backendUrl = String(msg.backendUrl || "").trim();
     if (!backendUrl) {
+      figma.ui.postMessage({ type: "pipeline-busy", busy: false });
       postError("Backend URL is empty.");
       return;
     }
 
     try {
+      figma.ui.postMessage({ type: "pipeline-busy", busy: true });
       const targetResolution = parseTargetSize(msg.targetSize, selectedFrame);
       postStatus(`Pipeline: stamping original node ids for ${selectedFrame.name}...`);
       const stampedNodeCount = stampOriginalNodeIds(selectedFrame);
@@ -1767,6 +1796,8 @@ figma.ui.onmessage = async (msg) => {
       }
       postError(pipelineMsg);
       sendSelectionInfo();
+    } finally {
+      figma.ui.postMessage({ type: "pipeline-busy", busy: false });
     }
     return;
   }

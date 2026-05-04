@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 
 from figma_semantic import (
     FIGMA_CONVERT_PROMPT,
+    FIGMA_CONVERT_SYSTEM_PROMPT,
     apply_semantic_names,
     build_naming_user_prompt,
     chunk_list,
@@ -61,6 +62,9 @@ FIGMA_CONVERT_TIMEOUT = float(os.getenv("FIGMA_CONVERT_TIMEOUT", str(max(REQUEST
 FIGMA_SEMANTIC_RUNS_DIR = Path(
     os.getenv("FIGMA_SEMANTIC_RUNS_DIR", "runs/figma_convert_semantic_json"),
 ).resolve()
+# Max long edge (px) for images sent to Qwen on /figma/convert-semantic-json (0 = disable).
+FIGMA_SEMANTIC_BANNER_MAX_EDGE = int(os.getenv("FIGMA_SEMANTIC_BANNER_MAX_EDGE", "1536"))
+FIGMA_SEMANTIC_GRID_MAX_EDGE = int(os.getenv("FIGMA_SEMANTIC_GRID_MAX_EDGE", "1536"))
 FRONTEND_DIR = Path(__file__).resolve().parent / "frontend"
 
 BANNER_VLM_CATEGORY_PROMPT = """You classify one retail / food banner image into exactly ONE of six campaigns.
@@ -276,6 +280,48 @@ def _data_uri(content: bytes, content_type: str | None) -> str:
     mime_type = content_type or "application/octet-stream"
     encoded = base64.b64encode(content).decode("ascii")
     return f"data:{mime_type};base64,{encoded}"
+
+
+def _resize_raster_max_long_edge(data: bytes, max_edge: int) -> tuple[bytes, dict[str, Any]]:
+    """
+    Downscale a raster image so max(width, height) <= max_edge.
+    Returns PNG bytes when resized; otherwise original bytes. ``info`` describes the transform.
+    """
+    info: dict[str, Any] = {"max_edge": max_edge, "resized": False}
+    if max_edge <= 0 or not data:
+        return data, info
+    try:
+        with Image.open(BytesIO(data)) as im:
+            im.load()
+            w, h = im.size
+            info["original_px"] = {"w": w, "h": h}
+            longest = max(w, h)
+            if longest <= max_edge:
+                info["model_px"] = {"w": w, "h": h}
+                return data, info
+
+            if im.mode in ("RGBA", "LA"):
+                rgba = im.convert("RGBA")
+                background = Image.new("RGB", rgba.size, (255, 255, 255))
+                background.paste(rgba, mask=rgba.getchannel("A"))
+                im = background
+            elif im.mode != "RGB":
+                im = im.convert("RGB")
+
+            scale = max_edge / longest
+            nw = max(1, int(round(w * scale)))
+            nh = max(1, int(round(h * scale)))
+            im = im.resize((nw, nh), Image.Resampling.LANCZOS)
+            out = BytesIO()
+            im.save(out, format="PNG", optimize=True)
+            resized = out.getvalue()
+            info["resized"] = True
+            info["model_px"] = {"w": nw, "h": nh}
+            return resized, info
+    except Exception as exc:
+        info["resize_error"] = str(exc)
+        info["model_px"] = info.get("original_px")
+        return data, info
 
 
 def _new_figma_semantic_run_id() -> str:
@@ -1171,8 +1217,30 @@ async def figma_convert_semantic_json(
                 pass
         raise HTTPException(status_code=400, detail=f"Invalid JSON: {exc}") from exc
 
-    banner_uri = _data_uri(banner_body, banner.content_type)
-    grid_uri = _data_uri(grid_body, grid.content_type)
+    banner_model_bytes, banner_resize_info = _resize_raster_max_long_edge(
+        banner_body, FIGMA_SEMANTIC_BANNER_MAX_EDGE
+    )
+    grid_model_bytes, grid_resize_info = _resize_raster_max_long_edge(
+        grid_body, FIGMA_SEMANTIC_GRID_MAX_EDGE
+    )
+    if meta_base is not None:
+        meta_base["model_image_resize"] = {
+            "banner": banner_resize_info,
+            "grid": grid_resize_info,
+        }
+
+    banner_mime = (
+        "image/png"
+        if banner_resize_info.get("resized")
+        else (banner.content_type or "image/png")
+    )
+    grid_mime = (
+        "image/png"
+        if grid_resize_info.get("resized")
+        else (grid.content_type or "image/png")
+    )
+    banner_uri = _data_uri(banner_model_bytes, banner_mime)
+    grid_uri = _data_uri(grid_model_bytes, grid_mime)
 
     raw_text = json.dumps(raw, ensure_ascii=False, separators=(",", ":"))
     user_text = (
@@ -1186,19 +1254,20 @@ async def figma_convert_semantic_json(
         ContentItem(type="image", image=grid_uri),
         ContentItem(type="text", text=user_text),
     ]
-    request = ChatRequest(
-        messages=[ChatMessage(role="user", content=user_content)],
-        max_new_tokens=max_new_tokens,
-    )
+    semantic_messages = [
+        ChatMessage(role="system", content=FIGMA_CONVERT_SYSTEM_PROMPT),
+        ChatMessage(role="user", content=user_content),
+    ]
+    semantic_payload = {
+        "messages": [m.model_dump(exclude_none=True) for m in semantic_messages],
+        "max_new_tokens": max_new_tokens,
+    }
 
     response_text = ""
     semantic_json: Any = None
     try:
         result = _call_model(
-            {
-                "messages": _messages_for_model(request),
-                "max_new_tokens": max_new_tokens,
-            },
+            semantic_payload,
             timeout=FIGMA_CONVERT_TIMEOUT,
         )
         response_text = result.get("response", "")

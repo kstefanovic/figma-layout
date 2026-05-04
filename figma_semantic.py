@@ -8,13 +8,38 @@ import textwrap
 from typing import Any
 
 # Full raw JSON → semantic Figma JSON (single Qwen call: banner + grid + raw text).
+FIGMA_CONVERT_SYSTEM_PROMPT = textwrap.dedent(
+    """
+    You output exactly one JSON object: the same Figma tree as the user’s raw JSON, but every node must get a
+    meaningful English snake_case semantic `name` from the vocabulary the user lists (or a short phrase built only
+    from those vocabulary roots).
+
+    Hard requirements:
+    - Copy `id`, `type`, `bounds`, `characters`, `visible`, `opacity`, `path`, and geometry unchanged unless you
+      intentionally collapse a meaningless wrapper (then keep children and geometry consistent with the rules).
+    - Never use lazy Figma defaults as final semantic names: bare digits ("5", "10"), "Frame", "Rectangle", "Vector",
+      "Ellipse", "Line", "Text", names like "Group 3912003", pixel-size roots like "960x512", or the raw `id` string
+      as `name`.
+    - Never emit ``//`` or ``/* */`` comments inside JSON; output must be strictly parseable (no "omitted for brevity"
+      lines).
+    - In ``characters`` strings use only normal spaces and ``\\n`` escapes—never Unicode line/paragraph separators
+      (U+2028 / U+2029) copied from Figma.
+    - The root frame must be named `banner_root` unless the file is clearly not a full banner (still prefer
+      `banner_root` for single exported frames).
+    - If a node is only decorative clutter, prefer `decoration_group` / `sparkle` / `ornament` etc. from the vocabulary
+      rather than generic "Group…".
+    """
+).strip()
+
 FIGMA_CONVERT_PROMPT = textwrap.dedent(
     """
     You are a strict Figma semantic JSON converter.
 
     Inputs:
     1. Full banner image.
-    2. Grid image where each cell shows one element crop and its raw JSON id.
+    2. Grid image: each cell has a **grey header bar** with text `id:<figma_id>` and, below it, a **thumbnail** of that
+       element. The `<figma_id>` matches the `"id"` field in the raw JSON for the same element—use it to align grid
+       crops with JSON nodes.
     3. Raw Figma JSON with anonymous names.
 
     Goal:
@@ -22,6 +47,10 @@ FIGMA_CONVERT_PROMPT = textwrap.dedent(
 
     Important rules:
     - Output ONLY valid JSON.
+    - Never put ``//`` or ``/* */`` comments inside the JSON; every line must be valid JSON (models often break
+      parsers with ``// ... omitted ...`` — do not do that).
+    - In ``characters`` fields use only printable text, normal spaces, and ``\\n`` for newlines—do not paste invisible
+      Unicode line separators (U+2028 / U+2029) from Figma.
     - Do not explain.
     - Do not create mid_json.
     - Do not invent new elements.
@@ -29,7 +58,10 @@ FIGMA_CONVERT_PROMPT = textwrap.dedent(
     - Use the full banner image for global context.
     - Use the grid image to understand each element by its raw JSON id.
     - Use raw JSON ids exactly as provided.
-    - Replace anonymous "name" values with semantic names.
+    - **Mandatory:** replace **every** `"name"` in the output with a snake_case semantic identifier from the
+      vocabulary below (or a 2–4 word snake_case phrase composed only from those vocabulary roots, e.g.
+      `product_visual_group_left`). Every node including leaves and wrappers must comply—no numeric-only names, no
+      `Group …` leftovers, no dimension strings as names.
     - Remove/collapse unnecessary wrapper groups/frames only when they have no independent visual meaning.
     - When removing a wrapper, preserve all meaningful children and promote them to the correct semantic parent.
     - Keep useful semantic containers such as brand_group, headline_group, hero_group, product_visual_group, legal_group, age_badge_group, decoration_group, background_group.
@@ -86,7 +118,8 @@ FIGMA_CONVERT_PROMPT = textwrap.dedent(
     - Stars/snowflakes/lights/confetti: decoration_group.
     - Large color/photo background: background_group.
 
-    Return the modified semantic JSON in the same general Figma JSON structure, with semantic "name" values and unnecessary wrappers collapsed.
+    Return the modified semantic JSON in the same general Figma JSON structure, with semantic "name" values on
+    **all** nodes and unnecessary wrappers collapsed only where allowed above.
     """
 ).strip()
 
@@ -194,12 +227,89 @@ def build_naming_user_prompt(
     return vision_intro + node_fields + naming_rules
 
 
+def _strip_full_line_double_slash_comments(s: str) -> str:
+    """Remove lines that are only ``//`` comments (models often inject invalid ``// ...`` in JSON)."""
+    out: list[str] = []
+    for line in s.splitlines():
+        if line.lstrip().startswith("//"):
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
+def _normalize_json_string_literals_for_parse(s: str) -> str:
+    """
+    Fix characters inside JSON double-quoted string literals that ``json.loads`` rejects:
+    raw ASCII controls (U+0000–U+001F), Unicode line/paragraph separators (U+2028, U+2029, U+0085), BOM.
+    Models often copy Figma text containing U+2028 instead of a normal space or ``\\n``.
+    """
+    out: list[str] = []
+    in_string = False
+    escape_next = False
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if not in_string:
+            out.append(ch)
+            if ch == '"':
+                slashes = 0
+                j = i - 1
+                while j >= 0 and s[j] == "\\":
+                    slashes += 1
+                    j -= 1
+                if slashes % 2 == 0:
+                    in_string = True
+            i += 1
+            continue
+        if escape_next:
+            out.append(ch)
+            escape_next = False
+            i += 1
+            continue
+        if ch == "\\":
+            out.append(ch)
+            escape_next = True
+            i += 1
+            continue
+        if ch == '"':
+            slashes = 0
+            j = i - 1
+            while j >= 0 and s[j] == "\\":
+                slashes += 1
+                j -= 1
+            if slashes % 2 == 0:
+                in_string = False
+            out.append(ch)
+            i += 1
+            continue
+        o = ord(ch)
+        if o < 0x20:
+            if ch == "\n":
+                out.append("\\n")
+            elif ch == "\r":
+                out.append("\\r")
+            elif ch == "\t":
+                out.append("\\t")
+            else:
+                out.append(f"\\u{o:04x}")
+        elif o in (0x2028, 0x2029, 0x0085):
+            out.append(" ")
+        elif o == 0xFEFF:
+            pass
+        else:
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def extract_first_json_object(text: str) -> Any:
     """Parse first top-level JSON object from model text (strips optional ``` fences)."""
     t = text.strip()
     fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", t, re.IGNORECASE)
     if fence:
         t = fence.group(1).strip()
+    t = _strip_full_line_double_slash_comments(t)
+    t = _normalize_json_string_literals_for_parse(t)
     start = t.find("{")
     if start < 0:
         raise ValueError("No JSON object found in model output")
@@ -220,6 +330,8 @@ def extract_first_json_value(text: str) -> Any:
     fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", t, re.IGNORECASE)
     if fence:
         t = fence.group(1).strip()
+    t = _strip_full_line_double_slash_comments(t)
+    t = _normalize_json_string_literals_for_parse(t)
     brace = t.find("{")
     bracket = t.find("[")
     if brace < 0 and bracket < 0:

@@ -88,6 +88,58 @@
       #copy-semantic-btn {
         background: #475569;
       }
+
+      button:disabled {
+        opacity: 0.55;
+        cursor: not-allowed;
+      }
+
+      .pipeline-overlay {
+        position: fixed;
+        inset: 0;
+        background: rgba(255, 255, 255, 0.78);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 50;
+      }
+
+      .pipeline-overlay[hidden] {
+        display: none !important;
+      }
+
+      .pipeline-overlay-card {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 12px;
+        padding: 20px 28px;
+        background: #fff;
+        border-radius: 12px;
+        border: 1px solid #e5e5e5;
+        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.08);
+      }
+
+      .pipeline-overlay-text {
+        font-size: 13px;
+        font-weight: 600;
+        color: #333;
+      }
+
+      .pipeline-spinner {
+        width: 36px;
+        height: 36px;
+        border: 3px solid #e5e5e5;
+        border-top-color: #18a0fb;
+        border-radius: 50%;
+        animation: pipeline-spin 0.85s linear infinite;
+      }
+
+      @keyframes pipeline-spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
     </style>
   </head>
   <body>
@@ -110,25 +162,27 @@
       <button id="pipeline-btn">Generate Target JSON + Draw Clone</button>
     </div>
 
-    <div class="row">
-      <label for="semantic-max-tokens">Semantic JSON — max new tokens (256–4096)</label>
-      <input id="semantic-max-tokens" type="number" min="256" max="4096" value="4096" />
-    </div>
+    <div id="semantic-json-section">
+      <div class="row">
+        <label for="semantic-max-tokens">Semantic JSON — max new tokens (256–4096)</label>
+        <input id="semantic-max-tokens" type="number" min="256" max="4096" value="4096" />
+      </div>
 
-    <div class="row">
-      <button id="semantic-json-btn" type="button">
-        Banner + grid PNG + raw JSON → semantic JSON (Qwen)
-      </button>
-    </div>
+      <div class="row">
+        <button id="semantic-json-btn" type="button">
+          Banner + grid PNG + raw JSON → semantic JSON (Qwen)
+        </button>
+      </div>
 
-    <div class="row">
-      <label>Semantic JSON result</label>
-      <textarea id="semantic-json-result" class="zone-result readonly" readonly>
+      <div class="row">
+        <label>Semantic JSON result</label>
+        <textarea id="semantic-json-result" class="zone-result readonly" readonly>
 Select one frame, then run “Banner + grid PNG + raw JSON → semantic JSON”.
-      </textarea>
-      <div style="display: flex; gap: 8px; margin-top: 8px">
-        <button id="copy-semantic-btn" type="button" style="flex: 1">Copy JSON</button>
-        <button id="download-semantic-btn" type="button" style="flex: 1; background: #334155">Download .json</button>
+        </textarea>
+        <div style="display: flex; gap: 8px; margin-top: 8px">
+          <button id="copy-semantic-btn" type="button" style="flex: 1">Copy JSON</button>
+          <button id="download-semantic-btn" type="button" style="flex: 1; background: #334155">Download .json</button>
+        </div>
       </div>
     </div>
 
@@ -150,6 +204,13 @@ Select one frame, then click “JSON to HTML/CSS Exporter”.
 
     <div id="status"></div>
 
+    <div id="pipeline-overlay" class="pipeline-overlay" hidden aria-live="polite">
+      <div class="pipeline-overlay-card">
+        <div class="pipeline-spinner" role="status" aria-label="Loading"></div>
+        <div class="pipeline-overlay-text">Calling backend…</div>
+      </div>
+    </div>
+
     <script>
       const statusEl = document.getElementById("status");
       const pipelineBtn = document.getElementById("pipeline-btn");
@@ -166,6 +227,14 @@ Select one frame, then click “JSON to HTML/CSS Exporter”.
 
       function setStatus(message) {
         statusEl.textContent = message;
+      }
+
+      const pipelineOverlayEl = document.getElementById("pipeline-overlay");
+
+      function setPipelineLoading(on) {
+        const busy = !!on;
+        if (pipelineOverlayEl) pipelineOverlayEl.hidden = !busy;
+        if (pipelineBtn) pipelineBtn.disabled = busy;
       }
 
       function setSelectedFrameInfo(info) {
@@ -291,6 +360,7 @@ Select one frame, then click “JSON to HTML/CSS Exporter”.
         document.getElementById("target-size").value = targetSize;
 
         setStatus("Preparing pipeline request...");
+        setPipelineLoading(true);
 
         parent.postMessage(
           {
@@ -337,7 +407,9 @@ Select one frame, then click “JSON to HTML/CSS Exporter”.
         const msg = event.data.pluginMessage;
         if (!msg) return;
 
-        if (msg.type === "status") {
+        if (msg.type === "pipeline-busy") {
+          setPipelineLoading(!!msg.busy);
+        } else if (msg.type === "status") {
           setStatus(msg.message);
         } else if (msg.type === "error") {
           setStatus("Error: " + msg.message);
