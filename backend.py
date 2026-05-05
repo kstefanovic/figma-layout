@@ -23,12 +23,14 @@ from figma_semantic import (
     apply_semantic_names,
     build_naming_user_prompt,
     chunk_list,
+    collect_allowed_ids_from_mid,
     extract_first_json_value,
     flatten_raw_to_mid,
     mid_node_prompt_slice,
     missing_name_ids,
     normalize_convert_semantic_output,
     parse_names_object,
+    raw_fig_tree_to_mid_blocks,
 )
 from json_embedding import (
     MAX_CLASS_NUMBER,
@@ -1229,6 +1231,23 @@ async def figma_convert_semantic_json(
                 pass
         raise HTTPException(status_code=400, detail=f"Invalid JSON: {exc}") from exc
 
+    try:
+        mid_blocks = raw_fig_tree_to_mid_blocks(raw, frame_index=0)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if meta_base is not None:
+        try:
+            (run_dir / "input_mid.json").write_text(
+                json.dumps(mid_blocks, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            meta_base.setdefault("input_files", {})["input_mid.json"] = {
+                "bytes": (run_dir / "input_mid.json").stat().st_size,
+            }
+        except OSError as exc:
+            warnings.append(f"Could not save input_mid.json: {exc}")
+
     banner_model_bytes, banner_resize_info = _resize_raster_max_long_edge(
         banner_body, FIGMA_SEMANTIC_BANNER_MAX_EDGE
     )
@@ -1254,11 +1273,13 @@ async def figma_convert_semantic_json(
     banner_uri = _data_uri(banner_model_bytes, banner_mime)
     grid_uri = _data_uri(grid_model_bytes, grid_mime)
 
-    raw_text = json.dumps(raw, ensure_ascii=False, separators=(",", ":"))
+    required_ids = sorted(collect_allowed_ids_from_mid(mid_blocks))
+    vlm_layout_payload = {"mid": mid_blocks, "required_node_ids": required_ids}
+    layout_text = json.dumps(vlm_layout_payload, ensure_ascii=False, separators=(",", ":"))
     user_text = (
         FIGMA_CONVERT_PROMPT
-        + "\n\nRaw Figma JSON (respond with only compact {\"names\":{...}} as specified):\n"
-        + raw_text
+        + "\n\nLayout JSON (mid + required_node_ids; no full raw tree):\n"
+        + layout_text
     )
 
     user_content: list[ContentItem] = [
@@ -1284,7 +1305,7 @@ async def figma_convert_semantic_json(
         )
         response_text = result.get("response", "")
         parsed = extract_first_json_value(response_text)
-        semantic_json = normalize_convert_semantic_output(parsed, raw, warnings)
+        semantic_json = normalize_convert_semantic_output(parsed, mid_blocks, warnings)
     except HTTPException as he:
         if meta_base is not None:
             try:
