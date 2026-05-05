@@ -229,6 +229,21 @@ async function exportFramePngBytes(node) {
   });
 }
 
+/** Banner for semantic JSON: cap longest side so Figma export + upload stay smaller (backend may downscale again). */
+const SEMANTIC_BANNER_EXPORT_MAX_EDGE = 1024;
+
+async function exportFramePngBytesMaxLongEdge(node, maxLongEdge) {
+  const cap = Math.max(64, Number(maxLongEdge) || 1024);
+  const w = "width" in node ? Number(node.width) : 1;
+  const h = "height" in node ? Number(node.height) : 1;
+  const longest = Math.max(1, w, h);
+  const scale = longest <= cap ? 1 : cap / longest;
+  return await node.exportAsync({
+    format: "PNG",
+    constraint: { type: "SCALE", value: scale },
+  });
+}
+
 async function exportElementAssetsForHtml(root, rawJson, maxCount) {
   const origin = getOrigin(root);
   const entries = collectLeafElementRefs(root, maxCount);
@@ -252,15 +267,15 @@ async function exportElementAssetsForHtml(root, rawJson, maxCount) {
   return assets;
 }
 
-/** Max leaves packed into the element atlas. Keep in sync with backend MAX_ATLAS_REGIONS. */
-const MAX_ELEMENT_LAYER_PNGS = 512;
+/** Max leaves packed into the element atlas (lower = faster layout/export; fewer cells for Qwen). */
+const MAX_ELEMENT_LAYER_PNGS = 256;
 
-/** Space between element bounding boxes. Requested as 20x the previous 12px spacing. */
-const PREVIOUS_ATLAS_GAP = 12;
-const ATLAS_GAP = PREVIOUS_ATLAS_GAP * 20;
-const ATLAS_CELL_PADDING = Math.round(ATLAS_GAP / 2);
+/** Gap between atlas cells (px). Smaller = much faster Figma layout/raster for large trees. */
+const ATLAS_GAP = 20;
+const ATLAS_CELL_PADDING = 8;
 const ATLAS_MAX_ROW_WIDTH = 8192;
-const ATLAS_MAX_CELL = 4096;
+/** Max clone width/height per cell before pack (smaller = faster clone/render). */
+const ATLAS_MAX_CELL = 2048;
 const ELEMENTS_PNG_MAX_WIDTH = 1920;
 const ELEMENTS_PNG_MAX_HEIGHT = 1028;
 const ATLAS_BOX_COLOR = { r: 1, g: 0, b: 0 };
@@ -373,7 +388,7 @@ async function loadAtlasLabelFont() {
 }
 
 /**
- * Clone leaves into one off-screen frame, pack in rows with large spacing, draw visible
+ * Clone leaves into one off-screen frame, pack in rows with modest spacing, draw visible
  * bounding boxes, and export a **single** PNG atlas capped to 1920 x 1028.
  * Returns PNG bytes + Base64 + region list in final exported pixel coords. Names/paths match ``raw_json``.
  */
@@ -1829,7 +1844,10 @@ figma.ui.onmessage = async (msg) => {
       rawJson.templateId = "figma_plugin_semantic_grid";
 
       postStatus("Semantic JSON: exporting banner PNG…");
-      const bannerBytes = await exportFramePngBytes(selectedFrame);
+      const bannerBytes = await exportFramePngBytesMaxLongEdge(
+        selectedFrame,
+        SEMANTIC_BANNER_EXPORT_MAX_EDGE,
+      );
 
       postStatus("Semantic JSON: building element grid PNG…");
       const { atlasPngBytes, regions, atlasSize } = await buildElementAtlasPngAndRegions(

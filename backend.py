@@ -63,8 +63,15 @@ FIGMA_SEMANTIC_RUNS_DIR = Path(
     os.getenv("FIGMA_SEMANTIC_RUNS_DIR", "runs/figma_convert_semantic_json"),
 ).resolve()
 # Max long edge (px) for images sent to Qwen on /figma/convert-semantic-json (0 = disable).
-FIGMA_SEMANTIC_BANNER_MAX_EDGE = int(os.getenv("FIGMA_SEMANTIC_BANNER_MAX_EDGE", "1536"))
-FIGMA_SEMANTIC_GRID_MAX_EDGE = int(os.getenv("FIGMA_SEMANTIC_GRID_MAX_EDGE", "1536"))
+FIGMA_SEMANTIC_BANNER_MAX_EDGE = int(os.getenv("FIGMA_SEMANTIC_BANNER_MAX_EDGE", "1024"))
+FIGMA_SEMANTIC_GRID_MAX_EDGE = int(os.getenv("FIGMA_SEMANTIC_GRID_MAX_EDGE", "1024"))
+# When false (0/no/false), skip writing per-request run folders (faster I/O; no artifacts for debugging).
+FIGMA_SEMANTIC_PERSIST_RUNS = os.getenv("FIGMA_SEMANTIC_PERSIST_RUNS", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
 FRONTEND_DIR = Path(__file__).resolve().parent / "frontend"
 
 BANNER_VLM_CATEGORY_PROMPT = """You classify one retail / food banner image into exactly ONE of six campaigns.
@@ -311,7 +318,7 @@ def _resize_raster_max_long_edge(data: bytes, max_edge: int) -> tuple[bytes, dic
             scale = max_edge / longest
             nw = max(1, int(round(w * scale)))
             nh = max(1, int(round(h * scale)))
-            im = im.resize((nw, nh), Image.Resampling.LANCZOS)
+            im = im.resize((nw, nh), Image.Resampling.BILINEAR)
             out = BytesIO()
             im.save(out, format="PNG", optimize=True)
             resized = out.getvalue()
@@ -1181,23 +1188,27 @@ async def figma_convert_semantic_json(
     if not banner_body or not grid_body:
         raise HTTPException(status_code=400, detail="banner and grid must be non-empty files.")
 
-    try:
-        meta_base = _persist_figma_semantic_run_inputs(
-            run_dir,
-            run_id=run_id,
-            max_new_tokens=max_new_tokens,
-            banner_body=banner_body,
-            grid_body=grid_body,
-            raw_bytes=raw_bytes,
-            banner_content_type=banner.content_type,
-            grid_content_type=grid.content_type,
-            banner_filename=banner.filename,
-            raw_json_filename=raw_json.filename,
-            grid_filename=grid.filename,
-        )
-    except OSError as exc:
-        warnings.append(f"Run artifacts not saved under {run_dir}: {exc}")
+    if FIGMA_SEMANTIC_PERSIST_RUNS:
+        try:
+            meta_base = _persist_figma_semantic_run_inputs(
+                run_dir,
+                run_id=run_id,
+                max_new_tokens=max_new_tokens,
+                banner_body=banner_body,
+                grid_body=grid_body,
+                raw_bytes=raw_bytes,
+                banner_content_type=banner.content_type,
+                grid_content_type=grid.content_type,
+                banner_filename=banner.filename,
+                raw_json_filename=raw_json.filename,
+                grid_filename=grid.filename,
+            )
+        except OSError as exc:
+            warnings.append(f"Run artifacts not saved under {run_dir}: {exc}")
+            meta_base = None
+    else:
         meta_base = None
+        warnings.append("FIGMA_SEMANTIC_PERSIST_RUNS disabled: run inputs/output not saved to disk.")
 
     try:
         raw = json.loads(raw_bytes.decode("utf-8"))

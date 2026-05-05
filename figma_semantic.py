@@ -22,6 +22,8 @@ FIGMA_CONVERT_SYSTEM_PROMPT = textwrap.dedent(
       as `name`.
     - Never emit ``//`` or ``/* */`` comments inside JSON; output must be strictly parseable (no "omitted for brevity"
       lines).
+    - Emit **compact** JSON (no indentation / no extra newlines between keys)—deep trees must still be one fully
+      closed object ending with ``}``; never stop mid-key or mid-string.
     - In ``characters`` strings use only normal spaces and ``\\n`` escapes—never Unicode line/paragraph separators
       (U+2028 / U+2029) copied from Figma.
     - The root frame must be named `banner_root` unless the file is clearly not a full banner (still prefer
@@ -46,7 +48,9 @@ FIGMA_CONVERT_PROMPT = textwrap.dedent(
     Convert the raw Figma JSON into clean semantic JSON.
 
     Important rules:
-    - Output ONLY valid JSON.
+    - Output ONLY valid JSON—one complete root object that ends with ``}`` (not cut off by length).
+    - Use **compact** JSON: minimal whitespace between tokens (no pretty-printed trees); this is required so the
+      whole file fits in the model output limit.
     - Never put ``//`` or ``/* */`` comments inside the JSON; every line must be valid JSON (models often break
       parsers with ``// ... omitted ...`` — do not do that).
     - In ``characters`` fields use only printable text, normal spaces, and ``\\n`` for newlines—do not paste invisible
@@ -227,6 +231,67 @@ def build_naming_user_prompt(
     return vision_intro + node_fields + naming_rules
 
 
+def _unwrap_model_json_text(text: str) -> str:
+    """
+    Strip optional markdown fences. If the model opened ```json but never closed ``` (truncated), drop the
+    opening fence line only so parsing starts at ``{``.
+    """
+    t = (text or "").strip()
+    fence = re.search(r"```(?:json|text)?\s*([\s\S]*?)```", t, re.IGNORECASE)
+    if fence:
+        return fence.group(1).strip()
+    if t.startswith("```"):
+        nl = t.find("\n")
+        if nl != -1:
+            t = t[nl + 1 :].lstrip()
+    rt = t.rstrip()
+    if rt.endswith("```"):
+        t = t[: t.rfind("```")].rstrip()
+    return t
+
+
+def _strip_trailing_commas_outside_strings(s: str) -> str:
+    """Remove JSON trailing commas (`,}` / `,]`) outside double-quoted strings."""
+    out: list[str] = []
+    i = 0
+    n = len(s)
+    in_string = False
+    escape_next = False
+    while i < n:
+        ch = s[i]
+        if in_string:
+            out.append(ch)
+            if escape_next:
+                escape_next = False
+            elif ch == "\\":
+                escape_next = True
+            elif ch == '"':
+                slashes = 0
+                j = len(out) - 2
+                while j >= 0 and out[j] == "\\":
+                    slashes += 1
+                    j -= 1
+                if slashes % 2 == 0:
+                    in_string = False
+            i += 1
+            continue
+        if ch == '"':
+            in_string = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == ",":
+            j = i + 1
+            while j < n and s[j] in " \t\n\r":
+                j += 1
+            if j < n and s[j] in "}]":
+                i += 1
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def _strip_full_line_double_slash_comments(s: str) -> str:
     """Remove lines that are only ``//`` comments (models often inject invalid ``// ...`` in JSON)."""
     out: list[str] = []
@@ -304,12 +369,10 @@ def _normalize_json_string_literals_for_parse(s: str) -> str:
 
 def extract_first_json_object(text: str) -> Any:
     """Parse first top-level JSON object from model text (strips optional ``` fences)."""
-    t = text.strip()
-    fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", t, re.IGNORECASE)
-    if fence:
-        t = fence.group(1).strip()
+    t = _unwrap_model_json_text(text)
     t = _strip_full_line_double_slash_comments(t)
     t = _normalize_json_string_literals_for_parse(t)
+    t = _strip_trailing_commas_outside_strings(t)
     start = t.find("{")
     if start < 0:
         raise ValueError("No JSON object found in model output")
@@ -326,12 +389,10 @@ def extract_first_json_object(text: str) -> Any:
 
 def extract_first_json_value(text: str) -> Any:
     """Parse first top-level JSON object or array from model text (handles ```json fences)."""
-    t = text.strip()
-    fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", t, re.IGNORECASE)
-    if fence:
-        t = fence.group(1).strip()
+    t = _unwrap_model_json_text(text)
     t = _strip_full_line_double_slash_comments(t)
     t = _normalize_json_string_literals_for_parse(t)
+    t = _strip_trailing_commas_outside_strings(t)
     brace = t.find("{")
     bracket = t.find("[")
     if brace < 0 and bracket < 0:
@@ -343,10 +404,21 @@ def extract_first_json_value(text: str) -> Any:
     else:
         start = min(brace, bracket)
     decoder = json.JSONDecoder()
+    slice_ = t[start:]
     try:
-        value, _end = decoder.raw_decode(t[start:])
+        value, _end = decoder.raw_decode(slice_)
     except json.JSONDecodeError as exc:
-        raise ValueError(f"Invalid JSON in model output: {exc}") from exc
+        tail = slice_.rstrip()
+        looks_truncated = bool(tail) and tail[0] == "{" and not tail.endswith("}")
+        if tail.startswith("["):
+            looks_truncated = not tail.endswith("]")
+        hint = ""
+        if looks_truncated:
+            hint = (
+                " Model output looks truncated (incomplete JSON at end). "
+                "Raise max_new_tokens (e.g. 4096) and ask the model for compact JSON (no indentation)."
+            )
+        raise ValueError(f"Invalid JSON in model output: {exc}.{hint}") from exc
     return value
 
 
