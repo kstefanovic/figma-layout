@@ -30,6 +30,9 @@ FIGMA_CONVERT_SYSTEM_PROMPT = textwrap.dedent(
       `banner_root` for single exported frames).
     - If a node is only decorative clutter, prefer `decoration_group` / `sparkle` / `ornament` etc. from the vocabulary
       rather than generic "Group…".
+    - When you look at the **full banner** image, infer roles from **typography and layering** (size, weight, color,
+      position), not only from Figma `type` strings: e.g. the largest boldest text block is rarely legal copy; the
+      smallest thinnest text block is rarely the main headline.
     """
 ).strip()
 
@@ -46,6 +49,32 @@ FIGMA_CONVERT_PROMPT = textwrap.dedent(
 
     Goal:
     Convert the raw Figma JSON into clean semantic JSON.
+
+    How to read the banner (image 1) — typical retail / promo layout:
+    - **Hero / product visual:** Often a large rectangle (photo or flat fill) for the product or scene; map to
+      `hero_group`, `product_visual_group`, `main_product`, or `product_packshot` by what is shown.
+    - **Background:** Often a colored rectangle or **vector** shapes behind content (e.g. blue panel); use
+      `background_group` / `base_background` when it is clearly a plate or wash behind other layers—not the hero
+      product itself.
+    - **Brand group:** Cluster of **brand name** (text/vector; sometimes **two separate parts**—e.g. two wordmarks)
+      plus **logo / mark**. The logo may sit on stacked layers: a **rear** backing shape and a **foreground** mark;
+      keep them under `brand_group` with `brand_mark`, `brand_name_yandex`, or `brand_name_lavka` as appropriate, not
+      as unrelated generic vectors.
+    - **Headline group:** Usually **two text roles** near each other:
+      - **Main headline:** The **largest and/or boldest** promotional line in the whole banner—what the product is,
+        the hero offer, or the **current price** emphasis. Prefer `headline_text` / `headline_line` / `offer_group` /
+        `current_price` by content.
+      - **Sub-headline:** **Smaller** type, often **medium weight** (not hairline), placed **closest** to the main
+        headline—delivery window, weight, pack size, secondary promise. Map to `subheadline_text`,
+        `delivery_info_group`, `delivery_time_text` when it matches that role (not the legal footer).
+    - **Legal / compliance copy:** The **smallest and thinnest** text in the layout—addresses, SKU, disclaimers,
+      “conditions apply”, etc. Almost always `legal_group` / `legal_text` even if it sits above the bottom edge.
+    - **Age badge:** Small badge with “0+”, “6+”, “12+”, etc. → `age_badge_group` / `age_badge_text`.
+    - **Decorations:** Non-message flourishes—stars, glows, bulbs, sparkles, confetti, shine—→ `decoration_group`,
+      `sparkle`, `star_decoration`, `glow_effect`, `shine_effect`, `ornament`, `overlay_effect_group` as fits.
+
+    Use this mental model together with **bounds** and **grid thumbnails** so each raw `id` gets the right semantic
+    role even when Figma node types are generic (`RECTANGLE`, `VECTOR`, `TEXT`).
 
     Important rules:
     - Output ONLY valid JSON—one complete root object that ends with ``}`` (not cut off by length).
@@ -109,18 +138,20 @@ FIGMA_CONVERT_PROMPT = textwrap.dedent(
     glow_effect
     shine_effect
 
-    Naming rules:
-    - Main brand/logo area: brand_group.
+    Naming rules (align with banner reading above):
+    - Main brand/logo area: brand_group; split name/logo parts with `brand_name_*` / `brand_mark`; stacked logo
+      layers → still brand-related, not random vectors.
     - Yandex text/vector: brand_name_yandex.
     - Lavka text/vector: brand_name_lavka.
     - Heart/logo mark: brand_mark.
-    - Headline: the main advertising/product message, usually the largest and/or boldest text block.
+    - Main headline vs sub-headline: use **relative size/weight and proximity**—main is the dominant line; sub is
+      smaller and paired with it (delivery, weight, etc.).
     - Delivery promise like "от 15 минут": delivery_info_group / delivery_time_text.
-    - Tiny disclaimer text near bottom: legal_group / legal_text.
+    - Legal copy: smallest/thinnest text block(s) → legal_group / legal_text.
     - "0+", "6+", "12+", "16+", "18+": age_badge_group / age_badge_text.
     - Product/photo/person area: hero_group or product_visual_group.
-    - Stars/snowflakes/lights/confetti: decoration_group.
-    - Large color/photo background: background_group.
+    - Stars/snowflakes/lights/confetti/glow/bulb motifs: decoration_group and specific decoration vocabulary.
+    - Large color/photo background plate: background_group / base_background.
 
     Return the modified semantic JSON in the same general Figma JSON structure, with semantic "name" values on
     **all** nodes and unnecessary wrappers collapsed only where allowed above.
