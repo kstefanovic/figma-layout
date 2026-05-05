@@ -37,7 +37,7 @@ class ChatMessage(BaseModel):
 
 class GenerateRequest(BaseModel):
     messages: list[ChatMessage] = Field(..., min_length=1)
-    max_new_tokens: int = Field(default=256, ge=1, le=4096)
+    max_new_tokens: int = Field(default=256, ge=1, le=8192)
 
 
 class GenerateResponse(BaseModel):

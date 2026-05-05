@@ -254,8 +254,8 @@
 
       <div class="params-grid" style="grid-template-columns: 1fr; max-width: 14rem;">
         <div class="param-field">
-          <span class="plabel" id="lbl-tokens">Max new tokens (256–4096; too low truncates JSON)</span>
-          <input type="number" id="max-tokens" min="256" max="4096" value="4096" aria-labelledby="lbl-tokens" />
+          <span class="plabel" id="lbl-tokens">Max new tokens (256–8192)</span>
+          <input type="number" id="max-tokens" min="256" max="8192" value="2048" aria-labelledby="lbl-tokens" />
         </div>
       </div>
 
@@ -368,7 +368,7 @@
       const g = gridInput.files?.[0];
       if (!b || !j || !g) return;
 
-      const mt = Math.min(4096, Math.max(256, parseInt(String(maxTokens.value), 10) || 4096));
+      const mt = Math.min(8192, Math.max(256, parseInt(String(maxTokens.value), 10) || 2048));
       maxTokens.value = String(mt);
 
       go.disabled = true;

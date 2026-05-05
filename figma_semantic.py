@@ -2,53 +2,49 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import re
 import textwrap
 from typing import Any
 
-# Full raw JSON → semantic Figma JSON (single Qwen call: banner + grid + raw text).
+# Raw JSON + banner + grid → model outputs only ``{"names":{...}}``; server merges into the tree (avoids huge JSON).
 FIGMA_CONVERT_SYSTEM_PROMPT = textwrap.dedent(
     """
-    You output exactly one JSON object: the same Figma tree as the user’s raw JSON, but every node must get a
-    meaningful English snake_case semantic `name` from the vocabulary the user lists (or a short phrase built only
-    from those vocabulary roots).
+    You output exactly one small JSON object of the form ``{"names":{"<figma_node_id>":"<semantic_snake_name>",...}}``.
+    The server copies the user’s full Figma tree and applies your ``names`` map by ``id``—do **not** echo the full
+    tree, do **not** pretty-print, do **not** wrap in markdown fences.
 
     Hard requirements:
-    - Copy `id`, `type`, `bounds`, `characters`, `visible`, `opacity`, `path`, and geometry unchanged unless you
-      intentionally collapse a meaningless wrapper (then keep children and geometry consistent with the rules).
-    - Never use lazy Figma defaults as final semantic names: bare digits ("5", "10"), "Frame", "Rectangle", "Vector",
-      "Ellipse", "Line", "Text", names like "Group 3912003", pixel-size roots like "960x512", or the raw `id` string
-      as `name`.
-    - Never emit ``//`` or ``/* */`` comments inside JSON; output must be strictly parseable (no "omitted for brevity"
-      lines).
-    - Emit **compact** JSON (no indentation / no extra newlines between keys)—deep trees must still be one fully
-      closed object ending with ``}``; never stop mid-key or mid-string.
-    - In ``characters`` strings use only normal spaces and ``\\n`` escapes—never Unicode line/paragraph separators
-      (U+2028 / U+2029) copied from Figma.
-    - The root frame must be named `banner_root` unless the file is clearly not a full banner (still prefer
-      `banner_root` for single exported frames).
-    - If a node is only decorative clutter, prefer `decoration_group` / `sparkle` / `ornament` etc. from the vocabulary
-      rather than generic "Group…".
-    - When you look at the **full banner** image, infer roles from **typography and layering** (size, weight, color,
-      position), not only from Figma `type` strings: e.g. the largest boldest text block is rarely legal copy; the
-      smallest thinnest text block is rarely the main headline.
+    - Every node ``id`` that appears anywhere in the supplied raw JSON must appear as a key in ``names`` (omit none).
+    - Values must be meaningful English ``snake_case`` from the vocabulary (or a 2–4 word phrase built only from those
+      roots). Never use lazy defaults as final names: bare digits, "Frame", "Rectangle", "Vector", "Text", "Group …",
+      pixel-size strings like "960x512", or the raw ``id`` string as the semantic name.
+    - Never emit ``//`` or ``/* */`` comments; output must be strictly parseable JSON.
+    - Use **compact** JSON: a single line is ideal—no indentation, no extra newlines outside string values.
+    - In ``names`` string values you only output identifiers—no Unicode line separators (U+2028 / U+2029).
+    - The root node’s semantic name must be ``banner_root`` unless the design is clearly not a single banner frame.
+    - Decorative clutter → ``decoration_group`` / ``sparkle`` / ``ornament`` / ``glow_effect`` etc., not generic shapes.
+    - Infer roles from the **banner image** using **typography and layering** (size, weight, color, position), and
+      from the **grid** thumbnails keyed by ``id``—not from Figma ``type`` alone.
     """
 ).strip()
 
 FIGMA_CONVERT_PROMPT = textwrap.dedent(
     """
-    You are a strict Figma semantic JSON converter.
+    You are a strict Figma semantic **renaming** assistant (vision + layout JSON).
 
     Inputs:
     1. Full banner image.
     2. Grid image: each cell has a **grey header bar** with text `id:<figma_id>` and, below it, a **thumbnail** of that
        element. The `<figma_id>` matches the `"id"` field in the raw JSON for the same element—use it to align grid
        crops with JSON nodes.
-    3. Raw Figma JSON with anonymous names.
+    3. Raw Figma JSON with anonymous names (your job is only better ``name`` strings, keyed by ``id``).
 
-    Goal:
-    Convert the raw Figma JSON into clean semantic JSON.
+    Output shape (mandatory — nothing else):
+    - Return **only** one JSON object: ``{"names":{"<id>":"<snake_case_semantic>", ...}}``.
+    - Include **every** ``"id"`` value from the raw JSON tree (all depths). No markdown, no code fences, no commentary.
+    - **Compact** JSON (ideally one line) so the response is short.
 
     How to read the banner (image 1) — typical retail / promo layout:
     - **Hero / product visual:** Often a large rectangle (photo or flat fill) for the product or scene; map to
@@ -76,30 +72,10 @@ FIGMA_CONVERT_PROMPT = textwrap.dedent(
     Use this mental model together with **bounds** and **grid thumbnails** so each raw `id` gets the right semantic
     role even when Figma node types are generic (`RECTANGLE`, `VECTOR`, `TEXT`).
 
-    Important rules:
-    - Output ONLY valid JSON—one complete root object that ends with ``}`` (not cut off by length).
-    - Use **compact** JSON: minimal whitespace between tokens (no pretty-printed trees); this is required so the
-      whole file fits in the model output limit.
-    - Never put ``//`` or ``/* */`` comments inside the JSON; every line must be valid JSON (models often break
-      parsers with ``// ... omitted ...`` — do not do that).
-    - In ``characters`` fields use only printable text, normal spaces, and ``\\n`` for newlines—do not paste invisible
-      Unicode line separators (U+2028 / U+2029) from Figma.
-    - Do not explain.
-    - Do not create mid_json.
-    - Do not invent new elements.
-    - Do not change id, type, bounds, characters, visible, opacity, or geometry.
-    - Use the full banner image for global context.
-    - Use the grid image to understand each element by its raw JSON id.
-    - Use raw JSON ids exactly as provided.
-    - **Mandatory:** replace **every** `"name"` in the output with a snake_case semantic identifier from the
-      vocabulary below (or a 2–4 word snake_case phrase composed only from those vocabulary roots, e.g.
-      `product_visual_group_left`). Every node including leaves and wrappers must comply—no numeric-only names, no
-      `Group …` leftovers, no dimension strings as names.
-    - Remove/collapse unnecessary wrapper groups/frames only when they have no independent visual meaning.
-    - When removing a wrapper, preserve all meaningful children and promote them to the correct semantic parent.
-    - Keep useful semantic containers such as brand_group, headline_group, hero_group, product_visual_group, legal_group, age_badge_group, decoration_group, background_group.
-    - Build a correct nested hierarchy by semantic meaning, not by the original raw hierarchy.
-    - Exact bbox already exists in raw JSON. Do not estimate bbox.
+    Rules:
+    - Do not explain. Do not output the full Figma tree—only the ``names`` map.
+    - Do not invent ids; keys must match raw JSON ``"id"`` strings exactly.
+    - Values are semantic **names** only (snake_case); the server keeps geometry, ``characters``, etc. unchanged.
 
     Semantic naming vocabulary:
     banner_root
@@ -153,8 +129,7 @@ FIGMA_CONVERT_PROMPT = textwrap.dedent(
     - Stars/snowflakes/lights/confetti/glow/bulb motifs: decoration_group and specific decoration vocabulary.
     - Large color/photo background plate: background_group / base_background.
 
-    Return the modified semantic JSON in the same general Figma JSON structure, with semantic "name" values on
-    **all** nodes and unnecessary wrappers collapsed only where allowed above.
+    Example (format only — ids are fake): ``{"names":{"1:2":"banner_root","1:3":"hero_group"}}``
     """
 ).strip()
 
@@ -447,10 +422,79 @@ def extract_first_json_value(text: str) -> Any:
         if looks_truncated:
             hint = (
                 " Model output looks truncated (incomplete JSON at end). "
-                "Raise max_new_tokens (e.g. 4096) and ask the model for compact JSON (no indentation)."
+                "Raise max_new_tokens if needed; prefer compact one-line JSON or the {\"names\":{}} id map format."
             )
         raise ValueError(f"Invalid JSON in model output: {exc}.{hint}") from exc
     return value
+
+
+def collect_node_ids_from_figma_raw(root: Any) -> set[str]:
+    """All string ``id`` values reachable from a Figma-like raw JSON root (dict or list of frames)."""
+    out: set[str] = set()
+
+    def walk(n: Any) -> None:
+        if isinstance(n, dict):
+            nid = n.get("id")
+            if nid is not None:
+                out.add(str(nid))
+            for c in n.get("children") or []:
+                walk(c)
+        elif isinstance(n, list):
+            for item in n:
+                walk(item)
+
+    walk(root)
+    return out
+
+
+def merge_semantic_names_into_raw_tree(raw: Any, names: dict[str, str]) -> Any:
+    """Deep copy ``raw`` and overwrite each node's ``name`` when ``str(id)`` is in ``names``."""
+    tree: Any = copy.deepcopy(raw)
+
+    def walk(n: Any) -> None:
+        if isinstance(n, dict):
+            nid = n.get("id")
+            if nid is not None and str(nid) in names:
+                n["name"] = names[str(nid)]
+            for c in n.get("children") or []:
+                walk(c)
+        elif isinstance(n, list):
+            for item in n:
+                walk(item)
+
+    walk(tree)
+    return tree
+
+
+def normalize_convert_semantic_output(parsed: Any, raw: Any, warnings: list[str]) -> Any:
+    """
+    If the model returned ``{"names":{...}}`` only, merge into a deep copy of ``raw``.
+    Otherwise return ``parsed`` unchanged (legacy: model echoed the full semantic tree).
+    """
+    if not isinstance(parsed, dict):
+        return parsed
+    if set(parsed.keys()) != {"names"}:
+        return parsed
+    names_obj = parsed.get("names")
+    if not isinstance(names_obj, dict):
+        return parsed
+    names = {
+        str(k): str(v).strip()
+        for k, v in names_obj.items()
+        if isinstance(v, str) and str(v).strip()
+    }
+    if not names:
+        return parsed
+    expected = collect_node_ids_from_figma_raw(raw)
+    missing = expected - set(names.keys())
+    if missing:
+        warnings.append(
+            f"Model omitted {len(missing)} id(s) in names map; those nodes keep their original names from raw JSON."
+        )
+    extra = set(names.keys()) - expected
+    if extra:
+        warnings.append(f"Ignoring {len(extra)} unexpected id(s) in names map that are not in raw JSON.")
+    return merge_semantic_names_into_raw_tree(raw, names)
 
 
 def parse_names_object(text: str) -> dict[str, str]:

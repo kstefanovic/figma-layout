@@ -1,7 +1,7 @@
 /**
  * Figma plugin main thread. Flows:
  * - ``POST …/pipeline/banner-raw-to-target-json-json`` — banner + raw JSON + target size → layout clone.
- * - ``POST …/figma/convert-semantic-json`` — banner + element grid PNG + raw JSON (atlas regions) → semantic JSON via Qwen.
+ * - ``POST …/figma/convert-semantic-json`` — banner + grid PNG + raw JSON → Qwen returns ``{names:{id:…}}`` merged server-side into full semantic JSON.
  * - HTML/CSS export from serialized JSON + assets (local).
  */
 figma.showUI(__html__, { width: 400, height: 720 });
@@ -1832,7 +1832,7 @@ figma.ui.onmessage = async (msg) => {
       return;
     }
 
-    const maxNewTokens = Math.min(4096, Math.max(256, parseInt(String(msg.maxNewTokens || "4096"), 10) || 4096));
+    const maxNewTokens = Math.min(8192, Math.max(256, parseInt(String(msg.maxNewTokens || "2048"), 10) || 2048));
 
     try {
       postStatus("Semantic JSON: stamping node ids…");

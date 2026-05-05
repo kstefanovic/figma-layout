@@ -27,6 +27,7 @@ from figma_semantic import (
     flatten_raw_to_mid,
     mid_node_prompt_slice,
     missing_name_ids,
+    normalize_convert_semantic_output,
     parse_names_object,
 )
 from json_embedding import (
@@ -108,7 +109,7 @@ class ChatRequest(BaseModel):
     images: list[str] = Field(default_factory=list)
     video: Any | None = None
     messages: list[ChatMessage] | None = None
-    max_new_tokens: int = Field(default=256, ge=1, le=4096)
+    max_new_tokens: int = Field(default=256, ge=1, le=8192)
 
 
 class ChatResponse(BaseModel):
@@ -1044,7 +1045,7 @@ async def figma_semantic_mid_json(
     ),
     frame_index: int = Form(0, ge=0),
     chunk_size: int = Form(40, ge=5, le=80),
-    max_new_tokens: int = Form(3072, ge=256, le=4096),
+    max_new_tokens: int = Form(3072, ge=256, le=8192),
 ) -> FigmaSemanticMidResponse:
     warnings: list[str] = []
 
@@ -1169,7 +1170,7 @@ async def figma_convert_semantic_json(
     banner: UploadFile = File(..., description="Full Figma banner export image"),
     raw_json: UploadFile = File(..., description="Raw Figma layout JSON"),
     grid: UploadFile = File(..., description="Grid image: each cell = element + raw JSON id"),
-    max_new_tokens: int = Form(4096, ge=256, le=4096),
+    max_new_tokens: int = Form(2048, ge=256, le=8192),
 ) -> FigmaConvertSemanticResponse:
     warnings: list[str] = []
     run_id = _new_figma_semantic_run_id()
@@ -1256,7 +1257,7 @@ async def figma_convert_semantic_json(
     raw_text = json.dumps(raw, ensure_ascii=False, separators=(",", ":"))
     user_text = (
         FIGMA_CONVERT_PROMPT
-        + "\n\nRaw Figma JSON (apply the rules above; output only the transformed JSON):\n"
+        + "\n\nRaw Figma JSON (respond with only compact {\"names\":{...}} as specified):\n"
         + raw_text
     )
 
@@ -1282,7 +1283,8 @@ async def figma_convert_semantic_json(
             timeout=FIGMA_CONVERT_TIMEOUT,
         )
         response_text = result.get("response", "")
-        semantic_json = extract_first_json_value(response_text)
+        parsed = extract_first_json_value(response_text)
+        semantic_json = normalize_convert_semantic_output(parsed, raw, warnings)
     except HTTPException as he:
         if meta_base is not None:
             try:
