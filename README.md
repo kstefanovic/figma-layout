@@ -1,6 +1,6 @@
 # Qwen2.5-VL FastAPI Project
 
-This project exposes a public FastAPI backend on `0.0.0.0:9298` and keeps the Qwen2.5-VL-7B-Instruct model service private on `127.0.0.1:9297`.
+This project exposes a public FastAPI backend on `0.0.0.0:20401` and keeps the Qwen2.5-VL-7B-Instruct model service private on `127.0.0.1:20400`.
 
 ## Run
 
@@ -18,7 +18,7 @@ source .venv/bin/activate
 python backend.py
 ```
 
-The backend is available from other machines on port `9298`. The model service stays bound to localhost on port `9297`. Both processes read settings from `.env` automatically.
+The backend is available from other machines on port `20401`. The model service stays bound to localhost on port `20400`. Both processes read settings from `.env` automatically.
 
 ## PM2
 
@@ -70,13 +70,13 @@ pm2 delete qwen-model-server
 ```bash
 QWEN_MODEL_PATH=./Qwen2.5-VL-7B-Instruct
 QWEN_HOST=127.0.0.1
-QWEN_PORT=9297
+QWEN_PORT=20400
 QWEN_GPU_DEVICE=0
 QWEN_DEVICE=cuda:0
 
 BACKEND_HOST=0.0.0.0
-BACKEND_PORT=9298
-MODEL_SERVICE_URL=http://127.0.0.1:9297
+BACKEND_PORT=20401
+MODEL_SERVICE_URL=http://127.0.0.1:20400
 MODEL_REQUEST_TIMEOUT=300
 ```
 
@@ -87,13 +87,13 @@ MODEL_REQUEST_TIMEOUT=300
 Health check:
 
 ```bash
-curl http://localhost:9298/health
+curl http://localhost:20401/health
 ```
 
 Text chat:
 
 ```bash
-curl -X POST http://localhost:9298/chat \
+curl -X POST http://localhost:20401/chat \
   -H "Content-Type: application/json" \
   -d '{"prompt":"What can you do?","max_new_tokens":128}'
 ```
@@ -101,7 +101,7 @@ curl -X POST http://localhost:9298/chat \
 Image URL:
 
 ```bash
-curl -X POST http://localhost:9298/chat \
+curl -X POST http://localhost:20401/chat \
   -H "Content-Type: application/json" \
   -d '{"prompt":"Describe this image.","image":"https://example.com/image.jpg"}'
 ```
@@ -109,7 +109,7 @@ curl -X POST http://localhost:9298/chat \
 Image upload:
 
 ```bash
-curl -X POST http://localhost:9298/analyze-image \
+curl -X POST http://localhost:20401/analyze-image \
   -F "file=@/path/to/image.jpg" \
   -F "prompt=Describe this image."
 ```

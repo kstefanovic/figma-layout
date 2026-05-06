@@ -1242,6 +1242,27 @@ def postprocess_semantic_names(
     def _is_visible_node(r: dict[str, Any]) -> bool:
         return r.get("visible") is not False
 
+    def _is_logo_like_cluster_child_id(cs: str) -> bool:
+        """Single child under a brand row: small frame/group with 1–2 vectors only, or a boolean logo cluster."""
+        sub = mid_by_id.get(cs)
+        if not sub:
+            return False
+        st = _normalize_figma_type(sub)
+        if st in ("frame", "group", "instance"):
+            subs = [str(x) for x in (sub.get("mid_child_ids") or []) if str(x) in mid_by_id]
+            vecs = [x for x in subs if _normalize_figma_type(mid_by_id[x]) == "vector"]
+            if 1 <= len(vecs) <= 2 and len(vecs) == len(subs):
+                return True
+            return False
+        if st == "boolean operation":
+            subs = [str(x) for x in (sub.get("mid_child_ids") or []) if str(x) in mid_by_id]
+            if not subs:
+                return False
+            return all(
+                _normalize_figma_type(mid_by_id[x]) in ("vector", "boolean operation") for x in subs
+            )
+        return False
+
     def _nested_logo_frame_child_id(sid: str) -> str | None:
         row = mid_by_id.get(sid)
         if not row:
@@ -1250,15 +1271,45 @@ def postprocess_semantic_names(
             cs = str(cid)
             if cs not in mid_by_id:
                 continue
-            sub = mid_by_id[cs]
-            st = str(sub.get("type") or "").lower()
-            if st not in ("frame", "group", "instance"):
-                continue
-            subs = [str(x) for x in (sub.get("mid_child_ids") or []) if str(x) in mid_by_id]
-            vecs = [x for x in subs if str(mid_by_id[x].get("type") or "").lower() == "vector"]
-            if 1 <= len(vecs) <= 2 and len(vecs) == len(subs):
+            if _is_logo_like_cluster_child_id(cs):
                 return cs
         return None
+
+    def _is_brand_row_compact_one_logo(sid: str) -> bool:
+        """Compact horizontal row, no text under it, exactly one logo-like boolean/group child → brand_group."""
+        row = mid_by_id.get(sid)
+        if not row:
+            return False
+        typ = str(row.get("type") or "").lower()
+        if typ not in ("frame", "group", "instance"):
+            return False
+        if _has_text_descendant(sid):
+            return False
+        ch_ids = [str(c) for c in (row.get("mid_child_ids") or []) if str(c) in mid_by_id]
+        vis = [c for c in ch_ids if _is_visible_node(mid_by_id[c])]
+        if len(vis) < 2:
+            return False
+        logo_like = [c for c in vis if _is_logo_like_cluster_child_id(c)]
+        if len(logo_like) != 1:
+            return False
+        try:
+            rw = float((row.get("bounds") or {}).get("width") or 0)
+            rh = float((row.get("bounds") or {}).get("height") or 0)
+            y0 = float((row.get("bounds") or {}).get("y") or 0)
+        except (TypeError, ValueError):
+            return False
+        if rh <= 0 or rw < 160:
+            return False
+        if rw / rh < 2.0:
+            return False
+        if frame_h > 0 and rh > min(520.0, 0.30 * frame_h):
+            return False
+        if frame_h > 0 and y0 > 0.62 * frame_h:
+            return False
+        vf = sum(1 for c in vis if _normalize_figma_type(mid_by_id[c]) == "vector")
+        if vf < 1:
+            return False
+        return True
 
     def _is_brand_row_rule5(sid: str) -> bool:
         row = mid_by_id.get(sid)
@@ -1280,7 +1331,8 @@ def postprocess_semantic_names(
         vf = sum(
             1
             for c in vis
-            if str(mid_by_id[c].get("type") or "").lower() in ("vector", "frame", "group", "instance")
+            if _normalize_figma_type(mid_by_id[c])
+            in ("vector", "frame", "group", "instance", "boolean operation")
         )
         if vf < max(3, int(0.6 * len(vis))):
             return False
@@ -1316,6 +1368,14 @@ def postprocess_semantic_names(
         if cur in ("hero_group", "headline_group", "product_group", "hero_image", "unassigned", ""):
             _force(out, sid, "brand_group", "rule5_compact_vector_brand_row")
 
+    # --- User rule 2: compact horizontal row, no text, one logo-like cluster → brand_group ---
+    for sid, row in mid_by_id.items():
+        if not _is_brand_row_compact_one_logo(sid):
+            continue
+        cur = out.get(sid, "").lower()
+        if cur in ("hero_group", "headline_group", "product_group", "hero_image", "unassigned", ""):
+            _force(out, sid, "brand_group", "user_rule2_compact_row_one_logo_cluster")
+
     # --- Rule 3: headline_group (valid headline + delivery text children only) ---
     for sid, row in mid_by_id.items():
         if not _text_child_headline_and_delivery_sub(sid):
@@ -1326,7 +1386,7 @@ def postprocess_semantic_names(
         if out.get(sid, "").lower() != "headline_group":
             continue
         if not _has_text_descendant(sid) or not _text_child_headline_and_delivery_sub(sid):
-            if _is_brand_row_rule5(sid):
+            if _is_brand_row_rule5(sid) or _is_brand_row_compact_one_logo(sid):
                 _force(out, sid, "brand_group", "rule3_invalid_headline_group_to_brand")
             else:
                 _force(out, sid, "unassigned", "rule3_headline_group_cleared_no_valid_text_block")
@@ -1371,6 +1431,19 @@ def postprocess_semantic_names(
             if ctyp == "rectangle":
                 _force(out, ch_ids[0], "hero_image", "rule3e_child_large_rectangle")
 
+    # --- Rule 6b: boolean / mixed cluster as ``logo`` under brand_group ---
+    for sid, row in mid_by_id.items():
+        if _normalize_figma_type(row) != "boolean operation":
+            continue
+        pids = row.get("mid_parent_ids") or []
+        if not pids:
+            continue
+        pid = str(pids[-1])
+        if out.get(pid, "").lower() != "brand_group":
+            continue
+        if _is_logo_like_cluster_child_id(sid):
+            _force(out, sid, "logo", "rule6b_boolean_cluster_as_logo")
+
     # --- Rule 6: logo nested frame under brand_group ---
     for sid, row in mid_by_id.items():
         ch_ids = [str(c) for c in (row.get("mid_child_ids") or []) if str(c) in mid_by_id]
@@ -1393,7 +1466,64 @@ def postprocess_semantic_names(
         else:
             _force(out, vecs[0], "logo_back", "rule6_single_vector_logo_mark")
 
-    # --- Rule 7: brand wordmark vectors by x relative to logo ---
+    def _leaf_vector_ids_under_logo(logo_id: str) -> list[str]:
+        acc: list[str] = []
+        stack = [logo_id]
+        seen: set[str] = set()
+        while stack:
+            cur = stack.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            if cur != logo_id:
+                sub = mid_by_id.get(cur)
+                if sub and str(sub.get("type") or "").lower() == "vector" and not (sub.get("mid_child_ids") or []):
+                    acc.append(cur)
+                    continue
+            subw = mid_by_id.get(cur)
+            if not subw:
+                continue
+            for xid in subw.get("mid_child_ids") or []:
+                xs = str(xid)
+                if xs in mid_by_id:
+                    stack.append(xs)
+        return acc
+
+    def _mid_descendant_id_set(start: str) -> set[str]:
+        out_d: set[str] = set()
+        stk = [start]
+        vis: set[str] = set()
+        while stk:
+            cur = stk.pop()
+            if cur in vis:
+                continue
+            vis.add(cur)
+            out_d.add(cur)
+            rw = mid_by_id.get(cur)
+            if not rw:
+                continue
+            for xid in rw.get("mid_child_ids") or []:
+                xs = str(xid)
+                if xs in mid_by_id:
+                    stk.append(xs)
+        return out_d
+
+    # --- Rule 6c: largest / second leaf vectors under any ``logo`` cluster ---
+    for sid, row in mid_by_id.items():
+        if out.get(sid, "").lower() != "logo":
+            continue
+        leaf_vecs = _leaf_vector_ids_under_logo(sid)
+        if len(leaf_vecs) < 1:
+            continue
+        leaf_vecs.sort(
+            key=lambda vid: _bounds_area(mid_by_id[vid].get("bounds")),
+            reverse=True,
+        )
+        _force(out, leaf_vecs[0], "logo_back", "rule6c_largest_leaf_vector_under_logo")
+        if len(leaf_vecs) >= 2:
+            _force(out, leaf_vecs[1], "logo_fore", "rule6c_second_leaf_vector_under_logo")
+
+    # --- Rule 7: brand wordmark vectors by x relative to logo (skip vectors inside logo subtree) ---
     for bid, brow in mid_by_id.items():
         if out.get(bid, "").lower() != "brand_group":
             continue
@@ -1402,8 +1532,12 @@ def postprocess_semantic_names(
         if len(logo_children) != 1:
             continue
         lid = logo_children[0]
+        logo_interior = _mid_descendant_id_set(lid)
+        logo_interior.discard(lid)
         ordered: list[tuple[float, str, str]] = []
         for c in ch_ids:
+            if c in logo_interior:
+                continue
             r = mid_by_id[c]
             t = str(r.get("type") or "").lower()
             b = r.get("bounds") or {}
@@ -1472,9 +1606,42 @@ def postprocess_semantic_names(
             if nm != newn:
                 _force(out, sid, newn, "rule4_huge_vector_background_family")
 
+    # --- User rule 1: large leaf rectangle cannot be brand_group / brand_name_* ---
+    for sid, row in mid_by_id.items():
+        if str(row.get("type") or "").lower() != "rectangle":
+            continue
+        if row.get("mid_child_ids"):
+            continue
+        nm = out.get(sid, "").lower()
+        if nm != "brand_group" and not nm.startswith("brand_name"):
+            continue
+        area = _bounds_area(row.get("bounds"))
+        if frame_area <= 0 or area < 0.08 * frame_area:
+            continue
+        b = row.get("bounds") or {}
+        try:
+            nw = float(b.get("width") or 0)
+            nh = float(b.get("height") or 0)
+        except (TypeError, ValueError):
+            nw, nh = 0.0, 0.0
+        ar = area / frame_area if frame_area > 0 else 0.0
+        wr, hr = (nw / frame_w if frame_w else 0.0), (nh / frame_h if frame_h else 0.0)
+        long_ratio = max(nw, nh) / max(min(nw, nh), 0.01)
+        if wr >= 0.82 and hr >= 0.82 and ar >= 0.42:
+            newn = "hero_image"
+        elif long_ratio >= 3.0 and max(wr, hr) >= 0.5:
+            newn = "background_shape"
+        elif ar >= 0.16 or area >= 1_200_000.0:
+            newn = "image_zone"
+        else:
+            newn = "background_shape"
+        _force(out, sid, newn, "user_rule1_large_leaf_rectangle_not_brand")
+
     # --- Rule 8: hero_group on compact brand row ---
     for sid, row in mid_by_id.items():
-        if _is_brand_row_rule5(sid) and out.get(sid, "").lower() == "hero_group":
+        if out.get(sid, "").lower() != "hero_group":
+            continue
+        if _is_brand_row_rule5(sid) or _is_brand_row_compact_one_logo(sid):
             _force(out, sid, "brand_group", "rule8_compact_brand_not_hero_group")
 
     # --- Rule 6a: star decorations ---
@@ -1713,6 +1880,56 @@ def remove_non_mid_json_nodes(
     return out if out is not None else root
 
 
+def lift_unassigned_wrappers_in_logo_subtrees(root: dict[str, Any], warnings: list[str]) -> dict[str, Any]:
+    """
+    Under nodes named ``logo``, replace a single-child ``unassigned`` frame/group wrapper with its child
+    (user rule: lift trivial wrappers inside the logo cluster).
+    """
+    def _nm(n: dict[str, Any]) -> str:
+        return str(n.get("name") or "").lower()
+
+    def _lift_chain_at_logo(node: dict[str, Any]) -> None:
+        if _nm(node) != "logo":
+            return
+        changed = True
+        while changed:
+            changed = False
+            ch = node.get("children")
+            if not isinstance(ch, list):
+                break
+            new_ch: list[Any] = []
+            for el in ch:
+                if not isinstance(el, dict):
+                    new_ch.append(el)
+                    continue
+                t = _normalize_figma_type(el)
+                if (
+                    _nm(el) == "unassigned"
+                    and t in ("group", "frame")
+                    and isinstance(el.get("children"), list)
+                    and len(el["children"]) == 1
+                    and isinstance(el["children"][0], dict)
+                ):
+                    warnings.append(f"lift_unassigned_single_wrapper_in_logo:{el.get('id')}")
+                    new_ch.append(el["children"][0])
+                    changed = True
+                else:
+                    new_ch.append(el)
+            if changed:
+                node["children"] = new_ch
+
+    def walk(n: dict[str, Any]) -> None:
+        if not isinstance(n, dict):
+            return
+        _lift_chain_at_logo(n)
+        for c in n.get("children") or []:
+            if isinstance(c, dict):
+                walk(c)
+
+    walk(root)
+    return root
+
+
 def normalize_convert_semantic_output(
     parsed: Any,
     mid_blocks: list[dict[str, Any]],
@@ -1745,6 +1962,7 @@ def normalize_convert_semantic_output(
     warnings.append("postprocess_debug:" + json.dumps(pp_dbg, ensure_ascii=False, separators=(",", ":")))
 
     tree = build_semantic_figma_tree_from_mid(mid_blocks, names, warnings)
+    tree = lift_unassigned_wrappers_in_logo_subtrees(tree, warnings)
     tree = remove_non_mid_json_nodes(tree, allowed_ids, warnings)
     validate_final_json_ids(tree, mid_blocks, warnings)
     return tree

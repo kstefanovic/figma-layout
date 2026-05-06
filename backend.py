@@ -47,9 +47,9 @@ from json_embedding import (
 
 load_dotenv()
 
-MODEL_SERVICE_URL = os.getenv("MODEL_SERVICE_URL", "http://127.0.0.1:9297")
+MODEL_SERVICE_URL = os.getenv("MODEL_SERVICE_URL", "http://127.0.0.1:20400")
 HOST = os.getenv("BACKEND_HOST", "0.0.0.0")
-PORT = int(os.getenv("BACKEND_PORT", "9298"))
+PORT = int(os.getenv("BACKEND_PORT", "20401"))
 REQUEST_TIMEOUT = float(os.getenv("MODEL_REQUEST_TIMEOUT", "300"))
 CATEGORY_PROMPT = os.getenv(
     "CATEGORY_PROMPT",

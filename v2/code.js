@@ -1,10 +1,13 @@
 /**
  * Figma plugin main thread. Flows:
  * - ``POST …/pipeline/banner-raw-to-target-json-json`` — banner + raw JSON + target size → layout clone.
- * - ``POST …/figma/convert-semantic-json`` — banner + grid PNG + raw JSON → Qwen returns ``{names:{id:…}}`` merged server-side into full semantic JSON.
+ * - ``POST …/figma/convert-semantic-json`` — banner + grid PNG + raw JSON → Qwen returns ``{names:{id:…}}`` merged server-side into full semantic JSON; plugin clones beside the original, reparents to match JSON hierarchy, then renames from that JSON.
  * - HTML/CSS export from serialized JSON + assets (local).
  */
 figma.showUI(__html__, { width: 400, height: 720 });
+
+/** Horizontal gap between the source frame and a sibling created by the plugin (px). */
+const BESIDE_FRAME_GAP = 80;
 
 function normalizeType(type) {
   return String(type || "").toLowerCase().replace(/_/g, " ");
@@ -830,6 +833,128 @@ function setSemanticName(node, itemOrName) {
   return true;
 }
 
+function buildSemanticCloneFrameTitle(sourceFrameName, semanticRootName) {
+  const src = sanitizeLayerName(String(sourceFrameName || "").trim()) || "frame";
+  const sem = sanitizeLayerName(String(semanticRootName || "").trim()) || "semantic";
+  return `${src} · ${sem}`;
+}
+
+/**
+ * Duplicate a frame to the right of the source (same Y). Caller should stamp ``originalNodeId`` on the
+ * source tree before cloning so the copy can be matched to backend JSON ``id`` fields.
+ */
+function cloneFrameBesideSource(sourceFrame) {
+  const clone = sourceFrame.clone();
+  clone.x = sourceFrame.x + sourceFrame.width + BESIDE_FRAME_GAP;
+  clone.y = sourceFrame.y;
+  figma.currentPage.appendChild(clone);
+  return clone;
+}
+
+function isStrictDescendantOf(node, ancestorCandidate) {
+  if (!node || !ancestorCandidate) return false;
+  let p = node.parent;
+  while (p) {
+    if (p.id === ancestorCandidate.id) return true;
+    p = p.parent;
+  }
+  return false;
+}
+
+/**
+ * Reparent and reorder nodes in ``cloneRoot`` so parent/child order matches ``jsonTree.children``
+ * (same serialized Figma ``id`` keys as ``collectClonedNodesByOriginalId``).
+ * Call before ``applyJsonTreeNamesByOriginalIds`` so the layer list matches backend hierarchy.
+ */
+function syncCloneHierarchyToJsonTree(jsonTree, cloneRoot) {
+  const { map: byId } = collectClonedNodesByOriginalId(cloneRoot);
+  let reparentMoves = 0;
+  const errors = [];
+
+  function resolveParentNode(jsonItem) {
+    const pid = String(jsonItem.id || "").trim();
+    if (pid && byId.has(pid)) return byId.get(pid);
+    if (jsonItem === jsonTree) return cloneRoot;
+    return null;
+  }
+
+  function sync(jsonItem) {
+    if (!jsonItem || typeof jsonItem !== "object") return;
+    const parentNode = resolveParentNode(jsonItem);
+    const kids = Array.isArray(jsonItem.children) ? jsonItem.children : [];
+
+    if (parentNode && typeof parentNode.insertChild === "function") {
+      let slot = 0;
+      for (let i = 0; i < kids.length; i++) {
+        const cj = kids[i];
+        if (!cj || typeof cj !== "object") continue;
+        const cid = String(cj.id || "").trim();
+        if (!cid) continue;
+        const childNode = byId.get(cid);
+        if (!childNode || childNode.id === cloneRoot.id) continue;
+        if (isStrictDescendantOf(parentNode, childNode)) {
+          console.warn("syncCloneHierarchy: skip (would cycle)", cid, "under", jsonItem.id);
+          continue;
+        }
+        const already =
+          childNode.parent &&
+          childNode.parent.id === parentNode.id &&
+          parentNode.children.indexOf(childNode) === slot;
+        if (already) {
+          slot++;
+          continue;
+        }
+        try {
+          parentNode.insertChild(slot, childNode);
+          reparentMoves++;
+        } catch (e) {
+          const msg = e && e.message ? e.message : String(e);
+          errors.push(cid + ":" + msg);
+          console.warn("syncCloneHierarchy: insertChild failed", cid, e);
+          continue;
+        }
+        slot++;
+      }
+    }
+
+    for (let j = 0; j < kids.length; j++) {
+      if (kids[j] && typeof kids[j] === "object") sync(kids[j]);
+    }
+  }
+
+  sync(jsonTree);
+  return { reparentMoves, errors };
+}
+
+/**
+ * Walk a semantic / ``final_json`` tree and rename nodes in ``cloneRoot`` by serialized Figma ``id``,
+ * using ``originalNodeId`` plugin data (``collectClonedNodesByOriginalId``).
+ */
+function applyJsonTreeNamesByOriginalIds(jsonTree, cloneRoot) {
+  const { map: byId, mapped } = collectClonedNodesByOriginalId(cloneRoot);
+  let renamed = 0;
+  const missing = [];
+
+  function walk(item) {
+    if (!item || typeof item !== "object") return;
+    const id = String(item.id || "").trim();
+    const nm = String(item.name || "").trim();
+    if (id && nm) {
+      const node = byId.get(id);
+      if (node) {
+        if (setSemanticName(node, nm)) renamed++;
+      } else {
+        missing.push(id);
+      }
+    }
+    const kids = Array.isArray(item.children) ? item.children : [];
+    for (let i = 0; i < kids.length; i++) walk(kids[i]);
+  }
+
+  walk(jsonTree);
+  return { renamed, missing, mapped };
+}
+
 function parseTargetSize(value, fallbackFrame) {
   const raw = String(value || "").trim();
   if (!raw || raw.toLowerCase() === "same") {
@@ -966,7 +1091,7 @@ async function drawJsonTreeBesideSelection(finalJson, sourceFrame, targetResolut
   const rootBounds = jsonBounds(finalJson);
   const root = figma.createFrame();
   root.name = targetSizeName(targetResolution);
-  root.x = sourceFrame.x + sourceFrame.width + 80;
+  root.x = sourceFrame.x + sourceFrame.width + BESIDE_FRAME_GAP;
   root.y = sourceFrame.y;
   root.layoutMode = "NONE";
   root.clipsContent = false;
@@ -1066,7 +1191,7 @@ function scaleCloneTree(node, sx, sy, isRoot) {
 
 function cloneCandidateFrameBesideSelection(candidateFrame, selectedFrame, finalJson, targetResolution) {
   const clone = candidateFrame.clone();
-  clone.x = selectedFrame.x + selectedFrame.width + 80;
+  clone.x = selectedFrame.x + selectedFrame.width + BESIDE_FRAME_GAP;
   clone.y = selectedFrame.y;
   clone.name = targetSizeName(targetResolution);
   const targetBounds = jsonBounds(finalJson || {});
@@ -1781,6 +1906,11 @@ figma.ui.onmessage = async (msg) => {
         drawMode = "create_from_returned_json_fallback";
       }
 
+      const rootJsonLabel = String((result.final_json && result.final_json.name) || "").trim();
+      const hierarchyReport = syncCloneHierarchyToJsonTree(result.final_json, convertedFrame);
+      const namingReport = applyJsonTreeNamesByOriginalIds(result.final_json, convertedFrame);
+      convertedFrame.name = buildSemanticCloneFrameTitle(selectedFrame.name, rootJsonLabel || "layout");
+
       figma.currentPage.selection = [convertedFrame];
       figma.viewport.scrollAndZoomIntoView([selectedFrame, convertedFrame]);
 
@@ -1789,6 +1919,8 @@ figma.ui.onmessage = async (msg) => {
           `Qwen class: ${result.category}\n` +
           `Guide: ${selectedGuide.name || "unknown"}\n` +
           `Mode: ${drawMode}\n` +
+          `Hierarchy sync moves: ${hierarchyReport.reparentMoves}\n` +
+          `Semantic names applied: ${namingReport.renamed} (id map ${namingReport.mapped})\n` +
           `Selected stamped nodes: ${stampedNodeCount}\n` +
           (applySummary
             ? `Scaled candidate nodes: ${applySummary.applied}\nScale: ${applySummary.scale_x.toFixed(3)} × ${applySummary.scale_y.toFixed(3)}`
@@ -1922,13 +2054,31 @@ figma.ui.onmessage = async (msg) => {
       }
 
       const pretty = JSON.stringify(data.semantic_json, null, 2);
+
+      postStatus("Semantic JSON: creating clone beside selection…");
+      const semanticClone = cloneFrameBesideSource(selectedFrame);
+      postStatus("Semantic JSON: matching layer hierarchy to returned JSON…");
+      const hierarchyReport = syncCloneHierarchyToJsonTree(data.semantic_json, semanticClone);
+      const namingReport = applyJsonTreeNamesByOriginalIds(data.semantic_json, semanticClone);
+      const rootJsonLabel = String((data.semantic_json && data.semantic_json.name) || "").trim();
+      semanticClone.name = buildSemanticCloneFrameTitle(selectedFrame.name, rootJsonLabel || "semantic");
+
+      figma.currentPage.selection = [semanticClone];
+      figma.viewport.scrollAndZoomIntoView([selectedFrame, semanticClone]);
+      figma.notify(
+        `Semantic clone ready next to the original.\nHierarchy moves: ${hierarchyReport.reparentMoves} · Layers renamed: ${namingReport.renamed} (id map ${namingReport.mapped}).`,
+        { timeout: 6 },
+      );
+
       figma.ui.postMessage({
         type: "semantic-json-result",
         ok: true,
         jsonText: pretty,
         fileName: `${selectedFrame.name || "semantic"}-${Math.round(selectedFrame.width)}x${Math.round(selectedFrame.height)}`,
       });
-      postStatus("Semantic JSON: done.");
+      postStatus(
+        `Semantic JSON: done. Clone "${semanticClone.name}" — ${hierarchyReport.reparentMoves} reparents, ${namingReport.renamed} names.`,
+      );
       figma.ui.postMessage({ type: "done" });
       sendSelectionInfo();
     } catch (err) {

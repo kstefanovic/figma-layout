@@ -19,7 +19,7 @@ from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
 MODEL_PATH = os.getenv("QWEN_MODEL_PATH", "./Qwen2.5-VL-7B-Instruct")
 HOST = os.getenv("QWEN_HOST", "127.0.0.1")
-PORT = int(os.getenv("QWEN_PORT", "9297"))
+PORT = int(os.getenv("QWEN_PORT", "20400"))
 DEVICE = os.getenv("QWEN_DEVICE", "cuda:0" if torch.cuda.is_available() else "cpu")
 
 
