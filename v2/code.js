@@ -927,6 +927,241 @@ function syncCloneHierarchyToJsonTree(jsonTree, cloneRoot) {
 }
 
 /**
+ * Collect every concrete ``id`` in a semantic / ``final_json`` tree (for pruning clones).
+ */
+function collectFinalJsonNodeIds(jsonTree) {
+  const ids = new Set();
+  function walk(item) {
+    if (!item || typeof item !== "object") return;
+    const id = String(item.id || "").trim();
+    if (id) ids.add(id);
+    const kids = Array.isArray(item.children) ? item.children : [];
+    for (let i = 0; i < kids.length; i++) walk(kids[i]);
+  }
+  walk(jsonTree);
+  return ids;
+}
+
+/**
+ * Re-stamp ``originalNodeId`` on the clone from ``jsonTree`` so BOOLEAN / GROUP / FRAME nodes match
+ * backend ids (clone + scale can leave booleans without plugin data; ``collectClonedNodesByOriginalId``
+ * would then skip layout for those nodes and they stay at 0,0 inside the parent).
+ */
+function stampCloneOriginalIdsFromJson(jsonTree, cloneRoot) {
+  let stamped = 0;
+
+  function walk(jNode, fNode) {
+    if (!jNode || typeof jNode !== "object" || !fNode) return;
+    const jid = String(jNode.id || "").trim();
+    if (jid) {
+      try {
+        fNode.setPluginData("originalNodeId", jid);
+        stamped++;
+      } catch (e) {
+        console.warn("stampCloneIds: setPluginData failed", jid, e);
+      }
+    }
+    const jch = Array.isArray(jNode.children) ? jNode.children : [];
+    if (!("children" in fNode) || !Array.isArray(fNode.children)) return;
+    const fch = [...fNode.children];
+    const used = new Set();
+    for (let i = 0; i < jch.length; i++) {
+      const jc = jch[i];
+      const cid = String(jc.id || "").trim();
+      let fc = null;
+      if (cid) {
+        for (let k = 0; k < fch.length; k++) {
+          if (used.has(k)) continue;
+          const cand = fch[k];
+          let oid = "";
+          try {
+            oid = String(cand.getPluginData("originalNodeId") || "").trim();
+          } catch (_e) {
+            oid = "";
+          }
+          if (oid === cid) {
+            fc = cand;
+            used.add(k);
+            break;
+          }
+        }
+      }
+      if (!fc && jch.length === fch.length) {
+        for (let k = 0; k < fch.length; k++) {
+          if (!used.has(k)) {
+            fc = fch[k];
+            used.add(k);
+            break;
+          }
+        }
+      }
+      if (fc) walk(jc, fc);
+    }
+  }
+
+  walk(jsonTree, cloneRoot);
+  return { stamped };
+}
+
+/**
+ * Absolute bounds and JSON parent id per node id (banner-root coordinate space).
+ */
+function buildFinalJsonLayoutIndex(jsonTree) {
+  const boundsById = new Map();
+  const parentIdById = new Map();
+
+  function walk(item, parentId) {
+    if (!item || typeof item !== "object") return;
+    const id = String(item.id || "").trim();
+    if (id) {
+      boundsById.set(id, jsonBounds(item));
+      parentIdById.set(id, parentId || null);
+    }
+    const nextParent = id || parentId;
+    const kids = Array.isArray(item.children) ? item.children : [];
+    for (let i = 0; i < kids.length; i++) {
+      walk(kids[i], nextParent);
+    }
+  }
+
+  walk(jsonTree, null);
+  return { boundsById, parentIdById };
+}
+
+/**
+ * Apply ``bounds`` from ``jsonTree`` as **absolute** coordinates in banner-root space, converting to
+ * each node's position relative to its **JSON** parent (frame / group / boolean / vector / text).
+ * Uses ``boundsById`` + ``parentIdById`` so BOOLEAN_OPERATION nodes are laid out even if a DFS
+ * skipped them earlier.
+ */
+function applyFinalJsonAbsoluteLayout(jsonTree, cloneRoot) {
+  const { boundsById, parentIdById } = buildFinalJsonLayoutIndex(jsonTree);
+  const { map: byId } = collectClonedNodesByOriginalId(cloneRoot);
+  const rootId = String(jsonTree.id || "").trim();
+  const rootAbs = rootId && boundsById.has(rootId) ? boundsById.get(rootId) : jsonBounds(jsonTree);
+  let applied = 0;
+
+  for (const fid of boundsById.keys()) {
+    const abs = boundsById.get(fid);
+    const node = byId.get(fid);
+    if (!node) continue;
+
+    if (cloneRoot && node.id === cloneRoot.id) {
+      if (typeof abs.width === "number" && typeof abs.height === "number") {
+        resizeNodeIfPossible(node, abs.width, abs.height);
+        applied++;
+      }
+      continue;
+    }
+
+    const pId = parentIdById.get(fid);
+    let parentAbs = rootAbs;
+    if (pId && boundsById.has(pId)) {
+      parentAbs = boundsById.get(pId);
+    }
+
+    const relX = abs.x - parentAbs.x;
+    const relY = abs.y - parentAbs.y;
+    node.x = relX;
+    node.y = relY;
+    applied++;
+    if (typeof abs.width === "number" && typeof abs.height === "number") {
+      resizeNodeIfPossible(node, abs.width, abs.height);
+    }
+  }
+
+  return { applied, indexIds: boundsById.size, mapSize: byId.size };
+}
+
+/**
+ * Remove clone subtrees whose ``originalNodeId`` is absent from ``final_json`` / ``semantic_json``.
+ * Lifts remaining children to the parent before removal so valid nodes are not deleted with a wrapper.
+ */
+function pruneClonedNodesMissingFromFinalJson(jsonTree, cloneRoot) {
+  const allowed = collectFinalJsonNodeIds(jsonTree);
+  let removed = 0;
+
+  function visitPost(node) {
+    if (!node || node === cloneRoot || !("children" in node) || !Array.isArray(node.children)) return;
+    const kids = [...node.children];
+    for (let i = 0; i < kids.length; i++) {
+      visitPost(kids[i]);
+    }
+    const kids2 = [...node.children];
+    for (let j = 0; j < kids2.length; j++) {
+      const c = kids2[j];
+      let oid = "";
+      try {
+        oid = String(c.getPluginData("originalNodeId") || "").trim();
+      } catch (_e) {
+        oid = "";
+      }
+      if (!oid || allowed.has(oid)) continue;
+      const p = c.parent;
+      if (p && typeof p.insertChild === "function" && "children" in c && Array.isArray(c.children)) {
+        let insertIdx = p.children.indexOf(c);
+        if (insertIdx < 0) insertIdx = p.children.length;
+        const lift = [...c.children];
+        for (let k = 0; k < lift.length; k++) {
+          try {
+            p.insertChild(insertIdx, lift[k]);
+            insertIdx++;
+          } catch (e) {
+            console.warn("prune: failed to lift child before removing orphan wrapper", lift[k] && lift[k].id, e);
+          }
+        }
+      }
+      try {
+        c.remove();
+        removed++;
+      } catch (e2) {
+        console.warn("prune: remove failed", c && c.id, e2);
+      }
+    }
+  }
+
+  visitPost(cloneRoot);
+  return { removed };
+}
+
+/**
+ * Remove empty FRAME/GROUP nodes under ``root`` (e.g. raw wrappers left after reparent + prune).
+ */
+function removeEmptyFramesUnder(root) {
+  let total = 0;
+  let rounds = 0;
+  let changed = true;
+  while (changed && rounds < 64) {
+    changed = false;
+    rounds++;
+    const toRemove = [];
+
+    function collectEmpty(node) {
+      if (!node || !("children" in node) || !Array.isArray(node.children)) return;
+      for (let i = 0; i < node.children.length; i++) {
+        collectEmpty(node.children[i]);
+      }
+      const t = node.type;
+      if (node !== root && (t === "FRAME" || t === "GROUP") && node.children.length === 0) {
+        toRemove.push(node);
+      }
+    }
+
+    collectEmpty(root);
+    for (let r = 0; r < toRemove.length; r++) {
+      try {
+        toRemove[r].remove();
+        total++;
+        changed = true;
+      } catch (e) {
+        console.warn("removeEmptyFramesUnder: remove failed", toRemove[r] && toRemove[r].id, e);
+      }
+    }
+  }
+  return { removed: total, rounds };
+}
+
+/**
  * Walk a semantic / ``final_json`` tree and rename nodes in ``cloneRoot`` by serialized Figma ``id``,
  * using ``originalNodeId`` plugin data (``collectClonedNodesByOriginalId``).
  */
@@ -1071,6 +1306,7 @@ async function createNodeFromJsonItem(item, parent, parentBounds, isRoot) {
 
   node.name = String(item.name || item.type || "json_node");
   if (!isRoot) {
+    // ``bounds`` / ``parentBounds`` are absolute in banner-root space (same as backend ``final_json``).
     node.x = bounds.x - parentBounds.x;
     node.y = bounds.y - parentBounds.y;
   }
@@ -1101,7 +1337,7 @@ async function drawJsonTreeBesideSelection(finalJson, sourceFrame, targetResolut
 
   const children = Array.isArray(finalJson.children) ? finalJson.children : [];
   for (const child of children) {
-    await createNodeFromJsonItem(child, root, { x: 0, y: 0, width: rootBounds.width, height: rootBounds.height }, false);
+    await createNodeFromJsonItem(child, root, rootBounds, false);
   }
   return root;
 }
@@ -1908,6 +2144,10 @@ figma.ui.onmessage = async (msg) => {
 
       const rootJsonLabel = String((result.final_json && result.final_json.name) || "").trim();
       const hierarchyReport = syncCloneHierarchyToJsonTree(result.final_json, convertedFrame);
+      const stampReport = stampCloneOriginalIdsFromJson(result.final_json, convertedFrame);
+      const layoutReport = applyFinalJsonAbsoluteLayout(result.final_json, convertedFrame);
+      const pruneReport = pruneClonedNodesMissingFromFinalJson(result.final_json, convertedFrame);
+      const emptyReport = removeEmptyFramesUnder(convertedFrame);
       const namingReport = applyJsonTreeNamesByOriginalIds(result.final_json, convertedFrame);
       convertedFrame.name = buildSemanticCloneFrameTitle(selectedFrame.name, rootJsonLabel || "layout");
 
@@ -1920,6 +2160,10 @@ figma.ui.onmessage = async (msg) => {
           `Guide: ${selectedGuide.name || "unknown"}\n` +
           `Mode: ${drawMode}\n` +
           `Hierarchy sync moves: ${hierarchyReport.reparentMoves}\n` +
+          `Ids re-stamped from JSON: ${stampReport.stamped}\n` +
+          `Layout from JSON (abs→rel): ${layoutReport.applied} nodes (index ${layoutReport.indexIds}, map ${layoutReport.mapSize})\n` +
+          `Pruned nodes not in JSON: ${pruneReport.removed}\n` +
+          `Removed empty frames: ${emptyReport.removed}\n` +
           `Semantic names applied: ${namingReport.renamed} (id map ${namingReport.mapped})\n` +
           `Selected stamped nodes: ${stampedNodeCount}\n` +
           (applySummary
@@ -2059,6 +2303,10 @@ figma.ui.onmessage = async (msg) => {
       const semanticClone = cloneFrameBesideSource(selectedFrame);
       postStatus("Semantic JSON: matching layer hierarchy to returned JSON…");
       const hierarchyReport = syncCloneHierarchyToJsonTree(data.semantic_json, semanticClone);
+      const stampReport = stampCloneOriginalIdsFromJson(data.semantic_json, semanticClone);
+      const layoutReport = applyFinalJsonAbsoluteLayout(data.semantic_json, semanticClone);
+      const pruneReport = pruneClonedNodesMissingFromFinalJson(data.semantic_json, semanticClone);
+      const emptyReport = removeEmptyFramesUnder(semanticClone);
       const namingReport = applyJsonTreeNamesByOriginalIds(data.semantic_json, semanticClone);
       const rootJsonLabel = String((data.semantic_json && data.semantic_json.name) || "").trim();
       semanticClone.name = buildSemanticCloneFrameTitle(selectedFrame.name, rootJsonLabel || "semantic");
@@ -2066,7 +2314,11 @@ figma.ui.onmessage = async (msg) => {
       figma.currentPage.selection = [semanticClone];
       figma.viewport.scrollAndZoomIntoView([selectedFrame, semanticClone]);
       figma.notify(
-        `Semantic clone ready next to the original.\nHierarchy moves: ${hierarchyReport.reparentMoves} · Layers renamed: ${namingReport.renamed} (id map ${namingReport.mapped}).`,
+        `Semantic clone ready next to the original.\n` +
+          `Hierarchy moves: ${hierarchyReport.reparentMoves}\n` +
+          `Ids re-stamped: ${stampReport.stamped} · Layout: ${layoutReport.applied} (idx ${layoutReport.indexIds})\n` +
+          `Pruned: ${pruneReport.removed} · Empty removed: ${emptyReport.removed}\n` +
+          `Layers renamed: ${namingReport.renamed} (id map ${namingReport.mapped}).`,
         { timeout: 6 },
       );
 
@@ -2077,7 +2329,8 @@ figma.ui.onmessage = async (msg) => {
         fileName: `${selectedFrame.name || "semantic"}-${Math.round(selectedFrame.width)}x${Math.round(selectedFrame.height)}`,
       });
       postStatus(
-        `Semantic JSON: done. Clone "${semanticClone.name}" — ${hierarchyReport.reparentMoves} reparents, ${namingReport.renamed} names.`,
+        `Semantic JSON: done. Clone "${semanticClone.name}" — ${hierarchyReport.reparentMoves} reparents, ` +
+          `${stampReport.stamped} ids stamped, ${layoutReport.applied} layout, ${namingReport.renamed} names.`,
       );
       figma.ui.postMessage({ type: "done" });
       sendSelectionInfo();

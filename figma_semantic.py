@@ -1940,8 +1940,11 @@ def remove_non_mid_json_nodes(
 
 def lift_unassigned_wrappers_in_logo_subtrees(root: dict[str, Any], warnings: list[str]) -> dict[str, Any]:
     """
-    Under nodes named ``logo``, replace a single-child ``unassigned`` frame/group wrapper with its child
-    (user rule: lift trivial wrappers inside the logo cluster).
+    Under nodes named ``logo``, lift trivial wrappers:
+
+    - single-child ``unassigned`` frame/group → child
+    - any frame/group/**boolean operation** with exactly one child named ``logo_fore`` or ``logo_back``
+      (e.g. ``background_shape`` around ``logo_fore``) → that child
     """
     def _nm(n: dict[str, Any]) -> str:
         return str(n.get("name") or "").lower()
@@ -1961,15 +1964,29 @@ def lift_unassigned_wrappers_in_logo_subtrees(root: dict[str, Any], warnings: li
                     new_ch.append(el)
                     continue
                 t = _normalize_figma_type(el)
+                sub = el.get("children")
+                single_logo_part = (
+                    t in ("group", "frame", "boolean operation")
+                    and isinstance(sub, list)
+                    and len(sub) == 1
+                    and isinstance(sub[0], dict)
+                    and _nm(sub[0]) in ("logo_fore", "logo_back")
+                )
                 if (
                     _nm(el) == "unassigned"
                     and t in ("group", "frame")
-                    and isinstance(el.get("children"), list)
-                    and len(el["children"]) == 1
-                    and isinstance(el["children"][0], dict)
+                    and isinstance(sub, list)
+                    and len(sub) == 1
+                    and isinstance(sub[0], dict)
                 ):
                     warnings.append(f"lift_unassigned_single_wrapper_in_logo:{el.get('id')}")
-                    new_ch.append(el["children"][0])
+                    new_ch.append(sub[0])
+                    changed = True
+                elif single_logo_part:
+                    warnings.append(
+                        f"lift_singleton_logo_part_wrapper_in_logo:{_nm(el)}:{el.get('id')}"
+                    )
+                    new_ch.append(sub[0])
                     changed = True
                 else:
                     new_ch.append(el)
@@ -2020,6 +2037,7 @@ def normalize_convert_semantic_output(
     warnings.append("postprocess_debug:" + json.dumps(pp_dbg, ensure_ascii=False, separators=(",", ":")))
 
     tree = build_semantic_figma_tree_from_mid(mid_blocks, names, warnings)
+    # Logo: lift unassigned wrappers and single-child logo_fore / logo_back shells (e.g. background_shape).
     tree = lift_unassigned_wrappers_in_logo_subtrees(tree, warnings)
     tree = remove_non_mid_json_nodes(tree, allowed_ids, warnings)
     validate_final_json_ids(tree, mid_blocks, warnings)
