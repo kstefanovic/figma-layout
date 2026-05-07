@@ -251,7 +251,8 @@ Do NOT call product/photo image `background`.
 - Soft gradient, glow, shadow, triangular light mask, or abstract overlay that bleeds past the frame:
   `background_gradient` (postprocess may assign `background_gradient_1`, `background_gradient_2`, …).
 - Full-bleed rectangle that covers almost the entire banner (main photo / scene): `hero_image` — not
-  `background_gradient` even when it bleeds past the frame edges.
+  `background_gradient` even when it bleeds past the frame edges. Wide DOOH layouts may use a large
+  left/right (or top/bottom) photo crop that still reads as the main visual: that is `hero_image`, not a soft overlay.
 - If unsure between `image_zone` and `background_gradient`: no recognizable object/photo → `background_gradient`;
   clear product/person/photo → `image_zone` or `hero_image`.
 
@@ -1691,6 +1692,10 @@ def postprocess_semantic_names(
         """
         Full-bleed main photo / scene plate: huge rectangle that actually covers most of the banner,
         unlike narrow gradient overlays that only clip a slice of the frame.
+
+        Wide banners often place the hero photo as a large right/left crop: high intersection on one
+        axis with moderate total coverage (~55–70%), which still must not be classified as
+        ``background_gradient``.
         """
         if str(row.get("type") or "").lower() != "rectangle":
             return False
@@ -1701,17 +1706,34 @@ def postprocess_semantic_names(
         cov = _rectangle_frame_coverage_ratio(row)
         b = row.get("bounds") or {}
         try:
+            x0 = float(b.get("x") or 0)
+            y0 = float(b.get("y") or 0)
             nw = float(b.get("width") or 0)
             nh = float(b.get("height") or 0)
         except (TypeError, ValueError):
             return False
+        if nw <= 0 or nh <= 0:
+            return False
         wr = nw / frame_w
         hr = nh / frame_h
+        ix0 = max(0.0, x0)
+        iy0 = max(0.0, y0)
+        ix1 = min(frame_w, x0 + nw)
+        iy1 = min(frame_h, y0 + nh)
+        iw = max(0.0, ix1 - ix0)
+        ih = max(0.0, iy1 - iy0)
+        wspan = iw / frame_w
+        hspan = ih / frame_h
         if cov >= 0.78:
             return True
         if cov >= 0.70 and wr >= 1.05 and hr >= 0.92:
             return True
         if wr >= 1.35 and hr >= 1.05:
+            return True
+        # Right/left or top/bottom dominant photo plate (wide DOOH, half-frame bleed, etc.).
+        if max(wr, hr) >= 0.72 and cov >= 0.48 and (hspan >= 0.86 or wspan >= 0.54):
+            return True
+        if max(wr, hr) >= 0.65 and cov >= 0.52 and (hspan >= 0.80 or wspan >= 0.52):
             return True
         return False
 
