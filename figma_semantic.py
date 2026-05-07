@@ -1094,6 +1094,20 @@ def postprocess_semantic_names(
     dbg = debug if debug is not None else {}
     dbg["postprocess_used"] = True
     dbg.setdefault("forced_renames", [])
+    # Compact top brand rows (vectors + one logo cluster) must never keep these container roles.
+    _FORBIDDEN_BRAND_ROW_PARENT = frozenset(
+        {
+            "hero_group",
+            "headline_group",
+            "product_group",
+            "hero_image",
+            "legal_text_group",
+            "background_group",
+            "unassigned",
+            "",
+        }
+    )
+
     def _track(sid: str, old: str, new: str, reason: str) -> None:
         if old == new:
             return
@@ -1292,6 +1306,13 @@ def postprocess_semantic_names(
         logo_like = [c for c in vis if _is_logo_like_cluster_child_id(c)]
         if len(logo_like) != 1:
             return False
+        logo_id = logo_like[0]
+        others = [c for c in vis if c != logo_id]
+        if not others:
+            return False
+        # Wordmark pieces are direct vectors; avoid rows with extra frames/booleans as siblings.
+        if not all(_normalize_figma_type(mid_by_id[c]) == "vector" for c in others):
+            return False
         try:
             rw = float((row.get("bounds") or {}).get("width") or 0)
             rh = float((row.get("bounds") or {}).get("height") or 0)
@@ -1305,9 +1326,6 @@ def postprocess_semantic_names(
         if frame_h > 0 and rh > min(520.0, 0.30 * frame_h):
             return False
         if frame_h > 0 and y0 > 0.62 * frame_h:
-            return False
-        vf = sum(1 for c in vis if _normalize_figma_type(mid_by_id[c]) == "vector")
-        if vf < 1:
             return False
         return True
 
@@ -1360,12 +1378,39 @@ def postprocess_semantic_names(
             return False
         return True
 
+    def _is_compact_vector_brand_row(sid: str) -> bool:
+        return _is_brand_row_rule5(sid) or _is_brand_row_compact_one_logo(sid)
+
+    def _has_real_legal_text_descendant(root_sid: str) -> bool:
+        """True if some descendant TEXT node is classified ``legal_text`` (post rule2)."""
+        stack = [
+            str(c)
+            for c in (mid_by_id.get(root_sid, {}).get("mid_child_ids") or [])
+            if str(c) in mid_by_id
+        ]
+        seen: set[str] = set()
+        while stack:
+            cur = stack.pop()
+            if cur in seen or cur == root_sid:
+                continue
+            seen.add(cur)
+            r = mid_by_id.get(cur)
+            if not r:
+                continue
+            if str(r.get("type") or "").lower() == "text" and out.get(cur, "").lower() == "legal_text":
+                return True
+            for cid in r.get("mid_child_ids") or []:
+                cs = str(cid)
+                if cs in mid_by_id:
+                    stack.append(cs)
+        return False
+
     # --- Rule 5: compact vector brand row ---
     for sid, row in mid_by_id.items():
         if not _is_brand_row_rule5(sid):
             continue
         cur = out.get(sid, "").lower()
-        if cur in ("hero_group", "headline_group", "product_group", "hero_image", "unassigned", ""):
+        if cur in _FORBIDDEN_BRAND_ROW_PARENT:
             _force(out, sid, "brand_group", "rule5_compact_vector_brand_row")
 
     # --- User rule 2: compact horizontal row, no text, one logo-like cluster → brand_group ---
@@ -1373,7 +1418,7 @@ def postprocess_semantic_names(
         if not _is_brand_row_compact_one_logo(sid):
             continue
         cur = out.get(sid, "").lower()
-        if cur in ("hero_group", "headline_group", "product_group", "hero_image", "unassigned", ""):
+        if cur in _FORBIDDEN_BRAND_ROW_PARENT:
             _force(out, sid, "brand_group", "user_rule2_compact_row_one_logo_cluster")
 
     # --- Rule 3: headline_group (valid headline + delivery text children only) ---
@@ -1386,7 +1431,7 @@ def postprocess_semantic_names(
         if out.get(sid, "").lower() != "headline_group":
             continue
         if not _has_text_descendant(sid) or not _text_child_headline_and_delivery_sub(sid):
-            if _is_brand_row_rule5(sid) or _is_brand_row_compact_one_logo(sid):
+            if _is_compact_vector_brand_row(sid):
                 _force(out, sid, "brand_group", "rule3_invalid_headline_group_to_brand")
             else:
                 _force(out, sid, "unassigned", "rule3_headline_group_cleared_no_valid_text_block")
@@ -1401,11 +1446,23 @@ def postprocess_semantic_names(
     for sid, row in mid_by_id.items():
         if not (row.get("mid_parent_ids") or []):
             continue
-        ch_names = _child_names(sid)
-        if any(n == "legal_text" for n in ch_names):
-            typ = str(row.get("type") or "").lower()
-            if typ != "text":
-                _force(out, sid, "legal_text_group", "rule3b_container_with_legal_text_child")
+        typ = str(row.get("type") or "").lower()
+        if typ == "text":
+            continue
+        if not _has_real_legal_text_descendant(sid):
+            continue
+        _force(out, sid, "legal_text_group", "rule3b_container_with_legal_text_descendant")
+    for sid, row in mid_by_id.items():
+        if out.get(sid, "").lower() != "legal_text_group":
+            continue
+        if str(row.get("type") or "").lower() == "text":
+            continue
+        if _has_real_legal_text_descendant(sid):
+            continue
+        if _is_compact_vector_brand_row(sid):
+            _force(out, sid, "brand_group", "rule3b_clear_legal_group_vector_only_brand_row")
+        else:
+            _force(out, sid, "unassigned", "rule3b_clear_legal_group_without_real_legal_text")
     for sid, row in mid_by_id.items():
         if not (row.get("mid_parent_ids") or []):
             continue
@@ -1637,12 +1694,13 @@ def postprocess_semantic_names(
             newn = "background_shape"
         _force(out, sid, newn, "user_rule1_large_leaf_rectangle_not_brand")
 
-    # --- Rule 8: hero_group on compact brand row ---
+    # --- Rule 8: wrong container roles on compact brand row (VLm / ordering fallout) ---
     for sid, row in mid_by_id.items():
-        if out.get(sid, "").lower() != "hero_group":
+        if not _is_compact_vector_brand_row(sid):
             continue
-        if _is_brand_row_rule5(sid) or _is_brand_row_compact_one_logo(sid):
-            _force(out, sid, "brand_group", "rule8_compact_brand_not_hero_group")
+        cur = out.get(sid, "").lower()
+        if cur in _FORBIDDEN_BRAND_ROW_PARENT:
+            _force(out, sid, "brand_group", "rule8_compact_brand_strip_wrong_container_role")
 
     # --- Rule 6a: star decorations ---
     for sid, row in mid_by_id.items():
