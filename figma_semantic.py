@@ -1099,10 +1099,11 @@ def postprocess_semantic_names(
     Deterministic corrections after VLM ``names`` output. Returns a new ``id -> semantic_name`` map.
 
     Rough phase order (dependencies matter more than rule numbers):
-    text roles → compact ``brand_group`` / logo subtree (rules 5–7, 6b, 6c) → huge-vector background
-    (rule 4) → rectangle / container fixes → rule 9 (stray ``logo_*``) → rule 10a (``hero_image``) → rule 10
-    (``image_zone`` → ``background_gradient``) → gradient numbering → per-parent gradient suffix normalize
-    → star decorations and soft validation.
+    text roles → compact ``brand_group`` / logo subtree (rules 5–7, 6b, 6c) → ``headline_group`` + rule 3f
+    (headline vs delivery on direct text children) → huge-vector background (rule 4) → rectangle / container fixes
+    → rule 9 (stray ``logo_*``) → rule 10a (``hero_image`` rectangles) → rule 10t (text cannot be ``hero_image``)
+    → rule 10 (``image_zone`` → ``background_gradient``) → gradient numbering → per-parent gradient suffix normalize
+    (rectangle/vector overlays only) → star decorations and soft validation.
 
     ``debug`` may be a dict mutated with ``postprocess_used``, ``forced_renames``, ``semantic_validation_warnings``.
     """
@@ -1253,7 +1254,29 @@ def postprocess_semantic_names(
             for n in names
             if n
         )
-        return bool(has_headline and has_sub)
+        if has_headline and has_sub:
+            return True
+        # DOOH / compact blocks: rule2 may miss smaller headline fonts; infer from copy + delivery phrase.
+        delivery_ids = 0
+        promo_ids = 0
+        for tid in tch:
+            tr = mid_by_id.get(tid)
+            if not tr or str(tr.get("type") or "").lower() != "text":
+                continue
+            chars = _norm_chars(str(tr.get("characters") or ""))
+            if not chars:
+                continue
+            low = chars.lower()
+            if any(m in low for m in _DELIVERY_MARKERS):
+                delivery_ids += 1
+                continue
+            cmp_age = chars.replace(" ", "")
+            if _AGE_BADGE_STRICT.match(cmp_age):
+                continue
+            if any(m.lower() in low for m in _LEGAL_MARKERS):
+                continue
+            promo_ids += 1
+        return bool(delivery_ids >= 1 and promo_ids >= 1)
 
     def _is_visible_node(r: dict[str, Any]) -> bool:
         return r.get("visible") is not False
@@ -1446,6 +1469,47 @@ def postprocess_semantic_names(
             continue
         if out.get(sid, "").lower() == "product_group":
             _force(out, sid, "headline_group", "rule3_product_group_with_headline_block")
+
+    # --- Rule 3f: under ``headline_group``, assign headline vs delivery on direct text children ---
+    def _text_font_size(tr: dict[str, Any]) -> float:
+        try:
+            return float(tr.get("fontSize") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    for sid, row in mid_by_id.items():
+        if out.get(sid, "").lower() != "headline_group":
+            continue
+        tch = _direct_text_child_ids(sid)
+        if len(tch) < 2:
+            continue
+        delivery: list[str] = []
+        promo: list[str] = []
+        for tid in tch:
+            tr = mid_by_id.get(tid)
+            if not tr or str(tr.get("type") or "").lower() != "text":
+                continue
+            chars = _norm_chars(str(tr.get("characters") or ""))
+            if not chars:
+                continue
+            low = chars.lower()
+            if any(m in low for m in _DELIVERY_MARKERS):
+                delivery.append(tid)
+            else:
+                cmp_age = chars.replace(" ", "")
+                if _AGE_BADGE_STRICT.match(cmp_age):
+                    continue
+                if any(m.lower() in low for m in _LEGAL_MARKERS):
+                    continue
+                promo.append(tid)
+        for did in delivery:
+            _force(out, did, "subheadline_delivery_time", "rule3f_delivery_line_under_headline_group")
+        promo.sort(key=lambda tid: -_text_font_size(mid_by_id[tid]))
+        for i, tid in enumerate(promo):
+            if i == 0:
+                _force(out, tid, "headline", "rule3f_primary_marketing_line_under_headline_group")
+            else:
+                _force(out, tid, "subheadline", "rule3f_secondary_marketing_line_under_headline_group")
 
     # --- Rule 3b/3c: legal / age wrapper groups (not root) ---
     for sid, row in mid_by_id.items():
@@ -1807,6 +1871,11 @@ def postprocess_semantic_names(
             pid = str(pids[-1])
             if not _is_background_gradient_slot_name(out.get(sid, "")):
                 continue
+            typ = str(row.get("type") or "").lower()
+            if typ not in ("rectangle", "vector"):
+                continue
+            if typ == "rectangle" and row.get("mid_child_ids"):
+                continue
             by_parent.setdefault(pid, []).append(sid)
         for _pid, sids in by_parent.items():
             if not sids:
@@ -1950,6 +2019,42 @@ def postprocess_semantic_names(
         ):
             continue
         _force(out, sid, "hero_image", "rule10a_main_photo_rectangle_not_gradient")
+
+    # --- Rule 10t: text is never ``hero_image`` (recover headline / delivery / unassigned) ---
+    for sid, row in mid_by_id.items():
+        if str(row.get("type") or "").lower() != "text":
+            continue
+        if out.get(sid, "").lower() != "hero_image":
+            continue
+        pids = row.get("mid_parent_ids") or []
+        parent = str(pids[-1]) if pids else ""
+        chars = _norm_chars(str(row.get("characters") or ""))
+        low = chars.lower()
+        if parent and out.get(parent, "").lower() == "headline_group":
+            if any(m in low for m in _DELIVERY_MARKERS):
+                _force(out, sid, "subheadline_delivery_time", "rule10t_text_hero_under_headline_group_delivery")
+            else:
+                _force(out, sid, "headline", "rule10t_text_hero_under_headline_group_headline")
+            continue
+        if any(m in low for m in _DELIVERY_MARKERS):
+            _force(out, sid, "subheadline_delivery_time", "rule10t_text_hero_to_delivery")
+            continue
+        try:
+            fs = float(row.get("fontSize") or 0)
+        except (TypeError, ValueError):
+            fs = 0.0
+        try:
+            th = float((row.get("bounds") or {}).get("height") or 0)
+        except (TypeError, ValueError):
+            th = 0.0
+        cmp_age = chars.replace(" ", "")
+        legal_hit = any(m.lower() in low for m in _LEGAL_MARKERS)
+        if (not _AGE_BADGE_STRICT.match(cmp_age)) and (not legal_hit) and (
+            fs >= 70.0 or th >= 90.0 or (fs >= 50.0 and len(chars) >= 6)
+        ):
+            _force(out, sid, "headline", "rule10t_text_hero_to_headline_heuristic")
+        else:
+            _force(out, sid, "unassigned", "rule10t_text_hero_cleared")
 
     # --- Rule 10: abstract gradient / bleed panels must not be ``image_zone`` ---
     for sid, row in mid_by_id.items():
