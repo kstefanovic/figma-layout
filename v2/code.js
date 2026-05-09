@@ -2248,6 +2248,16 @@ function applyFinalJsonToClone(finalJson, convertedFrame) {
   };
 }
 
+function collectFrameNodesFromSelection(selection) {
+  const out = [];
+  for (const n of selection) {
+    if (n && n.type === "FRAME") {
+      out.push(n);
+    }
+  }
+  return out;
+}
+
 function getSelectionInfo() {
   const selection = figma.currentPage.selection;
 
@@ -2255,17 +2265,43 @@ function getSelectionInfo() {
     return { hasSelection: false };
   }
 
-  const node = selection[0];
-
-  return {
+  const frames = collectFrameNodesFromSelection(selection);
+  const base = {
     hasSelection: true,
+    selectionCount: selection.length,
+    frameCount: frames.length,
+    frames: frames.map(function (node) {
+      return {
+        id: node.id,
+        name: node.name,
+        type: node.type,
+        width: "width" in node ? Number(node.width.toFixed(2)) : null,
+        height: "height" in node ? Number(node.height.toFixed(2)) : null,
+      };
+    }),
+  };
+
+  if (frames.length === 0) {
+    const node = selection[0];
+    return Object.assign({}, base, {
+      isFrame: false,
+      id: node.id,
+      name: node.name,
+      type: node.type,
+      width: "width" in node ? Number(node.width.toFixed(2)) : null,
+      height: "height" in node ? Number(node.height.toFixed(2)) : null,
+    });
+  }
+
+  const node = frames[0];
+  return Object.assign({}, base, {
+    isFrame: true,
     id: node.id,
     name: node.name,
     type: node.type,
-    isFrame: node.type === "FRAME",
     width: "width" in node ? Number(node.width.toFixed(2)) : null,
-    height: "height" in node ? Number(node.height.toFixed(2)) : null
-  };
+    height: "height" in node ? Number(node.height.toFixed(2)) : null,
+  });
 }
 
 function sendSelectionInfo() {
@@ -2290,54 +2326,120 @@ function postError(message) {
 figma.ui.onmessage = async (msg) => {
   if (msg.type === "export-selected-frame-html-css") {
     const selection = figma.currentPage.selection;
-    if (selection.length !== 1 || selection[0].type !== "FRAME") {
-      postError("Select exactly one frame.");
+    const frames = collectFrameNodesFromSelection(selection);
+    if (frames.length === 0) {
+      postError("Select one or more frames (only FRAME nodes are exported).");
       figma.ui.postMessage({ type: "html-css-export-result", ok: false });
       sendSelectionInfo();
       return;
     }
 
-    try {
-      const selectedFrame = selection[0];
-      postStatus(`HTML/CSS export: serializing ${selectedFrame.name}...`);
-      const origin = getOrigin(selectedFrame);
-      const rawJson = serializeNode(selectedFrame, origin, "");
-      rawJson.templateId = "figma_plugin_html_css_export";
-      postStatus(`HTML/CSS export: exporting full banner render...`);
-      const bannerPngBytes = await exportFramePngBytes(selectedFrame);
-      const bannerPngBase64 = uint8ToBase64(bannerPngBytes);
-      postStatus(`HTML/CSS export: exporting inspectable element assets...`);
-      const elementAssets = await exportElementAssetsForHtml(
-        selectedFrame,
-        rawJson,
-        MAX_ELEMENT_LAYER_PNGS,
-      );
-      const html = rawJsonToHtmlCss(rawJson, bannerPngBase64, elementAssets);
-      figma.ui.postMessage({
-        type: "html-css-export-result",
-        ok: true,
-        html,
-        fileName: `${selectedFrame.name || "figma-export"}-${Math.round(selectedFrame.width)}x${Math.round(selectedFrame.height)}`,
-      });
-      postStatus(`HTML/CSS export ready (${elementAssets.length} element assets, ${html.length.toLocaleString()} chars).`);
-    } catch (err) {
-      console.error("HTML/CSS export failed:", err);
-      postError(String(err && err.message ? err.message : err));
-      figma.ui.postMessage({ type: "html-css-export-result", ok: false });
+    const origSel = selection.slice();
+    var htmlOk = 0;
+    var htmlFail = 0;
+    for (var hi = 0; hi < frames.length; hi++) {
+      var selectedFrame = frames[hi];
+      try {
+        figma.currentPage.selection = [selectedFrame];
+        postStatus(
+          "HTML/CSS export (" +
+            String(hi + 1) +
+            "/" +
+            String(frames.length) +
+            "): serializing " +
+            selectedFrame.name +
+            "...",
+        );
+        const origin = getOrigin(selectedFrame);
+        const rawJson = serializeNode(selectedFrame, origin, "");
+        rawJson.templateId = "figma_plugin_html_css_export";
+        postStatus(
+          "HTML/CSS export (" + String(hi + 1) + "/" + String(frames.length) + "): exporting banner PNG...",
+        );
+        const bannerPngBytes = await exportFramePngBytes(selectedFrame);
+        const bannerPngBase64 = uint8ToBase64(bannerPngBytes);
+        postStatus(
+          "HTML/CSS export (" +
+            String(hi + 1) +
+            "/" +
+            String(frames.length) +
+            "): exporting element assets...",
+        );
+        const elementAssets = await exportElementAssetsForHtml(
+          selectedFrame,
+          rawJson,
+          MAX_ELEMENT_LAYER_PNGS,
+        );
+        const html = rawJsonToHtmlCss(rawJson, bannerPngBase64, elementAssets);
+        const safeBase =
+          `${selectedFrame.name || "figma-export"}-${Math.round(selectedFrame.width)}x${Math.round(selectedFrame.height)}`;
+        figma.ui.postMessage({
+          type: "html-css-export-result",
+          ok: true,
+          html: html,
+          fileName: safeBase,
+          batch: frames.length > 1,
+          batchAppend: hi > 0,
+          batchIndex: hi,
+          batchTotal: frames.length,
+        });
+        postStatus(
+          "HTML/CSS export (" +
+            String(hi + 1) +
+            "/" +
+            String(frames.length) +
+            "): ok — " +
+            String(elementAssets.length) +
+            " assets, " +
+            String(html.length) +
+            " chars.",
+        );
+        htmlOk++;
+      } catch (err) {
+        console.error("HTML/CSS export failed:", err);
+        htmlFail++;
+        const em = String(err && err.message ? err.message : err);
+        postStatus(
+          "HTML/CSS export (" +
+            String(hi + 1) +
+            "/" +
+            String(frames.length) +
+            ") skipped: " +
+            selectedFrame.name +
+            " — " +
+            em,
+        );
+        figma.ui.postMessage({
+          type: "html-css-export-result",
+          ok: false,
+          batch: frames.length > 1,
+          batchAppend: hi > 0,
+          batchIndex: hi,
+          batchTotal: frames.length,
+          error: em,
+          frameName: selectedFrame.name,
+        });
+      }
+    }
+    figma.currentPage.selection = origSel;
+    sendSelectionInfo();
+    postStatus("HTML/CSS batch done: " + String(htmlOk) + " ok, " + String(htmlFail) + " failed.");
+    if (htmlFail > 0 && htmlOk === 0) {
+      postError("All HTML/CSS exports in the batch failed. See status above.");
     }
     return;
   }
 
   if (msg.type === "pipeline-target-json-selected-frame") {
     const selection = figma.currentPage.selection;
-    if (selection.length !== 1 || selection[0].type !== "FRAME") {
+    const frames = collectFrameNodesFromSelection(selection);
+    if (frames.length === 0) {
       figma.ui.postMessage({ type: "pipeline-busy", busy: false });
-      postError("Select exactly one frame.");
+      postError("Select one or more frames (only FRAME nodes run the pipeline).");
       sendSelectionInfo();
       return;
     }
 
-    const selectedFrame = selection[0];
     const backendUrl = String(msg.backendUrl || "").trim();
     if (!backendUrl) {
       figma.ui.postMessage({ type: "pipeline-busy", busy: false });
@@ -2345,86 +2447,125 @@ figma.ui.onmessage = async (msg) => {
       return;
     }
 
+    const origSel = selection.slice();
+    let pipelineOk = 0;
+    let pipelineFail = 0;
+
     try {
       figma.ui.postMessage({ type: "pipeline-busy", busy: true });
-      const targetResolution = parseTargetSize(msg.targetSize, selectedFrame);
-      postStatus(`Pipeline: stamping original node ids for ${selectedFrame.name}...`);
-      const stampedNodeCount = stampOriginalNodeIds(selectedFrame);
+      for (let pi = 0; pi < frames.length; pi++) {
+        const selectedFrame = frames[pi];
+        try {
+          figma.currentPage.selection = [selectedFrame];
+          const targetResolution = parseTargetSize(msg.targetSize, selectedFrame);
+          postStatus(`Pipeline (${pi + 1}/${frames.length}): stamping… ${selectedFrame.name}`);
+          const stampedNodeCount = stampOriginalNodeIds(selectedFrame);
 
-      postStatus("Pipeline: serializing selected Figma design...");
-      const origin = getOrigin(selectedFrame);
-      const rawJson = serializeNode(selectedFrame, origin, "");
-      rawJson.templateId = "figma_plugin_pipeline_source";
+          postStatus("Pipeline: serializing selected Figma design...");
+          const origin = getOrigin(selectedFrame);
+          const rawJson = serializeNode(selectedFrame, origin, "");
+          rawJson.templateId = "figma_plugin_pipeline_source";
 
-      postStatus("Pipeline: exporting banner PNG...");
-      const pngBytes = await exportFramePngBytes(selectedFrame);
-      const pngBase64 = uint8ToBase64(pngBytes);
+          postStatus("Pipeline: exporting banner PNG...");
+          const pngBytes = await exportFramePngBytes(selectedFrame);
+          const pngBase64 = uint8ToBase64(pngBytes);
 
-      postStatus(
-        `Pipeline: calling backend for ${targetResolution.width}×${targetResolution.height} target JSON...`,
-      );
-      const result = await callBannerRawTargetPipeline(
-        backendUrl,
-        pngBase64,
-        rawJson,
-        targetResolution,
-      );
+          postStatus(
+            `Pipeline (${pi + 1}/${frames.length}): calling backend for ${targetResolution.width}×${targetResolution.height} target JSON...`,
+          );
+          const result = await callBannerRawTargetPipeline(
+            backendUrl,
+            pngBase64,
+            rawJson,
+            targetResolution,
+          );
 
-      const selectedGuide = result.selected_candidate || {};
-      postStatus(`Pipeline: finding candidate frame "${selectedGuide.name || "unknown"}" in current page...`);
-      const lookup = findCandidateFrameInCurrentPage(selectedGuide, result.final_json, selectedFrame);
-      let convertedFrame;
-      let drawMode;
-      let applySummary = null;
-      if (lookup.frame) {
-        postStatus(`Pipeline: cloning matched candidate frame (${lookup.reason}) and scaling to target size...`);
-        const cloned = cloneCandidateFrameBesideSelection(
-          lookup.frame,
-          selectedFrame,
-          result.final_json,
-          targetResolution,
-        );
-        convertedFrame = cloned.clone;
-        applySummary = cloned.summary;
-        drawMode = "clone_matched_candidate_frame_scaled";
-      } else {
-        postStatus("Pipeline: candidate frame not found in current page; drawing returned JSON fallback...");
-        convertedFrame = await drawJsonTreeBesideSelection(result.final_json, selectedFrame, targetResolution);
-        drawMode = "create_from_returned_json_fallback";
+          const selectedGuide = result.selected_candidate || {};
+          postStatus(`Pipeline: finding candidate frame "${selectedGuide.name || "unknown"}" in current page...`);
+          const lookup = findCandidateFrameInCurrentPage(selectedGuide, result.final_json, selectedFrame);
+          let convertedFrame;
+          let drawMode;
+          let applySummary = null;
+          if (lookup.frame) {
+            postStatus(`Pipeline: cloning matched candidate frame (${lookup.reason}) and scaling to target size...`);
+            const cloned = cloneCandidateFrameBesideSelection(
+              lookup.frame,
+              selectedFrame,
+              result.final_json,
+              targetResolution,
+            );
+            convertedFrame = cloned.clone;
+            applySummary = cloned.summary;
+            drawMode = "clone_matched_candidate_frame_scaled";
+          } else {
+            postStatus("Pipeline: candidate frame not found in current page; drawing returned JSON fallback...");
+            convertedFrame = await drawJsonTreeBesideSelection(result.final_json, selectedFrame, targetResolution);
+            drawMode = "create_from_returned_json_fallback";
+          }
+
+          const rootJsonLabel = String((result.final_json && result.final_json.name) || "").trim();
+          const recon = applyFinalJsonCloneReconstruction(result.final_json, convertedFrame);
+          const namingReport = applyJsonTreeNamesByOriginalIds(result.final_json, convertedFrame);
+          convertedFrame.name = buildSemanticCloneFrameTitle(selectedFrame.name, rootJsonLabel || "layout");
+
+          figma.currentPage.selection = [convertedFrame];
+          figma.viewport.scrollAndZoomIntoView([selectedFrame, convertedFrame]);
+
+          if (frames.length === 1) {
+            figma.notify(
+              `Target clone created.\n` +
+                `Qwen class: ${result.category}\n` +
+                `Guide: ${selectedGuide.name || "unknown"}\n` +
+                `Mode: ${drawMode}\n` +
+                `Hierarchy sync: ${recon.hierarchyReport.reparentMoves} · Pruned: ${recon.pruneReport.removed}\n` +
+                `Reorder: ${recon.reorderAfterPrune.moves} + ${recon.reorderAfterStray.moves} · Stamp: ${recon.stampReport.stamped}` +
+                (recon.stampReport.mismatchWarn ? ` (${recon.stampReport.mismatchWarn} count mismatches)` : "") +
+                `\nStray layers removed: ${recon.strayReport.removed}\n` +
+                `Layout (abs→rel): ${recon.layoutReport.applied} (skipped ${recon.layoutReport.skipped || 0}, json ids ${recon.layoutReport.indexIds}, map ${recon.layoutReport.mapSize})\n` +
+                `Bounds doc-fix: corrected ${recon.boundsFixReport.corrected}, child skips ${recon.boundsFixReport.skippedChildren}\n` +
+                `Empty frames removed: ${recon.emptyReport.removed}\n` +
+                `Semantic names: ${namingReport.renamed} (id map ${namingReport.mapped})\n` +
+                `Selected stamped nodes: ${stampedNodeCount}\n` +
+                (applySummary
+                  ? `Scaled candidate nodes: ${applySummary.applied}\nScale: ${applySummary.scale_x.toFixed(3)} × ${applySummary.scale_y.toFixed(3)}`
+                  : `Fallback drawn from JSON`),
+              { timeout: 8 },
+            );
+          } else {
+            figma.notify(
+              `Pipeline ${pi + 1}/${frames.length}: clone ready for "${selectedFrame.name}".\n` +
+                `Qwen class: ${result.category} · Mode: ${drawMode}`,
+              { timeout: 4 },
+            );
+          }
+
+          pipelineOk++;
+        } catch (err) {
+          pipelineFail++;
+          console.error("Pipeline target JSON failed:", err);
+          const shortMsg = String(err && err.message ? err.message : err);
+          postStatus(`Pipeline (${pi + 1}/${frames.length}) skipped: ${selectedFrame.name} — ${shortMsg}`);
+          if (err && err.message === "Failed to fetch") {
+            postStatus(
+              "Figma only allows requests to origins listed in manifest.json networkAccess.devAllowedDomains. Match Backend URL, then reload the plugin.",
+            );
+          }
+        }
       }
 
-      const rootJsonLabel = String((result.final_json && result.final_json.name) || "").trim();
-      const recon = applyFinalJsonCloneReconstruction(result.final_json, convertedFrame);
-      const namingReport = applyJsonTreeNamesByOriginalIds(result.final_json, convertedFrame);
-      convertedFrame.name = buildSemanticCloneFrameTitle(selectedFrame.name, rootJsonLabel || "layout");
-
-      figma.currentPage.selection = [convertedFrame];
-      figma.viewport.scrollAndZoomIntoView([selectedFrame, convertedFrame]);
-
-      figma.notify(
-        `Target clone created.\n` +
-          `Qwen class: ${result.category}\n` +
-          `Guide: ${selectedGuide.name || "unknown"}\n` +
-          `Mode: ${drawMode}\n` +
-          `Hierarchy sync: ${recon.hierarchyReport.reparentMoves} · Pruned: ${recon.pruneReport.removed}\n` +
-          `Reorder: ${recon.reorderAfterPrune.moves} + ${recon.reorderAfterStray.moves} · Stamp: ${recon.stampReport.stamped}` +
-          (recon.stampReport.mismatchWarn ? ` (${recon.stampReport.mismatchWarn} count mismatches)` : "") +
-          `\nStray layers removed: ${recon.strayReport.removed}\n` +
-          `Layout (abs→rel): ${recon.layoutReport.applied} (skipped ${recon.layoutReport.skipped || 0}, json ids ${recon.layoutReport.indexIds}, map ${recon.layoutReport.mapSize})\n` +
-          `Bounds doc-fix: corrected ${recon.boundsFixReport.corrected}, child skips ${recon.boundsFixReport.skippedChildren}\n` +
-          `Empty frames removed: ${recon.emptyReport.removed}\n` +
-          `Semantic names: ${namingReport.renamed} (id map ${namingReport.mapped})\n` +
-          `Selected stamped nodes: ${stampedNodeCount}\n` +
-          (applySummary
-            ? `Scaled candidate nodes: ${applySummary.applied}\nScale: ${applySummary.scale_x.toFixed(3)} × ${applySummary.scale_y.toFixed(3)}`
-            : `Fallback drawn from JSON`),
-        { timeout: 8 },
-      );
-
-      figma.ui.postMessage({ type: "done" });
+      figma.currentPage.selection = origSel;
       sendSelectionInfo();
+      figma.ui.postMessage({ type: "done" });
+      if (frames.length > 1) {
+        figma.notify(`Pipeline batch complete: ${pipelineOk} ok, ${pipelineFail} failed.`, { timeout: 6 });
+      }
+      if (pipelineFail > 0 && pipelineOk === 0) {
+        postError("Every frame in the pipeline batch failed. See status lines above.");
+      } else if (pipelineFail > 0) {
+        postError(`Pipeline finished with ${pipelineFail} failure(s); ${pipelineOk} succeeded.`);
+      }
     } catch (err) {
-      console.error("Pipeline target JSON failed:", err);
+      console.error("Pipeline batch failed:", err);
       var pipelineMsg =
         err && err.stack
           ? err.message + "\n\n" + err.stack
@@ -2444,13 +2585,13 @@ figma.ui.onmessage = async (msg) => {
 
   if (msg.type === "semantic-json-grid-selected-frame") {
     const selection = figma.currentPage.selection;
-    if (selection.length !== 1 || selection[0].type !== "FRAME") {
-      postError("Select exactly one frame.");
+    const frames = collectFrameNodesFromSelection(selection);
+    if (frames.length === 0) {
+      postError("Select one or more frames (only FRAME nodes run semantic JSON).");
       sendSelectionInfo();
       return;
     }
 
-    const selectedFrame = selection[0];
     const backendUrl = String(msg.backendUrl || "").trim().replace(/\/+$/, "");
     if (!backendUrl) {
       postError("Backend URL is empty.");
@@ -2458,144 +2599,188 @@ figma.ui.onmessage = async (msg) => {
     }
 
     const maxNewTokens = Math.min(8192, Math.max(256, parseInt(String(msg.maxNewTokens || "2048"), 10) || 2048));
+    const origSel = selection.slice();
+    let semOk = 0;
+    let semFail = 0;
 
-    try {
-      postStatus("Semantic JSON: stamping node ids…");
-      stampOriginalNodeIds(selectedFrame);
-
-      postStatus("Semantic JSON: serializing raw JSON…");
-      const origin = getOrigin(selectedFrame);
-      const rawJson = serializeNode(selectedFrame, origin, "");
-      rawJson.templateId = "figma_plugin_semantic_grid";
-
-      postStatus("Semantic JSON: exporting banner PNG…");
-      const bannerBytes = await exportFramePngBytesMaxLongEdge(
-        selectedFrame,
-        SEMANTIC_BANNER_EXPORT_MAX_EDGE,
-      );
-
-      postStatus("Semantic JSON: building element grid PNG…");
-      const { atlasPngBytes, regions, atlasSize } = await buildElementAtlasPngAndRegions(
-        selectedFrame,
-        MAX_ELEMENT_LAYER_PNGS,
-      );
-      if (!atlasPngBytes || !atlasPngBytes.length) {
-        throw new Error("Grid atlas export failed (empty PNG).");
-      }
-      if (!regions.length) {
-        throw new Error("Grid atlas has no regions (no packable leaf elements).");
-      }
-      injectAtlasRegionsIntoRawJson(rawJson, regions);
-      attachAtlasMetadataToRawJson(rawJson, atlasSize, regions);
-
-      const requestUrl = `${backendUrl}/figma/convert-semantic-json`;
-      postStatus("Semantic JSON: calling backend + Qwen (may take several minutes)…");
-
-      const jsonStr = JSON.stringify(rawJson);
-      const bannerU8 =
-        bannerBytes instanceof Uint8Array ? bannerBytes : new Uint8Array(bannerBytes);
-
-      const boundary =
-        "----figmaSemantic" +
-        Math.random().toString(36).slice(2) +
-        Date.now().toString(36) +
-        Math.random().toString(36).slice(2);
-      const mpBody = buildMultipartFormDataBody(boundary, [
-        { name: "banner", filename: "banner.png", contentType: "image/png", body: bannerU8 },
-        { name: "grid", filename: "elements.png", contentType: "image/png", body: atlasPngBytes },
-        {
-          name: "raw_json",
-          filename: "raw.json",
-          contentType: "application/json; charset=utf-8",
-          body: utf8Bytes(jsonStr),
-        },
-        {
-          name: "max_new_tokens",
-          filename: null,
-          contentType: "text/plain; charset=utf-8",
-          body: utf8Bytes(String(maxNewTokens)),
-        },
-      ]);
-
-      const response = await fetch(requestUrl, {
-        method: "POST",
-        headers: {
-          "Content-Type": "multipart/form-data; boundary=" + boundary,
-        },
-        body: mpBody,
-      });
-      const responseText = await response.text();
-      let data = null;
+    for (let si = 0; si < frames.length; si++) {
+      const selectedFrame = frames[si];
       try {
-        data = responseText ? JSON.parse(responseText) : null;
-      } catch (_parseErr) {
-        data = null;
+        figma.currentPage.selection = [selectedFrame];
+        postStatus(`Semantic JSON (${si + 1}/${frames.length}): stamping… ${selectedFrame.name}`);
+        stampOriginalNodeIds(selectedFrame);
+
+        postStatus("Semantic JSON: serializing raw JSON…");
+        const origin = getOrigin(selectedFrame);
+        const rawJson = serializeNode(selectedFrame, origin, "");
+        rawJson.templateId = "figma_plugin_semantic_grid";
+
+        postStatus("Semantic JSON: exporting banner PNG…");
+        const bannerBytes = await exportFramePngBytesMaxLongEdge(
+          selectedFrame,
+          SEMANTIC_BANNER_EXPORT_MAX_EDGE,
+        );
+
+        postStatus("Semantic JSON: building element grid PNG…");
+        const { atlasPngBytes, regions, atlasSize } = await buildElementAtlasPngAndRegions(
+          selectedFrame,
+          MAX_ELEMENT_LAYER_PNGS,
+        );
+        if (!atlasPngBytes || !atlasPngBytes.length) {
+          throw new Error("Grid atlas export failed (empty PNG).");
+        }
+        if (!regions.length) {
+          throw new Error("Grid atlas has no regions (no packable leaf elements).");
+        }
+        injectAtlasRegionsIntoRawJson(rawJson, regions);
+        attachAtlasMetadataToRawJson(rawJson, atlasSize, regions);
+
+        const requestUrl = `${backendUrl}/figma/convert-semantic-json`;
+        postStatus(
+          `Semantic JSON (${si + 1}/${frames.length}): calling backend + Qwen (may take several minutes)…`,
+        );
+
+        const jsonStr = JSON.stringify(rawJson);
+        const bannerU8 =
+          bannerBytes instanceof Uint8Array ? bannerBytes : new Uint8Array(bannerBytes);
+
+        const boundary =
+          "----figmaSemantic" +
+          Math.random().toString(36).slice(2) +
+          Date.now().toString(36) +
+          Math.random().toString(36).slice(2);
+        const mpBody = buildMultipartFormDataBody(boundary, [
+          { name: "banner", filename: "banner.png", contentType: "image/png", body: bannerU8 },
+          { name: "grid", filename: "elements.png", contentType: "image/png", body: atlasPngBytes },
+          {
+            name: "raw_json",
+            filename: "raw.json",
+            contentType: "application/json; charset=utf-8",
+            body: utf8Bytes(jsonStr),
+          },
+          {
+            name: "max_new_tokens",
+            filename: null,
+            contentType: "text/plain; charset=utf-8",
+            body: utf8Bytes(String(maxNewTokens)),
+          },
+        ]);
+
+        const response = await fetch(requestUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "multipart/form-data; boundary=" + boundary,
+          },
+          body: mpBody,
+        });
+        const responseText = await response.text();
+        let data = null;
+        try {
+          data = responseText ? JSON.parse(responseText) : null;
+        } catch (_parseErr) {
+          data = null;
+        }
+
+        if (!response.ok) {
+          const detail =
+            data && typeof data === "object" && data.detail != null
+              ? typeof data.detail === "string"
+                ? data.detail
+                : JSON.stringify(data.detail)
+              : responseText || "HTTP " + String(response.status);
+          throw new Error(detail);
+        }
+
+        if (!data || typeof data !== "object" || !("semantic_json" in data)) {
+          throw new Error("Backend response missing semantic_json.");
+        }
+
+        const pretty = JSON.stringify(data.semantic_json, null, 2);
+
+        postStatus("Semantic JSON: creating clone beside selection…");
+        const semanticClone = cloneFrameBesideSource(selectedFrame);
+        postStatus("Semantic JSON: matching layer hierarchy to returned JSON…");
+        const recon = applyFinalJsonCloneReconstruction(data.semantic_json, semanticClone);
+        const namingReport = applyJsonTreeNamesByOriginalIds(data.semantic_json, semanticClone);
+        const rootJsonLabel = String((data.semantic_json && data.semantic_json.name) || "").trim();
+        semanticClone.name = buildSemanticCloneFrameTitle(selectedFrame.name, rootJsonLabel || "semantic");
+
+        figma.currentPage.selection = [semanticClone];
+        figma.viewport.scrollAndZoomIntoView([selectedFrame, semanticClone]);
+
+        if (frames.length === 1) {
+          figma.notify(
+            `Semantic clone ready next to the original.\n` +
+              `Sync: ${recon.hierarchyReport.reparentMoves} · Prune: ${recon.pruneReport.removed} · Stray: ${recon.strayReport.removed}\n` +
+              `Reorder: ${recon.reorderAfterPrune.moves}+${recon.reorderAfterStray.moves} · Stamp: ${recon.stampReport.stamped}` +
+              (recon.stampReport.mismatchWarn ? ` (${recon.stampReport.mismatchWarn} mismatches)` : "") +
+              `\nLayout: ${recon.layoutReport.applied} (skipped ${recon.layoutReport.skipped || 0}) · Bounds fix: ${recon.boundsFixReport.corrected} · Empty removed: ${recon.emptyReport.removed}\n` +
+              `Layers renamed: ${namingReport.renamed} (id map ${namingReport.mapped}).`,
+            { timeout: 6 },
+          );
+        } else {
+          figma.notify(
+            `Semantic JSON ${si + 1}/${frames.length}: clone ready for "${selectedFrame.name}".`,
+            { timeout: 4 },
+          );
+        }
+
+        const fileBase = `${selectedFrame.name || "semantic"}-${Math.round(selectedFrame.width)}x${Math.round(selectedFrame.height)}`;
+        figma.ui.postMessage({
+          type: "semantic-json-result",
+          ok: true,
+          jsonText: pretty,
+          fileName: fileBase,
+          batch: frames.length > 1,
+          batchAppend: si > 0,
+          batchIndex: si,
+          batchTotal: frames.length,
+        });
+        postStatus(
+          `Semantic JSON (${si + 1}/${frames.length}): done. Clone "${semanticClone.name}" — ` +
+            `${recon.hierarchyReport.reparentMoves} sync, ${recon.layoutReport.applied} layout, ` +
+            `${recon.boundsFixReport.corrected} bounds-fix, ${namingReport.renamed} names.`,
+        );
+        semOk++;
+      } catch (err) {
+        semFail++;
+        console.error("Semantic JSON grid flow failed:", err);
+        const shortMsg = err && err.message ? err.message : String(err);
+        postStatus(`Semantic JSON (${si + 1}/${frames.length}) skipped: ${selectedFrame.name} — ${shortMsg}`);
+        let errText =
+          err && err.stack ? err.message + "\n\n" + err.stack : String(err && err.message ? err.message : err);
+        if (err && err.message === "Failed to fetch") {
+          errText +=
+            "\n\nFigma only allows requests to origins listed in manifest.json networkAccess.devAllowedDomains. " +
+            "Match Backend URL exactly, then reload the plugin.";
+          postStatus(
+            "Figma only allows requests to origins listed in manifest.json networkAccess.devAllowedDomains.",
+          );
+        }
+        figma.ui.postMessage({
+          type: "semantic-json-result",
+          ok: false,
+          error: shortMsg,
+          batch: frames.length > 1,
+          batchAppend: si > 0,
+          batchIndex: si,
+          batchTotal: frames.length,
+          frameName: selectedFrame.name,
+        });
       }
+    }
 
-      if (!response.ok) {
-        const detail =
-          data && typeof data === "object" && data.detail != null
-            ? typeof data.detail === "string"
-              ? data.detail
-              : JSON.stringify(data.detail)
-            : responseText || "HTTP " + String(response.status);
-        throw new Error(detail);
-      }
-
-      if (!data || typeof data !== "object" || !("semantic_json" in data)) {
-        throw new Error("Backend response missing semantic_json.");
-      }
-
-      const pretty = JSON.stringify(data.semantic_json, null, 2);
-
-      postStatus("Semantic JSON: creating clone beside selection…");
-      const semanticClone = cloneFrameBesideSource(selectedFrame);
-      postStatus("Semantic JSON: matching layer hierarchy to returned JSON…");
-      const recon = applyFinalJsonCloneReconstruction(data.semantic_json, semanticClone);
-      const namingReport = applyJsonTreeNamesByOriginalIds(data.semantic_json, semanticClone);
-      const rootJsonLabel = String((data.semantic_json && data.semantic_json.name) || "").trim();
-      semanticClone.name = buildSemanticCloneFrameTitle(selectedFrame.name, rootJsonLabel || "semantic");
-
-      figma.currentPage.selection = [semanticClone];
-      figma.viewport.scrollAndZoomIntoView([selectedFrame, semanticClone]);
-      figma.notify(
-        `Semantic clone ready next to the original.\n` +
-          `Sync: ${recon.hierarchyReport.reparentMoves} · Prune: ${recon.pruneReport.removed} · Stray: ${recon.strayReport.removed}\n` +
-          `Reorder: ${recon.reorderAfterPrune.moves}+${recon.reorderAfterStray.moves} · Stamp: ${recon.stampReport.stamped}` +
-          (recon.stampReport.mismatchWarn ? ` (${recon.stampReport.mismatchWarn} mismatches)` : "") +
-          `\nLayout: ${recon.layoutReport.applied} (skipped ${recon.layoutReport.skipped || 0}) · Bounds fix: ${recon.boundsFixReport.corrected} · Empty removed: ${recon.emptyReport.removed}\n` +
-          `Layers renamed: ${namingReport.renamed} (id map ${namingReport.mapped}).`,
-        { timeout: 6 },
-      );
-
-      figma.ui.postMessage({
-        type: "semantic-json-result",
-        ok: true,
-        jsonText: pretty,
-        fileName: `${selectedFrame.name || "semantic"}-${Math.round(selectedFrame.width)}x${Math.round(selectedFrame.height)}`,
-      });
-      postStatus(
-        `Semantic JSON: done. Clone "${semanticClone.name}" — ${recon.hierarchyReport.reparentMoves} sync, ` +
-          `${recon.layoutReport.applied} layout, ${recon.boundsFixReport.corrected} bounds-fix, ${namingReport.renamed} names.`,
-      );
-      figma.ui.postMessage({ type: "done" });
-      sendSelectionInfo();
-    } catch (err) {
-      console.error("Semantic JSON grid flow failed:", err);
-      let errText =
-        err && err.stack ? err.message + "\n\n" + err.stack : String(err && err.message ? err.message : err);
-      if (err && err.message === "Failed to fetch") {
-        errText +=
-          "\n\nFigma only allows requests to origins listed in manifest.json networkAccess.devAllowedDomains. " +
-          "Match Backend URL exactly, then reload the plugin.";
-      }
-      postError(errText);
-      figma.ui.postMessage({
-        type: "semantic-json-result",
-        ok: false,
-        error: err && err.message ? err.message : String(err),
-      });
-      sendSelectionInfo();
+    figma.currentPage.selection = origSel;
+    postStatus(`Semantic JSON batch done: ${semOk} ok, ${semFail} failed.`);
+    figma.ui.postMessage({ type: "done" });
+    sendSelectionInfo();
+    if (frames.length > 1) {
+      figma.notify(`Semantic JSON batch: ${semOk} ok, ${semFail} failed.`, { timeout: 5 });
+    }
+    if (semFail > 0 && semOk === 0) {
+      postError("All semantic JSON runs failed. See status / JSON panel.");
+    } else if (semFail > 0) {
+      postError(`${semFail} frame(s) failed; ${semOk} succeeded.`);
     }
     return;
   }

@@ -144,7 +144,7 @@
   </head>
   <body>
     <div class="row">
-      <label for="selected-frame">Selected Figma Design</label>
+      <label for="selected-frame">Selected Figma design(s)</label>
       <textarea id="selected-frame" class="readonly" readonly>No frame selected.</textarea>
     </div>
 
@@ -158,9 +158,9 @@
       <input id="target-size" value="1024x1280" placeholder="1024x1280" />
     </div>
 
-    <div class="row">
-      <button id="pipeline-btn">Generate Target JSON + Draw Clone</button>
-    </div>
+      <div class="row">
+        <button id="pipeline-btn">Generate Target JSON + Draw Clone (1 or more frames)</button>
+      </div>
 
     <div id="semantic-json-section">
       <div class="row">
@@ -170,14 +170,14 @@
 
       <div class="row">
         <button id="semantic-json-btn" type="button">
-          Banner + grid PNG + raw JSON → semantic JSON (Qwen)
+          Banner + grid PNG + raw JSON → semantic JSON (Qwen), 1+ frames sequential
         </button>
       </div>
 
       <div class="row">
         <label>Semantic JSON result</label>
         <textarea id="semantic-json-result" class="zone-result readonly" readonly>
-Select one frame, then run “Banner + grid PNG + raw JSON → semantic JSON”.
+Select one or more frames, then run “Banner + grid PNG + raw JSON → semantic JSON”. Multiple frames run in order; failures are skipped and logged here.
         </textarea>
         <div style="display: flex; gap: 8px; margin-top: 8px">
           <button id="copy-semantic-btn" type="button" style="flex: 1">Copy JSON</button>
@@ -188,14 +188,14 @@ Select one frame, then run “Banner + grid PNG + raw JSON → semantic JSON”.
 
     <div class="row">
       <button id="html-export-btn" type="button">
-        JSON to HTML/CSS Exporter
+        JSON to HTML/CSS Exporter (1+ frames sequential)
       </button>
     </div>
 
     <div class="row">
       <label>HTML/CSS export</label>
       <textarea id="html-export-result" class="zone-result readonly" readonly>
-Select one frame, then click “JSON to HTML/CSS Exporter”.
+Select one or more frames, then click “JSON to HTML/CSS Exporter”. Each frame exports in order; multiple downloads may run (staggered). Errors are appended here.
       </textarea>
       <button id="copy-html-btn" type="button" style="margin-top: 8px">
         Copy HTML/CSS
@@ -243,17 +243,30 @@ Select one frame, then click “JSON to HTML/CSS Exporter”.
           return;
         }
 
-        if (!info.isFrame) {
+        if (!info.isFrame || !info.frameCount) {
           selectedFrameEl.value =
-            `Selected node is not a frame.\nName: ${info.name}\nType: ${info.type}`;
+            `Selection: ${info.selectionCount} node(s), no FRAME nodes.\n` +
+            `Select one or more frames for batch export / pipeline.\n` +
+            `First selected: ${info.name} (${info.type})`;
           return;
         }
 
+        if (info.frameCount === 1) {
+          selectedFrameEl.value =
+            `1 frame selected.\n` +
+            `Name: ${info.name}\n` +
+            `Type: ${info.type}\n` +
+            `ID: ${info.id}\n` +
+            `Size: ${info.width} × ${info.height}`;
+          return;
+        }
+
+        const lines = info.frames.map(
+          (f, i) =>
+            `${i + 1}. ${f.name} — ${f.width}×${f.height} (id ${f.id})`,
+        );
         selectedFrameEl.value =
-          `Name: ${info.name}\n` +
-          `Type: ${info.type}\n` +
-          `ID: ${info.id}\n` +
-          `Size: ${info.width} × ${info.height}`;
+          `${info.frameCount} frames selected (processed in list order):\n` + lines.join("\n");
       }
 
       function setHtmlExportResult(text) {
@@ -418,22 +431,70 @@ Select one frame, then click “JSON to HTML/CSS Exporter”.
         } else if (msg.type === "selection-info") {
           setSelectedFrameInfo(msg.selection);
         } else if (msg.type === "html-css-export-result") {
+          const isBatch = !!msg.batch;
+          const append = !!msg.batchAppend;
           if (!msg.ok) {
-            setHtmlExportResult("Export failed. See status above.");
+            const errLine = msg.error || "Export failed. See status above.";
+            if (isBatch && append) {
+              setHtmlExportResult(
+                (htmlExportResultEl.value || "").trimEnd() +
+                  `\n\n<!-- ERROR ${(msg.batchIndex || 0) + 1}/${msg.batchTotal} ${msg.frameName || ""} -->\n${errLine}\n`,
+              );
+            } else if (isBatch) {
+              setHtmlExportResult(
+                `<!-- ERROR 1/${msg.batchTotal} ${msg.frameName || ""} -->\n${errLine}\n`,
+              );
+            } else {
+              setHtmlExportResult("Export failed. See status above.");
+            }
             return;
           }
           const html = msg.html || "";
-          setHtmlExportResult(html);
-          downloadTextFile(`${safeFileName(msg.fileName)}.html`, html, "text/html;charset=utf-8");
-          setStatus(`HTML/CSS file exported: ${safeFileName(msg.fileName)}.html`);
+          const header =
+            isBatch && append
+              ? `\n\n<!-- === ${(msg.batchIndex || 0) + 1}/${msg.batchTotal} ${msg.fileName || "export"} === -->\n\n`
+              : isBatch
+                ? `<!-- === 1/${msg.batchTotal} ${msg.fileName || "export"} === -->\n\n`
+                : "";
+          const prev = append ? (htmlExportResultEl.value || "").trimEnd() : "";
+          setHtmlExportResult(prev + header + html);
+          const delay = typeof msg.batchIndex === "number" ? msg.batchIndex * 320 : 0;
+          setTimeout(() => {
+            downloadTextFile(`${safeFileName(msg.fileName)}.html`, html, "text/html;charset=utf-8");
+          }, delay);
+          setStatus(`HTML/CSS exported: ${safeFileName(msg.fileName)}.html`);
         } else if (msg.type === "semantic-json-result") {
-          if (!msg.ok || !msg.jsonText) {
-            semanticJsonResultEl.value = msg.error || "Request failed. See status above.";
+          const isBatch = !!msg.batch;
+          const append = !!msg.batchAppend;
+          if (!msg.ok) {
+            const errLine = msg.error || "Request failed. See status above.";
+            if (isBatch && append) {
+              semanticJsonResultEl.value =
+                (semanticJsonResultEl.value || "").trimEnd() +
+                `\n\n/* === ERROR ${(msg.batchIndex || 0) + 1}/${msg.batchTotal} ${msg.frameName || ""} === */\n${errLine}\n`;
+            } else if (isBatch) {
+              semanticJsonResultEl.value = `/* === ERROR 1/${msg.batchTotal} ${msg.frameName || ""} === */\n${errLine}\n`;
+            } else {
+              semanticJsonResultEl.value = errLine;
+            }
             return;
           }
-          lastSemanticFileBase = safeFileName(msg.fileName || "semantic_figma");
-          semanticJsonResultEl.value = msg.jsonText;
-          setStatus(`Semantic JSON ready (${(msg.jsonText.length / 1024).toFixed(1)} KB). Use Copy or Download.`);
+          if (!msg.jsonText) {
+            semanticJsonResultEl.value = "Empty JSON in response.";
+            return;
+          }
+          const header =
+            isBatch && append
+              ? `\n\n/* === ${(msg.batchIndex || 0) + 1}/${msg.batchTotal} ${msg.fileName || "semantic"} === */\n\n`
+              : isBatch
+                ? `/* === 1/${msg.batchTotal} ${msg.fileName || "semantic"} === */\n\n`
+                : "";
+          const prev = append ? (semanticJsonResultEl.value || "").trimEnd() : "";
+          semanticJsonResultEl.value = prev + header + msg.jsonText;
+          lastSemanticFileBase = isBatch ? "semantic-batch" : safeFileName(msg.fileName || "semantic_figma");
+          setStatus(
+            `Semantic JSON ready (${(msg.jsonText.length / 1024).toFixed(1)} KB)${isBatch ? " — appended to batch" : ""}. Use Copy or Download.`,
+          );
         }
       };
     </script>
