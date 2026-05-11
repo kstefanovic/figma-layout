@@ -7,6 +7,8 @@ einops
 requests
 pydantic
 python-multipart
+numpy
+ortools
 torch
 torchvision
 torchaudio
