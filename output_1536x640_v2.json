@@ -1,0 +1,304 @@
+{
+  "id": "2544:32838",
+  "name": "DOOH_480x340 · banner_root",
+  "type": "frame",
+  "bounds": {
+    "x": 0,
+    "y": 0,
+    "width": 1536,
+    "height": 640
+  },
+  "visible": true,
+  "opacity": 1,
+  "layoutMode": "NONE",
+  "itemSpacing": 0,
+  "padding": {
+    "top": 0,
+    "right": 0,
+    "bottom": 0,
+    "left": 0
+  },
+  "children": [
+    {
+      "id": "2544:32840",
+      "name": "hero_image",
+      "type": "rectangle",
+      "bounds": {
+        "x": 737.28,
+        "y": -32.0,
+        "width": 890.88,
+        "height": 704.0
+      },
+      "visible": true,
+      "opacity": 1
+    },
+    {
+      "id": "2544:32841",
+      "name": "background_shape",
+      "type": "vector",
+      "bounds": {
+        "x": -45.44,
+        "y": -30.08,
+        "width": 930.53,
+        "height": 696.09
+      },
+      "visible": true,
+      "opacity": 1
+    },
+    {
+      "id": "2544:32842",
+      "name": "background_gradient_2",
+      "type": "rectangle",
+      "bounds": {
+        "x": 888.26,
+        "y": 689.26,
+        "width": 759.39,
+        "height": 586.6
+      },
+      "visible": true,
+      "opacity": 1
+    },
+    {
+      "id": "2544:32843",
+      "name": "background_gradient_1",
+      "type": "rectangle",
+      "bounds": {
+        "x": -28.45,
+        "y": -30.17,
+        "width": 387.62,
+        "height": 566.63
+      },
+      "visible": true,
+      "opacity": 1
+    },
+    {
+      "id": "2544:32845",
+      "name": "star_decoration_1",
+      "type": "star",
+      "bounds": {
+        "x": 760.16,
+        "y": 218.54,
+        "width": 143.27,
+        "height": 143.27
+      },
+      "visible": true,
+      "opacity": 1
+    },
+    {
+      "id": "2544:32847",
+      "name": "star_decoration_2",
+      "type": "star",
+      "bounds": {
+        "x": 61.09,
+        "y": 258.92,
+        "width": 93.99,
+        "height": 93.99
+      },
+      "visible": true,
+      "opacity": 1
+    },
+    {
+      "id": "2544:32848",
+      "name": "headline_group",
+      "type": "frame",
+      "bounds": {
+        "x": 92.16,
+        "y": 179.2,
+        "width": 645.12,
+        "height": 230.4
+      },
+      "visible": true,
+      "opacity": 1,
+      "layoutMode": "NONE",
+      "itemSpacing": 0,
+      "padding": {
+        "top": 0,
+        "right": 0,
+        "bottom": 0,
+        "left": 0
+      },
+      "children": [
+        {
+          "id": "2544:32850",
+          "name": "headline",
+          "type": "text",
+          "bounds": {
+            "x": 92.16,
+            "y": 179.2,
+            "width": 645.12,
+            "height": 168.78
+          },
+          "visible": true,
+          "opacity": 1,
+          "characters": "Мегапорцияоливье\nдля гостей"
+        },
+        {
+          "id": "2544:32851",
+          "name": "subheadline_delivery_time",
+          "type": "text",
+          "bounds": {
+            "x": 94.13,
+            "y": 372.5,
+            "width": 569.25,
+            "height": 38.11
+          },
+          "visible": true,
+          "opacity": 1,
+          "characters": "с доставкой от 15 минут"
+        }
+      ]
+    },
+    {
+      "id": "2544:32852",
+      "name": "brand_group",
+      "type": "frame",
+      "bounds": {
+        "x": 92.16,
+        "y": 51.2,
+        "width": 522.24,
+        "height": 76.8
+      },
+      "visible": true,
+      "opacity": 1,
+      "layoutMode": "NONE",
+      "itemSpacing": 5.063957691192627,
+      "padding": {
+        "top": 0,
+        "right": 0,
+        "bottom": 0,
+        "left": 0
+      },
+      "children": [
+        {
+          "id": "2544:32853",
+          "name": "brand_name_first_part_2",
+          "type": "vector",
+          "bounds": {
+            "x": 138.2,
+            "y": 75.79,
+            "width": 181.32,
+            "height": 51.68
+          },
+          "visible": true,
+          "opacity": 1
+        },
+        {
+          "id": "2544:32854",
+          "name": "brand_name_first_part_1",
+          "type": "vector",
+          "bounds": {
+            "x": 92.59,
+            "y": 60.79,
+            "width": 37.49,
+            "height": 57.21
+          },
+          "visible": true,
+          "opacity": 1
+        },
+        {
+          "id": "2544:32855",
+          "name": "brand_name_second",
+          "type": "vector",
+          "bounds": {
+            "x": 420.86,
+            "y": 60.79,
+            "width": 193.38,
+            "height": 58.02
+          },
+          "visible": true,
+          "opacity": 1
+        },
+        {
+          "id": "2544:32856",
+          "name": "logo",
+          "type": "boolean operation",
+          "bounds": {
+            "x": 332.82,
+            "y": 52.15,
+            "width": 75.13,
+            "height": 75.27
+          },
+          "visible": true,
+          "opacity": 1,
+          "children": [
+            {
+              "id": "2544:32857",
+              "name": "logo_back",
+              "type": "vector",
+              "bounds": {
+                "x": 332.82,
+                "y": 52.15,
+                "width": 75.13,
+                "height": 75.27
+              },
+              "visible": true,
+              "opacity": 1
+            },
+            {
+              "id": "2544:32859",
+              "name": "logo_fore",
+              "type": "vector",
+              "bounds": {
+                "x": 347.67,
+                "y": 71.26,
+                "width": 45.11,
+                "height": 41.58
+              },
+              "visible": true,
+              "opacity": 1
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "2544:32860",
+      "name": "age_badge",
+      "type": "text",
+      "bounds": {
+        "x": 1382.4,
+        "y": 51.2,
+        "width": 92.16,
+        "height": 51.2
+      },
+      "visible": true,
+      "opacity": 1,
+      "characters": "0+"
+    },
+    {
+      "id": "2544:32861",
+      "name": "legal_text",
+      "type": "text",
+      "bounds": {
+        "x": 92.16,
+        "y": 537.6,
+        "width": 675.84,
+        "height": 51.2
+      },
+      "visible": true,
+      "opacity": 1,
+      "characters": "Доставку осуществляют партнёры сервиса Яндекс Еда. Продавец — ООО «Яндекс.Лавка» \n(123112, г. Москва, пр. 1-й Красногвардейский, \nд. 22, стр. 1, эт. 12, пом. 12-40, ОГРН 1187746479250)"
+    }
+  ],
+  "templateId": "test",
+  "metadata": {
+    "layout_engine": {
+      "engine": "ortools_cp_sat",
+      "mode": "solver",
+      "orientation": "landscape",
+      "target_width": 1536,
+      "target_height": 640,
+      "source_width": 480.0,
+      "source_height": 340.0,
+      "scale_x": 3.2,
+      "scale_y": 1.8824,
+      "available_roles": [
+        "age_badge",
+        "brand_group",
+        "headline_group",
+        "hero_image",
+        "legal_text"
+      ]
+    }
+  }
+}

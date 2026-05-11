@@ -1,7 +1,7 @@
+
 MAIN_ROLES = {
     "banner_root",
     "background",
-    "background_shape",
     "image_zone",
     "hero_image",
     "brand_group",
@@ -23,8 +23,24 @@ MAIN_ROLES = {
 def normalize_name(name: str) -> str:
     name = (name or "").strip().lower()
 
-    # remove common Figma random suffix style
-    # example: "headline_group 123456" or "headline_group_Group"
+    # IMPORTANT:
+    # These are visual helper/background nodes.
+    # They should NOT become solver-controlled semantic roles.
+    # convert.py will root-scale them proportionally.
+    if name.startswith("background_gradient"):
+        return ""
+
+    if name.startswith("gradient"):
+        return ""
+
+    if name == "background_shape" or name.startswith("background_shape"):
+        return ""
+
+    # Only an exact real full-frame background should be solver-controlled.
+    if name == "background":
+        return "background"
+
+    # Exact / prefixed semantic names.
     for role in MAIN_ROLES:
         if name == role:
             return role
@@ -37,19 +53,25 @@ def normalize_name(name: str) -> str:
 
     if "image_zone" in name:
         return "image_zone"
-    if "hero" in name and "image" in name:
-        return "hero_image"
+
     if "hero_image" in name:
+        return "hero_image"
+
+    if "hero" in name and "image" in name:
         return "hero_image"
 
     if "headline_group" in name:
         return "headline_group"
+
     if "headline" in name and "group" in name:
         return "headline_group"
+
     if "subheadline_delivery" in name:
         return "subheadline_delivery_time"
+
     if "subheadline" in name:
         return "subheadline"
+
     if "headline" in name:
         return "headline"
 
@@ -58,30 +80,33 @@ def normalize_name(name: str) -> str:
 
     if "age_badge" in name:
         return "age_badge"
+
     if name == "0+" or "0+" in name:
         return "age_badge"
 
     if "brand_group" in name:
         return "brand_group"
+
     if "brand_name_first" in name:
         return "brand_name_first"
+
     if "brand_name_second" in name:
         return "brand_name_second"
+
     if "brand_name" in name:
         return "brand_name"
+
     if "brand" in name:
         return "brand_group"
 
     if "logo" in name:
         return "logo"
 
-    if "background_shape" in name:
-        return "background_shape"
-    if "background" in name:
-        return "background"
-
     if "decoration_group" in name:
         return "decoration_group"
+
+    # Loose decorations should not be treated as decoration_group.
+    # They will be root-scaled in convert.py.
     if "decoration" in name:
         return "decoration"
 
@@ -121,6 +146,7 @@ def get_area(node: dict) -> float:
 
 def get_largest_node(nodes_by_role: dict, *roles):
     candidates = []
+
     for role in roles:
         candidates.extend(nodes_by_role.get(role, []))
 
