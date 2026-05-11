@@ -1,10 +1,11 @@
 /**
  * Figma plugin main thread. Flows:
  * - ``POST …/pipeline/banner-raw-to-target-json-json`` — banner + raw JSON + target size → layout clone.
+ * - ``POST …/layout-engine/convert`` — serialized frame JSON + target size → ``layout_engine.convert`` CP-SAT output; plugin clones beside the original and applies returned ``final_json``.
  * - ``POST …/figma/convert-semantic-json`` — banner + grid PNG + raw JSON → Qwen returns ``{names:{id:…}}`` merged server-side into full semantic JSON; plugin clones beside the original, reparents to match JSON hierarchy, then renames from that JSON.
  * - HTML/CSS export from serialized JSON + assets (local).
  */
-figma.showUI(__html__, { width: 400, height: 720 });
+figma.showUI(__html__, { width: 400, height: 760 });
 
 /** Horizontal gap between the source frame and a sibling created by the plugin (px). */
 const BESIDE_FRAME_GAP = 80;
@@ -1499,6 +1500,41 @@ async function callBannerRawTargetPipeline(backendUrl, bannerPngBase64, rawJson,
   return data;
 }
 
+async function callLayoutEngineConvert(backendUrl, rawJson, targetResolution) {
+  const url = String(backendUrl || "").trim().replace(/\/+$/, "");
+  if (!url) throw new Error("Backend URL is empty.");
+  const response = await fetch(url + "/layout-engine/convert", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      raw_json: rawJson,
+      target_width: targetResolution.width,
+      target_height: targetResolution.height,
+      target_resolution: `${targetResolution.width}x${targetResolution.height}`,
+    }),
+  });
+  const text = await response.text();
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch (e) {
+    data = null;
+  }
+  if (!response.ok) {
+    const detail =
+      data && data.detail != null
+        ? typeof data.detail === "string"
+          ? data.detail
+          : JSON.stringify(data.detail)
+        : text || `HTTP ${response.status}`;
+    throw new Error(`Layout engine backend failed: ${detail}`);
+  }
+  if (!data || typeof data !== "object" || !data.final_json) {
+    throw new Error("Layout engine returned invalid JSON or missing final_json.");
+  }
+  return data;
+}
+
 function resizeNodeIfPossible(node, width, height) {
   if (!node || !("resizeWithoutConstraints" in node)) return;
   try {
@@ -2576,6 +2612,118 @@ figma.ui.onmessage = async (msg) => {
           "Make sure Backend URL exactly matches the manifest, then reload the development plugin.";
       }
       postError(pipelineMsg);
+      sendSelectionInfo();
+    } finally {
+      figma.ui.postMessage({ type: "pipeline-busy", busy: false });
+    }
+    return;
+  }
+
+  if (msg.type === "layout-engine-convert-selected-frame") {
+    const selection = figma.currentPage.selection;
+    const frames = collectFrameNodesFromSelection(selection);
+    if (frames.length === 0) {
+      figma.ui.postMessage({ type: "pipeline-busy", busy: false });
+      postError("Select one or more frames (only FRAME nodes run layout_engine).");
+      sendSelectionInfo();
+      return;
+    }
+
+    const backendUrl = String(msg.backendUrl || "").trim();
+    if (!backendUrl) {
+      figma.ui.postMessage({ type: "pipeline-busy", busy: false });
+      postError("Backend URL is empty.");
+      return;
+    }
+
+    const origSel = selection.slice();
+    let ok = 0;
+    let fail = 0;
+
+    try {
+      figma.ui.postMessage({ type: "pipeline-busy", busy: true });
+      for (let li = 0; li < frames.length; li++) {
+        const selectedFrame = frames[li];
+        try {
+          figma.currentPage.selection = [selectedFrame];
+          const targetResolution = parseTargetSize(msg.targetSize, selectedFrame);
+          postStatus(`Layout engine (${li + 1}/${frames.length}): stamping… ${selectedFrame.name}`);
+          stampOriginalNodeIds(selectedFrame);
+
+          postStatus("Layout engine: serializing frame JSON…");
+          const origin = getOrigin(selectedFrame);
+          const rawJson = serializeNode(selectedFrame, origin, "");
+          rawJson.templateId = "figma_plugin_layout_engine";
+
+          postStatus(
+            `Layout engine (${li + 1}/${frames.length}): calling backend ${targetResolution.width}×${targetResolution.height}…`,
+          );
+          const result = await callLayoutEngineConvert(backendUrl, rawJson, targetResolution);
+          const finalJson = result.final_json;
+
+          postStatus("Layout engine: cloning frame beside selection…");
+          const layoutClone = cloneFrameBesideSource(selectedFrame);
+          const recon = applyFinalJsonCloneReconstruction(finalJson, layoutClone);
+          const namingReport = applyJsonTreeNamesByOriginalIds(finalJson, layoutClone);
+          const rootJsonLabel = String((finalJson && finalJson.name) || "").trim();
+          layoutClone.name = buildSemanticCloneFrameTitle(
+            selectedFrame.name,
+            rootJsonLabel || targetSizeName(targetResolution),
+          );
+
+          figma.currentPage.selection = [layoutClone];
+          figma.viewport.scrollAndZoomIntoView([selectedFrame, layoutClone]);
+
+          if (frames.length === 1) {
+            figma.notify(
+              `Layout engine clone ready.\n` +
+                `Sync: ${recon.hierarchyReport.reparentMoves} · Prune: ${recon.pruneReport.removed} · Stray: ${recon.strayReport.removed}\n` +
+                `Reorder: ${recon.reorderAfterPrune.moves}+${recon.reorderAfterStray.moves} · Stamp: ${recon.stampReport.stamped}` +
+                (recon.stampReport.mismatchWarn ? ` (${recon.stampReport.mismatchWarn} mismatches)` : "") +
+                `\nLayout: ${recon.layoutReport.applied} · Bounds fix: ${recon.boundsFixReport.corrected} · Empty removed: ${recon.emptyReport.removed}\n` +
+                `Layers renamed: ${namingReport.renamed} (id map ${namingReport.mapped}).`,
+              { timeout: 6 },
+            );
+          } else {
+            figma.notify(`Layout engine ${li + 1}/${frames.length}: done for "${selectedFrame.name}".`, {
+              timeout: 4,
+            });
+          }
+          ok++;
+        } catch (err) {
+          fail++;
+          console.error("Layout engine convert failed:", err);
+          const shortMsg = String(err && err.message ? err.message : err);
+          postStatus(`Layout engine (${li + 1}/${frames.length}) skipped: ${selectedFrame.name} — ${shortMsg}`);
+          if (err && err.message === "Failed to fetch") {
+            postStatus(
+              "Figma only allows requests to origins listed in manifest.json networkAccess.devAllowedDomains. Match Backend URL, then reload the plugin.",
+            );
+          }
+        }
+      }
+
+      figma.currentPage.selection = origSel;
+      sendSelectionInfo();
+      figma.ui.postMessage({ type: "done" });
+      if (frames.length > 1) {
+        figma.notify(`Layout engine batch: ${ok} ok, ${fail} failed.`, { timeout: 5 });
+      }
+      if (fail > 0 && ok === 0) {
+        postError("Every frame in the layout_engine batch failed. See status above.");
+      } else if (fail > 0) {
+        postError(`Layout engine finished with ${fail} failure(s); ${ok} succeeded.`);
+      }
+    } catch (err) {
+      console.error("Layout engine batch failed:", err);
+      let errMsg =
+        err && err.stack ? err.message + "\n\n" + err.stack : String(err && err.message ? err.message : err);
+      if (err && err.message === "Failed to fetch") {
+        errMsg +=
+          "\n\nFigma only allows requests to origins listed in manifest.json networkAccess.devAllowedDomains. " +
+          "Make sure Backend URL exactly matches the manifest, then reload the development plugin.";
+      }
+      postError(errMsg);
       sendSelectionInfo();
     } finally {
       figma.ui.postMessage({ type: "pipeline-busy", busy: false });

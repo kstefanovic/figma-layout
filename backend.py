@@ -43,6 +43,7 @@ from json_embedding import (
     resize_figma_json_to_resolution,
     search_index,
 )
+from layout_engine.convert import convert_banner
 
 
 load_dotenv()
@@ -223,6 +224,21 @@ class BannerRawToTargetJsonJsonRequest(BaseModel):
     raw_frame_index: int = Field(default=0, ge=0)
     top_k: int = Field(default=3, ge=1, le=20)
     max_new_tokens: int = Field(default=64, ge=8, le=512)
+
+
+class LayoutEngineConvertRequest(BaseModel):
+    """Run CP-SAT layout_engine on plugin-serialized banner JSON (no VLM / embedding index)."""
+
+    raw_json: Any = Field(..., description="Root frame dict or single-element list from the Figma plugin")
+    target_resolution: str | None = Field(None, description="WIDTHxHEIGHT, e.g. 1536x640")
+    target_width: float | None = None
+    target_height: float | None = None
+
+
+class LayoutEngineConvertResponse(BaseModel):
+    final_json: dict[str, Any]
+    target_width: int
+    target_height: int
 
 
 app = FastAPI(title="Public Qwen2.5-VL Backend")
@@ -686,6 +702,51 @@ def banner_raw_to_target_json_json(request: BannerRawToTargetJsonJsonRequest) ->
         raw_frame_index=request.raw_frame_index,
         top_k=request.top_k,
         max_new_tokens=request.max_new_tokens,
+    )
+
+
+@app.post("/layout-engine/convert", response_model=LayoutEngineConvertResponse)
+def layout_engine_convert(request: LayoutEngineConvertRequest) -> LayoutEngineConvertResponse:
+    """
+    Resize / relayout the selected banner using ``layout_engine.convert.convert_banner`` (OR-Tools CP-SAT).
+    Expects the same serialized JSON shape the Figma plugin produces (semantic-ish layer names give best results).
+    """
+    if request.target_resolution:
+        try:
+            tw, th = parse_resolution(request.target_resolution)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    elif request.target_width is not None and request.target_height is not None:
+        tw, th = float(request.target_width), float(request.target_height)
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide target_resolution or both target_width and target_height.",
+        )
+
+    tw_i = max(1, int(round(tw)))
+    th_i = max(1, int(round(th)))
+
+    raw = request.raw_json
+    if isinstance(raw, list):
+        if not raw:
+            raise HTTPException(status_code=400, detail="raw_json list is empty.")
+        raw = raw[0]
+    if not isinstance(raw, dict):
+        raise HTTPException(status_code=400, detail="raw_json must be a JSON object or a non-empty list.")
+
+    try:
+        final_json = convert_banner(raw, tw_i, th_i)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"layout_engine.convert failed: {exc}",
+        ) from exc
+
+    return LayoutEngineConvertResponse(
+        final_json=final_json,
+        target_width=tw_i,
+        target_height=th_i,
     )
 
 

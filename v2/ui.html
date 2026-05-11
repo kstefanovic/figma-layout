@@ -84,6 +84,14 @@
         background: #059669;
       }
 
+      #layout-engine-btn {
+        background: #7c3aed;
+      }
+
+      #layout-engine-btn:hover {
+        background: #6d28d9;
+      }
+
       #copy-html-btn,
       #copy-semantic-btn {
         background: #475569;
@@ -162,6 +170,12 @@
         <button id="pipeline-btn">Generate Target JSON + Draw Clone (1 or more frames)</button>
       </div>
 
+    <div class="row">
+      <button id="layout-engine-btn" type="button">
+        Layout engine only — JSON + target size → clone beside frame (1+ frames)
+      </button>
+    </div>
+
     <div id="semantic-json-section">
       <div class="row">
         <label for="semantic-max-tokens">Semantic JSON — max new tokens (256–8192; names-only output is small)</label>
@@ -214,6 +228,7 @@ Select one or more frames, then click “JSON to HTML/CSS Exporter”. Each fram
     <script>
       const statusEl = document.getElementById("status");
       const pipelineBtn = document.getElementById("pipeline-btn");
+      const layoutEngineBtn = document.getElementById("layout-engine-btn");
       const semanticJsonBtn = document.getElementById("semantic-json-btn");
       const semanticMaxTokensEl = document.getElementById("semantic-max-tokens");
       const semanticJsonResultEl = document.getElementById("semantic-json-result");
@@ -235,6 +250,7 @@ Select one or more frames, then click “JSON to HTML/CSS Exporter”. Each fram
         const busy = !!on;
         if (pipelineOverlayEl) pipelineOverlayEl.hidden = !busy;
         if (pipelineBtn) pipelineBtn.disabled = busy;
+        if (layoutEngineBtn) layoutEngineBtn.disabled = busy;
       }
 
       function setSelectedFrameInfo(info) {
@@ -384,6 +400,24 @@ Select one or more frames, then click “JSON to HTML/CSS Exporter”. Each fram
             }
           },
           "*"
+        );
+      };
+
+      layoutEngineBtn.onclick = () => {
+        const backendUrl = document.getElementById("backend-url").value.trim();
+        const targetSize = normalizeTargetSizeText(document.getElementById("target-size").value);
+        document.getElementById("target-size").value = targetSize;
+        setStatus("Calling layout_engine on serialized JSON…");
+        setPipelineLoading(true);
+        parent.postMessage(
+          {
+            pluginMessage: {
+              type: "layout-engine-convert-selected-frame",
+              backendUrl,
+              targetSize,
+            },
+          },
+          "*",
         );
       };
 
