@@ -1,5 +1,5 @@
 {
-  "name": "Qwen Layout Converter",
+  "name": "Transformer Layout Converter",
   "id": "qwen-layout-converter-plugin",
   "api": "1.0.0",
   "main": "code.js",
@@ -8,9 +8,7 @@
   "networkAccess": {
     "allowedDomains": ["https://theye-inference.onrender.com"],
     "devAllowedDomains": [
-      "http://localhost:20401",
-      "http://127.0.0.1:20401",
-      "http://213.184.224.88:20401"
+      "http://localhost:20198"
     ]
   }
 }

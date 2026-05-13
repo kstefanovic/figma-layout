@@ -11,6 +11,14 @@ source .venv/bin/activate
 python model_server.py
 ```
 
+Pick a physical GPU without changing `.env` (writes `CUDA_VISIBLE_DEVICES` before PyTorch loads):
+
+```bash
+python model_server.py --gpu 1
+# short form
+python model_server.py -g 0
+```
+
 Start the public backend in another terminal:
 
 ```bash
@@ -71,8 +79,8 @@ pm2 delete qwen-model-server
 QWEN_MODEL_PATH=./Qwen2.5-VL-7B-Instruct
 QWEN_HOST=127.0.0.1
 QWEN_PORT=20400
+# Host GPU index; use 1 for the second card, etc. Optional: QWEN_DEVICE (see .env.example).
 QWEN_GPU_DEVICE=0
-QWEN_DEVICE=cuda:0
 
 BACKEND_HOST=0.0.0.0
 BACKEND_PORT=20401
@@ -80,7 +88,7 @@ MODEL_SERVICE_URL=http://127.0.0.1:20400
 MODEL_REQUEST_TIMEOUT=300
 ```
 
-`QWEN_GPU_DEVICE` controls `CUDA_VISIBLE_DEVICES` before `torch` initializes CUDA. With `QWEN_GPU_DEVICE=0`, the model runs on GPU 0 as `cuda:0`.
+`QWEN_GPU_DEVICE` sets `CUDA_VISIBLE_DEVICES` before `torch` loads, so you select which physical GPU(s) the process may use. Inside the process, the first visible GPU is always `cuda:0`; you only need `QWEN_DEVICE` if you expose multiple GPUs or need a non-default mapping (see `.env.example`).
 
 ## API
 

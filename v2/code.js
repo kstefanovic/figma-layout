@@ -2,7 +2,7 @@
  * Figma plugin main thread. Flows:
  * - ``POST …/pipeline/banner-raw-to-target-json-json`` — banner + raw JSON + target size → layout clone.
  * - ``POST …/layout-engine/convert`` — serialized frame JSON + target size → ``layout_engine.convert`` CP-SAT output; plugin clones beside the original and applies returned ``final_json``.
- * - ``POST …/figma/convert-semantic-json`` — banner + grid PNG + raw JSON → Qwen returns ``{names:{id:…}}`` merged server-side into full semantic JSON; plugin clones beside the original, reparents to match JSON hierarchy, then renames from that JSON.
+ * - ``POST …/figma/convert-semantic-json`` — banner + grid PNG + raw JSON → Qwen (multipart sent from the plugin UI iframe with ``FormData``, same as ``frontend/figma.html``); server merges ``{names:{id:…}}`` into full semantic JSON; main thread clones beside the original, reparents to match JSON hierarchy, then renames from that JSON.
  * - HTML/CSS export from serialized JSON + assets (local).
  */
 figma.showUI(__html__, { width: 400, height: 760 });
@@ -643,72 +643,6 @@ function uint8ToBase64(bytes) {
   return result;
 }
 
-function concatUint8Arrays(pieces) {
-  let total = 0;
-  for (const p of pieces) {
-    total += p.length;
-  }
-  const out = new Uint8Array(total);
-  let offset = 0;
-  for (const p of pieces) {
-    out.set(p, offset);
-    offset += p.length;
-  }
-  return out;
-}
-
-/** UTF-8 encode string to bytes (Figma main thread has no FormData/Blob). */
-function utf8Bytes(s) {
-  const str = String(s);
-  if (typeof TextEncoder !== "undefined") {
-    return new TextEncoder().encode(str);
-  }
-  const bytes = [];
-  for (let i = 0; i < str.length; i++) {
-    let c = str.charCodeAt(i);
-    if (c < 0x80) {
-      bytes.push(c);
-    } else if (c < 0x800) {
-      bytes.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));
-    } else if (c < 0xd800 || c >= 0xe000) {
-      bytes.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
-    } else {
-      i++;
-      c = 0x10000 + (((c & 0x3ff) << 10) | (str.charCodeAt(i) & 0x3ff));
-      bytes.push(
-        0xf0 | (c >> 18),
-        0x80 | ((c >> 12) & 0x3f),
-        0x80 | ((c >> 6) & 0x3f),
-        0x80 | (c & 0x3f),
-      );
-    }
-  }
-  return new Uint8Array(bytes);
-}
-
-/**
- * multipart/form-data without FormData (not available in Figma plugin sandbox).
- * @param {string} boundary
- * @param {{ name: string, filename?: string | null, contentType: string, body: Uint8Array }}[] parts
- */
-function buildMultipartFormDataBody(boundary, parts) {
-  const chunks = [];
-  for (const part of parts) {
-    chunks.push(utf8Bytes("--" + boundary + "\r\n"));
-    let head = 'Content-Disposition: form-data; name="' + part.name + '"';
-    if (part.filename) {
-      head += '; filename="' + part.filename + '"';
-    }
-    head += "\r\nContent-Type: " + part.contentType + "\r\n\r\n";
-    chunks.push(utf8Bytes(head));
-    const body = part.body instanceof Uint8Array ? part.body : new Uint8Array(part.body);
-    chunks.push(body);
-    chunks.push(utf8Bytes("\r\n"));
-  }
-  chunks.push(utf8Bytes("--" + boundary + "--\r\n"));
-  return concatUint8Arrays(chunks);
-}
-
 function stampOriginalNodeIds(root) {
   let stamped = 0;
 
@@ -800,6 +734,8 @@ function getSemanticName(item) {
     return value || null;
   }
   if (typeof item === "object") {
+    const direct = item.name != null ? String(item.name).trim() : "";
+    if (direct) return direct;
     return item.semantic_name || item.semanticName || item.role || null;
   }
   return null;
@@ -865,7 +801,7 @@ function isStrictDescendantOf(node, ancestorCandidate) {
 /**
  * Reparent and reorder nodes in ``cloneRoot`` so parent/child order matches ``jsonTree.children``
  * (same serialized Figma ``id`` keys as ``collectClonedNodesByOriginalId``).
- * Call before ``applyJsonTreeNamesByOriginalIds`` so the layer list matches backend hierarchy.
+ * Call before ``finalizeSemanticLayerNamesFromJson`` / ``applyJsonTreeNamesByOriginalIds`` so the layer list matches backend hierarchy.
  */
 function syncCloneHierarchyToJsonTree(jsonTree, cloneRoot) {
   const { map: byId } = collectClonedNodesByOriginalId(cloneRoot);
@@ -944,12 +880,9 @@ function collectFinalJsonNodeIds(jsonTree) {
 }
 
 /**
- * Re-stamp ``originalNodeId`` on the clone from ``jsonTree`` using **index-aligned** pairing:
- * ``jsonTree.children[i]`` ↔ ``cloneRoot.children[i]`` at every level.
- * Call only after ``pruneClonedNodesMissingFromFinalJson`` + ``reorderCloneChildrenPerFinalJson`` so
- * counts match and booleans / groups are not mis-mapped to sibling slots.
+ * Re-stamp ``originalNodeId`` on a Figma subtree from a JSON subtree (index-aligned children).
  */
-function stampCloneOriginalIdsFromJson(jsonTree, cloneRoot) {
+function stampCloneSubtreeOriginalIdsFromJson(jRoot, fRoot) {
   let stamped = 0;
   let mismatchWarn = 0;
 
@@ -982,8 +915,69 @@ function stampCloneOriginalIdsFromJson(jsonTree, cloneRoot) {
     for (let i = 0; i < n; i++) walk(jch[i], fch[i]);
   }
 
-  walk(jsonTree, cloneRoot);
+  walk(jRoot, fRoot);
   return { stamped, mismatchWarn };
+}
+
+/**
+ * Re-stamp ``originalNodeId`` on the clone from ``jsonTree`` using **index-aligned** pairing:
+ * ``jsonTree.children[i]`` ↔ ``cloneRoot.children[i]`` at every level.
+ * Call after hierarchy is stable; often invoked **twice** in ``applyFinalJsonCloneReconstruction`` (initial
+ * pairing on the raw clone, then again after prune / stray cleanup).
+ */
+function stampCloneOriginalIdsFromJson(jsonTree, cloneRoot) {
+  return stampCloneSubtreeOriginalIdsFromJson(jsonTree, cloneRoot);
+}
+
+/**
+ * Figma ignores ``node.name`` (and plugin data on inner nodes) inside INSTANCE subtrees until detached.
+ * Detach every INSTANCE that still appears in ``jsonTree`` with semantic ``children`` so later passes
+ * can sync hierarchy and apply ``final_json`` / ``semantic_json`` names.
+ */
+function detachInstancesForFinalJson(jsonTree, cloneRoot) {
+  let detached = 0;
+  const post = [];
+
+  function collectPost(j) {
+    if (!j || typeof j !== "object") return;
+    const ch = Array.isArray(j.children) ? j.children : [];
+    for (let i = 0; i < ch.length; i++) collectPost(ch[i]);
+    post.push(j);
+  }
+  collectPost(jsonTree);
+
+  for (let pi = 0; pi < post.length; pi++) {
+    const jNode = post[pi];
+    const jid = String(jNode.id || "").trim();
+    const jkids = Array.isArray(jNode.children) ? jNode.children : [];
+    if (!jid || jkids.length === 0) continue;
+
+    const { map: byId } = collectClonedNodesByOriginalId(cloneRoot);
+    const fig = byId.get(jid);
+    if (!fig || fig.type !== "INSTANCE") continue;
+
+    let detachedFrame = null;
+    try {
+      detachedFrame = fig.detachInstance();
+      detached++;
+    } catch (e) {
+      console.warn("detachInstancesForFinalJson: detachInstance failed", jid, e);
+      continue;
+    }
+
+    const sem = String(jNode.name || "").trim();
+    if (sem) {
+      try {
+        setSemanticName(detachedFrame, sem);
+      } catch (e2) {
+        console.warn("detachInstancesForFinalJson: rename detached root failed", jid, e2);
+      }
+    }
+
+    stampCloneSubtreeOriginalIdsFromJson(jNode, detachedFrame);
+  }
+
+  return { detached };
 }
 
 /**
@@ -1248,6 +1242,8 @@ function applyFinalAbsoluteBoundsCorrection(jsonTree, figmaRoot) {
  * re-order → layout from JSON bounds → empty cleanup → **absolute bounds correction** (document nudge).
  */
 function applyFinalJsonCloneReconstruction(jsonTree, cloneRoot) {
+  const preStampReport = stampCloneOriginalIdsFromJson(jsonTree, cloneRoot);
+  const detachReport = detachInstancesForFinalJson(jsonTree, cloneRoot);
   const hierarchyReport = syncCloneHierarchyToJsonTree(jsonTree, cloneRoot);
   const pruneReport = pruneClonedNodesMissingFromFinalJson(jsonTree, cloneRoot);
   const reorderAfterPrune = reorderCloneChildrenPerFinalJson(jsonTree, cloneRoot);
@@ -1257,7 +1253,11 @@ function applyFinalJsonCloneReconstruction(jsonTree, cloneRoot) {
   const layoutReport = applyFinalJsonAbsoluteLayout(jsonTree, cloneRoot);
   const emptyReport = removeEmptyFramesUnder(cloneRoot);
   const boundsFixReport = applyFinalAbsoluteBoundsCorrection(jsonTree, cloneRoot);
+  const pathNameReport = applyJsonTreeNamesByPath(jsonTree, cloneRoot);
+  const zeroSizeReport = removeEmptyZeroSizeNodes(cloneRoot);
   return {
+    preStampReport,
+    detachReport,
     hierarchyReport,
     pruneReport,
     reorderAfterPrune,
@@ -1267,6 +1267,8 @@ function applyFinalJsonCloneReconstruction(jsonTree, cloneRoot) {
     layoutReport,
     emptyReport,
     boundsFixReport,
+    pathNameReport,
+    zeroSizeReport,
   };
 }
 
@@ -1377,7 +1379,7 @@ function pruneClonedNodesMissingFromFinalJson(jsonTree, cloneRoot) {
 }
 
 /**
- * Remove empty FRAME/GROUP nodes under ``root`` (e.g. raw wrappers left after reparent + prune).
+ * Remove empty wrappers and zero-size empty nodes under ``root`` (e.g. stale logo wrappers after reparent + prune).
  */
 function removeEmptyFramesUnder(root) {
   let total = 0;
@@ -1389,12 +1391,23 @@ function removeEmptyFramesUnder(root) {
     const toRemove = [];
 
     function collectEmpty(node) {
-      if (!node || !("children" in node) || !Array.isArray(node.children)) return;
-      for (let i = 0; i < node.children.length; i++) {
-        collectEmpty(node.children[i]);
+      if (!node) return;
+      const hasChildrenArray = "children" in node && Array.isArray(node.children);
+      const childCount = hasChildrenArray ? node.children.length : 0;
+      if (hasChildrenArray) {
+        for (let i = 0; i < node.children.length; i++) {
+          collectEmpty(node.children[i]);
+        }
       }
       const t = node.type;
-      if (node !== root && (t === "FRAME" || t === "GROUP") && node.children.length === 0) {
+      const isEmptyWrapper = (t === "FRAME" || t === "GROUP" || t === "INSTANCE") && childCount === 0;
+      const isZeroSizeEmpty =
+        childCount === 0 &&
+        "width" in node &&
+        "height" in node &&
+        Math.abs(Number(node.width) || 0) <= 0.01 &&
+        Math.abs(Number(node.height) || 0) <= 0.01;
+      if (node !== root && (isEmptyWrapper || isZeroSizeEmpty)) {
         toRemove.push(node);
       }
     }
@@ -1414,8 +1427,106 @@ function removeEmptyFramesUnder(root) {
 }
 
 /**
- * Walk a semantic / ``final_json`` tree and rename nodes in ``cloneRoot`` by serialized Figma ``id``,
- * using ``originalNodeId`` plugin data (``collectClonedNodesByOriginalId``).
+ * Remove any empty zero-size node under ``root``. This catches stale boolean/vector logo shells that
+ * survive hierarchy reconstruction but are absent from ``final_json``.
+ */
+function removeEmptyZeroSizeNodes(root) {
+  let removed = 0;
+  let rounds = 0;
+  let changed = true;
+
+  while (changed && rounds < 64) {
+    changed = false;
+    rounds++;
+    const toRemove = [];
+
+    function collect(node) {
+      if (!node) return;
+      const hasChildrenArray = "children" in node && Array.isArray(node.children);
+      if (hasChildrenArray) {
+        for (let i = 0; i < node.children.length; i++) {
+          collect(node.children[i]);
+        }
+      }
+      const childCount = hasChildrenArray ? node.children.length : 0;
+      const hasSize = "width" in node && "height" in node;
+      const width = hasSize ? Number(node.width) || 0 : 0;
+      const height = hasSize ? Number(node.height) || 0 : 0;
+      if (node !== root && hasSize && childCount === 0 && width <= 0.01 && height <= 0.01) {
+        toRemove.push(node);
+      }
+    }
+
+    collect(root);
+    for (let i = 0; i < toRemove.length; i++) {
+      try {
+        toRemove[i].remove();
+        removed++;
+        changed = true;
+      } catch (e) {
+        console.warn("removeEmptyZeroSizeNodes: remove failed", toRemove[i] && toRemove[i].id, e);
+      }
+    }
+  }
+
+  return { removed, rounds };
+}
+
+/**
+ * All id-like keys on a JSON tree node that may match ``originalNodeId`` / Figma serialization.
+ */
+function jsonSourceIdKeys(item) {
+  if (!item || typeof item !== "object") return [];
+  const seen = new Set();
+  const out = [];
+  for (const k of ["id", "source_figma_id", "sourceFigmaId", "figma_node_id", "node_id"]) {
+    const v = item[k];
+    if (v == null) continue;
+    const s = String(v).trim();
+    if (!s || seen.has(s)) continue;
+    seen.add(s);
+    out.push(s);
+  }
+  return out;
+}
+
+/**
+ * Find the Figma node for a ``final_json`` row. ``byId`` maps **source** ids (``originalNodeId`` / JSON id),
+ * never the post-clone Figma ``node.id``, to the cloned node. Falls back to ``path`` under ``cloneRoot``.
+ */
+function resolveFigmaNodeForJsonItem(item, byId, cloneRoot) {
+  if (!item || typeof item !== "object" || !cloneRoot) return null;
+  for (const key of jsonSourceIdKeys(item)) {
+    if (byId.has(key)) return byId.get(key);
+  }
+  const p = item.path;
+  if (p == null) return null;
+  const ps = String(p).trim();
+  if (!ps) return cloneRoot;
+  return getNodeByPath(cloneRoot, ps);
+}
+
+/**
+ * Apply semantic layer name from backend (``name`` / ``semantic_name`` / ``role``).
+ * Sets ``node.name`` directly so INSTANCE / all types receive the label when the API allows.
+ */
+function applySemanticNameToFigmaNode(node, rawName) {
+  if (!node || rawName == null) return false;
+  const clean = sanitizeLayerName(String(rawName).trim());
+  if (!clean) return false;
+  try {
+    node.name = clean;
+    node.setPluginData("semanticName", clean);
+    return true;
+  } catch (e) {
+    console.warn("applySemanticNameToFigmaNode failed", node && node.id, e);
+    return false;
+  }
+}
+
+/**
+ * Walk ``final_json`` and rename nodes in ``cloneRoot`` using ``originalNodeId`` plugin data
+ * (``collectClonedNodesByOriginalId``) — keys are **source** ids, not new Figma ids.
  */
 function applyJsonTreeNamesByOriginalIds(jsonTree, cloneRoot) {
   const { map: byId, mapped } = collectClonedNodesByOriginalId(cloneRoot);
@@ -1424,14 +1535,18 @@ function applyJsonTreeNamesByOriginalIds(jsonTree, cloneRoot) {
 
   function walk(item) {
     if (!item || typeof item !== "object") return;
-    const id = String(item.id || "").trim();
-    const nm = String(item.name || "").trim();
-    if (id && nm) {
-      const node = byId.get(id);
+    const nm =
+      String(item.name || "").trim() ||
+      String(getSemanticName(item) || "").trim();
+    const keys = jsonSourceIdKeys(item);
+    const primaryId = keys.length ? keys[0] : "";
+
+    if (nm) {
+      const node = resolveFigmaNodeForJsonItem(item, byId, cloneRoot);
       if (node) {
-        if (setSemanticName(node, nm)) renamed++;
-      } else {
-        missing.push(id);
+        if (applySemanticNameToFigmaNode(node, nm)) renamed++;
+      } else if (primaryId) {
+        missing.push(primaryId);
       }
     }
     const kids = Array.isArray(item.children) ? item.children : [];
@@ -1440,6 +1555,228 @@ function applyJsonTreeNamesByOriginalIds(jsonTree, cloneRoot) {
 
   walk(jsonTree);
   return { renamed, missing, mapped };
+}
+
+/**
+ * Path-only fallback for semantic names. This does not depend on cloned node ids or ``originalNodeId``:
+ * it indexes backend JSON by ``path`` (or derived child-index path) and walks the Figma clone by current path.
+ */
+function applyJsonTreeNamesByPath(jsonTree, cloneRoot) {
+  const byPath = new Map();
+  let renamed = 0;
+  let stamped = 0;
+  const missing = [];
+
+  function index(jNode, derivedPath) {
+    if (!jNode || typeof jNode !== "object") return;
+    const explicitPath = jNode.path !== undefined && jNode.path !== null ? String(jNode.path).trim() : "";
+    byPath.set(explicitPath || derivedPath, jNode);
+    const kids = Array.isArray(jNode.children) ? jNode.children : [];
+    for (let i = 0; i < kids.length; i++) {
+      index(kids[i], derivedPath ? `${derivedPath}/${i}` : String(i));
+    }
+  }
+
+  function stampSourceId(figmaNode, jsonNode) {
+    const jid = String(jsonNode && jsonNode.id || "").trim();
+    if (!jid || !figmaNode) return;
+    try {
+      figmaNode.setPluginData("originalNodeId", jid);
+      stamped++;
+    } catch (e) {
+      console.warn("applyJsonTreeNamesByPath: set originalNodeId failed", jid, e);
+    }
+  }
+
+  function walk(figmaNode, path) {
+    if (!figmaNode) return;
+    const jsonNode = byPath.get(path);
+    if (jsonNode) {
+      const nm =
+        String(jsonNode.name || "").trim() ||
+        String(getSemanticName(jsonNode) || "").trim();
+      if (nm && applySemanticNameToFigmaNode(figmaNode, nm)) renamed++;
+      stampSourceId(figmaNode, jsonNode);
+    } else {
+      missing.push(path);
+    }
+
+    if ("children" in figmaNode && Array.isArray(figmaNode.children)) {
+      for (let i = 0; i < figmaNode.children.length; i++) {
+        walk(figmaNode.children[i], path ? `${path}/${i}` : String(i));
+      }
+    }
+  }
+
+  index(jsonTree, "");
+  walk(cloneRoot, "");
+  const zeroSizeReport = removeEmptyZeroSizeNodes(cloneRoot);
+  return { renamed, stamped, missing, zeroSizeRemoved: zeroSizeReport.removed };
+}
+
+/**
+ * Index backend ``final_json`` / ``semantic_json`` by stable **source** ids and ``path`` (never clone ids).
+ * Values are the JSON objects so callers can read ``.name``.
+ */
+function indexFinalJsonSemantics(jsonTree) {
+  const semanticBySourceId = new Map();
+  const semanticByPath = new Map();
+
+  function indexSemantic(node) {
+    if (!node || typeof node !== "object") return;
+    const id = node.id != null ? String(node.id).trim() : "";
+    if (id) semanticBySourceId.set(id, node);
+    const sf = node.source_figma_id != null ? String(node.source_figma_id).trim() : "";
+    if (sf) semanticBySourceId.set(sf, node);
+    const sf2 = node.sourceFigmaId != null ? String(node.sourceFigmaId).trim() : "";
+    if (sf2) semanticBySourceId.set(sf2, node);
+    if (node.path !== undefined && node.path !== null) {
+      const pk = String(node.path).trim();
+      semanticByPath.set(pk, node);
+    }
+    const kids = Array.isArray(node.children) ? node.children : [];
+    for (let i = 0; i < kids.length; i++) indexSemantic(kids[i]);
+  }
+
+  indexSemantic(jsonTree);
+  return { semanticBySourceId, semanticByPath };
+}
+
+/**
+ * Pair ``final_json`` nodes with Figma nodes by **parallel tree walk** (child index order).
+ * Does not look up semantics using ``figmaNode.id`` — only ``jsonNode`` shape + ``jsonNode.name``.
+ */
+function applySemanticNamesParallelTreeWalk(jsonTree, figmaRoot) {
+  let renamed = 0;
+
+  function walk(jsonNode, figmaNode) {
+    if (!jsonNode || typeof jsonNode !== "object" || !figmaNode) return;
+    const nm =
+      String(jsonNode.name || "").trim() ||
+      String(getSemanticName(jsonNode) || "").trim();
+    if (nm && applySemanticNameToFigmaNode(figmaNode, nm)) renamed++;
+
+    const jch = Array.isArray(jsonNode.children) ? jsonNode.children : [];
+    if (!("children" in figmaNode) || !Array.isArray(figmaNode.children)) return;
+    const fch = figmaNode.children;
+    const n = Math.min(jch.length, fch.length);
+    for (let i = 0; i < n; i++) walk(jch[i], fch[i]);
+  }
+
+  walk(jsonTree, figmaRoot);
+  return { renamed };
+}
+
+/**
+ * Apply semantic names using **only** ``originalNodeId`` (stamped source / JSON id), never ``node.id``.
+ */
+function applySemanticNamesFromStampedSourceIds(maps, figmaRoot) {
+  const { semanticBySourceId, semanticByPath } = maps;
+  let renamed = 0;
+
+  function visit(figmaNode) {
+    let oid = "";
+    try {
+      oid = String(figmaNode.getPluginData("originalNodeId") || "").trim();
+    } catch (_e) {
+      oid = "";
+    }
+    let semantic = null;
+    if (oid) {
+      semantic = semanticBySourceId.get(oid) || null;
+      if (!semantic) semantic = semanticByPath.get(oid) || null;
+    }
+    if (semantic) {
+      const nm =
+        String(semantic.name || "").trim() ||
+        String(getSemanticName(semantic) || "").trim();
+      if (nm && applySemanticNameToFigmaNode(figmaNode, nm)) renamed++;
+    }
+    if ("children" in figmaNode && Array.isArray(figmaNode.children)) {
+      for (let i = 0; i < figmaNode.children.length; i++) visit(figmaNode.children[i]);
+    }
+  }
+
+  visit(figmaRoot);
+  return { renamed };
+}
+
+/**
+ * Warn when layer names still look like raw Figma defaults but indexed semantics expect a label.
+ */
+function warnRawSemanticLayerNames(figmaRoot, maps) {
+  const { semanticBySourceId, semanticByPath } = maps;
+  const bad = [];
+
+  function visit(node) {
+    if (!node) return;
+    const nm = String(node.name || "");
+    const rawNumeric = /^[0-9]+$/.test(nm);
+    const rawGroup = /^Group\s+/i.test(nm);
+    if (!rawNumeric && !rawGroup) {
+      if ("children" in node && Array.isArray(node.children)) {
+        for (let i = 0; i < node.children.length; i++) visit(node.children[i]);
+      }
+      return;
+    }
+    let oid = "";
+    try {
+      oid = String(node.getPluginData("originalNodeId") || "").trim();
+    } catch (_e) {
+      oid = "";
+    }
+    const semantic = oid
+      ? semanticBySourceId.get(oid) || semanticByPath.get(oid)
+      : null;
+    const expected = semantic ? String(semantic.name || "").trim() : "";
+    if (expected && expected !== nm) {
+      bad.push({ figmaId: node.id, originalNodeId: oid, name: nm, expected });
+    } else if (!expected && rawNumeric) {
+      bad.push({ figmaId: node.id, originalNodeId: oid || "(none)", name: nm, expected: "(no semantic row)" });
+    }
+    if ("children" in node && Array.isArray(node.children)) {
+      for (let j = 0; j < node.children.length; j++) visit(node.children[j]);
+    }
+  }
+
+  visit(figmaRoot);
+  if (bad.length) {
+    console.warn("[semantic-name-fail]", bad.map((b) => b.name), bad);
+  }
+  return { badCount: bad.length, samples: bad.slice(0, 12) };
+}
+
+/**
+ * Last-chance semantic labels: detach INSTANCEs, re-stamp source ids, then apply names using
+ * **indexed** ``final_json`` (source id / path) + parallel tree walk — never semantic lookup by new Figma id.
+ */
+function finalizeSemanticLayerNamesFromJson(jsonTree, cloneRoot) {
+  const detachReport = detachInstancesForFinalJson(jsonTree, cloneRoot);
+  stampCloneOriginalIdsFromJson(jsonTree, cloneRoot);
+
+  const maps = indexFinalJsonSemantics(jsonTree);
+  let renamed = 0;
+  renamed += applySemanticNamesParallelTreeWalk(jsonTree, cloneRoot).renamed;
+  renamed += applySemanticNamesFromStampedSourceIds(maps, cloneRoot).renamed;
+
+  const nameReport = applyJsonTreeNamesByOriginalIds(jsonTree, cloneRoot);
+  renamed += nameReport.renamed;
+  const pathNameReport = applyJsonTreeNamesByPath(jsonTree, cloneRoot);
+  renamed += pathNameReport.renamed;
+  const zeroSizeReport = removeEmptyZeroSizeNodes(cloneRoot);
+
+  const validation = warnRawSemanticLayerNames(cloneRoot, maps);
+
+  return {
+    renamed,
+    missing: nameReport.missing,
+    mapped: nameReport.mapped,
+    detached: detachReport.detached,
+    pathRenamed: pathNameReport.renamed,
+    pathStamped: pathNameReport.stamped,
+    zeroSizeRemoved: zeroSizeReport.removed,
+    validationBadCount: validation.badCount,
+  };
 }
 
 function parseTargetSize(value, fallbackFrame) {
@@ -2359,7 +2696,45 @@ function postError(message) {
   figma.ui.postMessage({ type: "error", message });
 }
 
+/** UI iframe completes POST /figma/convert-semantic-json with browser FormData (same as `frontend/figma.html`). */
+const semanticJsonUiFetchWaiters = new Map();
+
+function fetchSemanticJsonThroughUi(payload) {
+  const id = "sj_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 12);
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      if (semanticJsonUiFetchWaiters.has(id)) {
+        semanticJsonUiFetchWaiters.delete(id);
+        reject(new Error("Semantic JSON request timed out waiting for UI (12 min)."));
+      }
+    }, 12 * 60 * 1000);
+    semanticJsonUiFetchWaiters.set(id, { resolve, reject, timeout });
+    figma.ui.postMessage(
+      Object.assign(
+        {
+          type: "semantic-json-fetch",
+          id,
+        },
+        payload,
+      ),
+    );
+  });
+}
+
 figma.ui.onmessage = async (msg) => {
+  if (msg.type === "semantic-json-fetch-result") {
+    const entry = semanticJsonUiFetchWaiters.get(msg.id);
+    if (!entry) return;
+    clearTimeout(entry.timeout);
+    semanticJsonUiFetchWaiters.delete(msg.id);
+    if (msg.ok && msg.data && typeof msg.data === "object" && "semantic_json" in msg.data) {
+      entry.resolve(msg.data);
+    } else {
+      entry.reject(new Error(msg.error || "Semantic JSON request failed."));
+    }
+    return;
+  }
+
   if (msg.type === "export-selected-frame-html-css") {
     const selection = figma.currentPage.selection;
     const frames = collectFrameNodesFromSelection(selection);
@@ -2524,6 +2899,7 @@ figma.ui.onmessage = async (msg) => {
           let applySummary = null;
           if (lookup.frame) {
             postStatus(`Pipeline: cloning matched candidate frame (${lookup.reason}) and scaling to target size...`);
+            stampOriginalNodeIds(lookup.frame);
             const cloned = cloneCandidateFrameBesideSelection(
               lookup.frame,
               selectedFrame,
@@ -2531,17 +2907,25 @@ figma.ui.onmessage = async (msg) => {
               targetResolution,
             );
             convertedFrame = cloned.clone;
+            applyJsonTreeNamesByPath(result.final_json, convertedFrame);
+            removeEmptyZeroSizeNodes(convertedFrame);
             applySummary = cloned.summary;
             drawMode = "clone_matched_candidate_frame_scaled";
           } else {
             postStatus("Pipeline: candidate frame not found in current page; drawing returned JSON fallback...");
             convertedFrame = await drawJsonTreeBesideSelection(result.final_json, selectedFrame, targetResolution);
+            applyJsonTreeNamesByPath(result.final_json, convertedFrame);
+            removeEmptyZeroSizeNodes(convertedFrame);
             drawMode = "create_from_returned_json_fallback";
           }
 
           const rootJsonLabel = String((result.final_json && result.final_json.name) || "").trim();
           const recon = applyFinalJsonCloneReconstruction(result.final_json, convertedFrame);
-          const namingReport = applyJsonTreeNamesByOriginalIds(result.final_json, convertedFrame);
+          removeEmptyZeroSizeNodes(convertedFrame);
+          applyJsonTreeNamesByPath(result.final_json, convertedFrame);
+          removeEmptyZeroSizeNodes(convertedFrame);
+          const namingReport = finalizeSemanticLayerNamesFromJson(result.final_json, convertedFrame);
+          removeEmptyZeroSizeNodes(convertedFrame);
           convertedFrame.name = buildSemanticCloneFrameTitle(selectedFrame.name, rootJsonLabel || "layout");
 
           figma.currentPage.selection = [convertedFrame];
@@ -2663,8 +3047,10 @@ figma.ui.onmessage = async (msg) => {
 
           postStatus("Layout engine: cloning frame beside selection…");
           const layoutClone = cloneFrameBesideSource(selectedFrame);
+          applyJsonTreeNamesByPath(finalJson, layoutClone);
           const recon = applyFinalJsonCloneReconstruction(finalJson, layoutClone);
-          const namingReport = applyJsonTreeNamesByOriginalIds(finalJson, layoutClone);
+          applyJsonTreeNamesByPath(finalJson, layoutClone);
+          const namingReport = finalizeSemanticLayerNamesFromJson(finalJson, layoutClone);
           const rootJsonLabel = String((finalJson && finalJson.name) || "").trim();
           layoutClone.name = buildSemanticCloneFrameTitle(
             selectedFrame.name,
@@ -2783,73 +3169,37 @@ figma.ui.onmessage = async (msg) => {
         injectAtlasRegionsIntoRawJson(rawJson, regions);
         attachAtlasMetadataToRawJson(rawJson, atlasSize, regions);
 
-        const requestUrl = `${backendUrl}/figma/convert-semantic-json`;
         postStatus(
-          `Semantic JSON (${si + 1}/${frames.length}): calling backend + Qwen (may take several minutes)…`,
+          `Semantic JSON (${si + 1}/${frames.length}): calling backend + Qwen via UI (may take several minutes)…`,
         );
 
         const jsonStr = JSON.stringify(rawJson);
         const bannerU8 =
           bannerBytes instanceof Uint8Array ? bannerBytes : new Uint8Array(bannerBytes);
+        const atlasU8 =
+          atlasPngBytes instanceof Uint8Array ? atlasPngBytes : new Uint8Array(atlasPngBytes);
 
-        const boundary =
-          "----figmaSemantic" +
-          Math.random().toString(36).slice(2) +
-          Date.now().toString(36) +
-          Math.random().toString(36).slice(2);
-        const mpBody = buildMultipartFormDataBody(boundary, [
-          { name: "banner", filename: "banner.png", contentType: "image/png", body: bannerU8 },
-          { name: "grid", filename: "elements.png", contentType: "image/png", body: atlasPngBytes },
-          {
-            name: "raw_json",
-            filename: "raw.json",
-            contentType: "application/json; charset=utf-8",
-            body: utf8Bytes(jsonStr),
-          },
-          {
-            name: "max_new_tokens",
-            filename: null,
-            contentType: "text/plain; charset=utf-8",
-            body: utf8Bytes(String(maxNewTokens)),
-          },
-        ]);
-
-        const response = await fetch(requestUrl, {
-          method: "POST",
-          headers: {
-            "Content-Type": "multipart/form-data; boundary=" + boundary,
-          },
-          body: mpBody,
+        const data = await fetchSemanticJsonThroughUi({
+          backendUrl,
+          maxNewTokens,
+          rawJsonText: jsonStr,
+          bannerB64: uint8ToBase64(bannerU8),
+          gridB64: uint8ToBase64(atlasU8),
         });
-        const responseText = await response.text();
-        let data = null;
-        try {
-          data = responseText ? JSON.parse(responseText) : null;
-        } catch (_parseErr) {
-          data = null;
-        }
-
-        if (!response.ok) {
-          const detail =
-            data && typeof data === "object" && data.detail != null
-              ? typeof data.detail === "string"
-                ? data.detail
-                : JSON.stringify(data.detail)
-              : responseText || "HTTP " + String(response.status);
-          throw new Error(detail);
-        }
-
-        if (!data || typeof data !== "object" || !("semantic_json" in data)) {
-          throw new Error("Backend response missing semantic_json.");
-        }
 
         const pretty = JSON.stringify(data.semantic_json, null, 2);
 
         postStatus("Semantic JSON: creating clone beside selection…");
         const semanticClone = cloneFrameBesideSource(selectedFrame);
+        applyJsonTreeNamesByPath(data.semantic_json, semanticClone);
+        removeEmptyZeroSizeNodes(semanticClone);
         postStatus("Semantic JSON: matching layer hierarchy to returned JSON…");
         const recon = applyFinalJsonCloneReconstruction(data.semantic_json, semanticClone);
-        const namingReport = applyJsonTreeNamesByOriginalIds(data.semantic_json, semanticClone);
+        removeEmptyZeroSizeNodes(semanticClone);
+        applyJsonTreeNamesByPath(data.semantic_json, semanticClone);
+        removeEmptyZeroSizeNodes(semanticClone);
+        const namingReport = finalizeSemanticLayerNamesFromJson(data.semantic_json, semanticClone);
+        removeEmptyZeroSizeNodes(semanticClone);
         const rootJsonLabel = String((data.semantic_json && data.semantic_json.name) || "").trim();
         semanticClone.name = buildSemanticCloneFrameTitle(selectedFrame.name, rootJsonLabel || "semantic");
 

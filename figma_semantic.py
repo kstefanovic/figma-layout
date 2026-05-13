@@ -1100,10 +1100,12 @@ def postprocess_semantic_names(
 
     Rough phase order (dependencies matter more than rule numbers):
     text roles → compact ``brand_group`` / logo subtree (rules 5–7, 6b, 6c) → ``headline_group`` + rule 3f
-    (headline vs delivery on direct text children) → huge-vector background (rule 4) → rectangle / container fixes
-    → rule 9 (stray ``logo_*``) → rule 10a (``hero_image`` rectangles) → rule 10t (text cannot be ``hero_image``)
-    → rule 10 (``image_zone`` → ``background_gradient``) → gradient numbering → per-parent gradient suffix normalize
-    (rectangle/vector overlays only) → star decorations and soft validation.
+    (headline vs delivery on direct text children) → rule 10a (``hero_image`` rectangles, including DOOH side strips)
+    before decoration / background fallback can claim them → huge-vector background (rule 4) → rectangle / container fixes
+    → rule 9 (stray ``logo_*``) → rule 10a no-hero promotion / dedupe → rule 11 (``brand_name*`` only under
+    ``brand_group``) → rule 10t (text cannot be ``hero_image``) → rule 10 (``image_zone`` → ``background_gradient``)
+    → gradient numbering → per-parent gradient suffix normalize (rectangle/vector overlays only) → star decorations and
+    soft validation.
 
     ``debug`` may be a dict mutated with ``postprocess_used``, ``forced_renames``, ``semantic_validation_warnings``.
     """
@@ -1799,6 +1801,16 @@ def postprocess_semantic_names(
             return True
         if max(wr, hr) >= 0.65 and cov >= 0.52 and (hspan >= 0.80 or wspan >= 0.52):
             return True
+        # DOOH / wide banner: main photo is often a tall crop pinned to one side; most pixels sit in a
+        # modest horizontal strip but span the full visible frame height (intersection ``cov`` stays low
+        # because the layer bleeds far above/below the frame).
+        if frame_h > 0 and frame_w > 0:
+            if hspan >= 0.82 and wspan >= 0.12 and cov >= 0.14:
+                return True
+            if wspan >= 0.82 and hspan >= 0.10 and cov >= 0.12:
+                return True
+            if hspan >= 0.88 and cov >= 0.12 and (y0 < -0.05 * frame_h or y0 + nh > frame_h * 1.05):
+                return True
         return False
 
     def _looks_like_abstract_background_overlay(row: dict[str, Any]) -> bool:
@@ -1826,20 +1838,116 @@ def postprocess_semantic_names(
             return False
         area_ratio = (nw * nh) / frame_area
         wr, hr = nw / frame_w, nh / frame_h
+        side_edge = (
+            x0 <= 0.03 * frame_w
+            or x0 + nw >= 0.97 * frame_w
+            or y0 <= 0.03 * frame_h
+            or y0 + nh >= 0.97 * frame_h
+        )
+        narrow_side_strip = min(wr, hr) <= 0.16 and max(wr, hr) >= 0.72 and side_edge
         bleed = (
             x0 < -0.005 * frame_w
+            or y0 < -0.005 * frame_h
             or y0 > 0.72 * frame_h
             or x0 + nw > frame_w * 1.02
             or y0 + nh > frame_h * 1.02
         )
         huge = wr >= 0.65 or hr >= 0.50 or area_ratio >= 0.10
         wide_soft_bar = wr >= 0.80 and hr <= 0.55
+        if narrow_side_strip:
+            return True
         if not huge:
             return False
         return bool(bleed or wide_soft_bar)
 
+    def _looks_like_narrow_side_gradient_strip(row: dict[str, Any]) -> bool:
+        typ = str(row.get("type") or "").lower()
+        if typ not in ("rectangle", "vector"):
+            return False
+        if typ == "rectangle" and row.get("mid_child_ids"):
+            return False
+        if typ == "rectangle" and _looks_like_main_hero_photo_leaf_rectangle(row):
+            return False
+        b = row.get("bounds") or {}
+        try:
+            x0 = float(b.get("x") or 0)
+            y0 = float(b.get("y") or 0)
+            nw = float(b.get("width") or 0)
+            nh = float(b.get("height") or 0)
+        except (TypeError, ValueError):
+            return False
+        if frame_w <= 0 or frame_h <= 0 or nw <= 0 or nh <= 0:
+            return False
+        wr, hr = nw / frame_w, nh / frame_h
+        near_side = x0 <= 0.03 * frame_w or x0 + nw >= 0.97 * frame_w
+        near_top_bottom = y0 <= 0.03 * frame_h or y0 + nh >= 0.97 * frame_h
+        return min(wr, hr) <= 0.16 and max(wr, hr) >= 0.72 and (near_side or near_top_bottom)
+
+    def _zone_type_has_image_hint(row: dict[str, Any]) -> bool:
+        for key in ("zone_type", "zoneType", "semantic_zone", "semanticZone"):
+            raw = row.get(key)
+            if raw is None:
+                continue
+            if isinstance(raw, (list, tuple, set)):
+                text = " ".join(str(x) for x in raw)
+            else:
+                text = str(raw)
+            low = text.lower()
+            if "image" in low or "photo" in low or "hero" in low:
+                return True
+        return False
+
+    def _has_any_image_zone_hint() -> bool:
+        if any(_zone_type_has_image_hint(r) for r in mid_by_id.values()):
+            return True
+        return any(out.get(sid, "").lower() in ("image_zone", "hero_image", "person_image") for sid in mid_by_id)
+
+    def _hero_photo_rectangle_candidates() -> list[tuple[float, float, str]]:
+        candidates: list[tuple[float, float, str]] = []
+        for sid, row in mid_by_id.items():
+            if str(row.get("type") or "").lower() != "rectangle" or row.get("mid_child_ids"):
+                continue
+            if _has_brand_or_headline_ancestor(sid) or _has_brand_group_semantic_ancestor(sid):
+                continue
+            if not _looks_like_main_hero_photo_leaf_rectangle(row):
+                continue
+            area = _bounds_area(row.get("bounds"))
+            cov = _rectangle_frame_coverage_ratio(row)
+            candidates.append((cov, area, sid))
+        candidates.sort(key=lambda t: (-t[0], -t[1], t[2]))
+        return candidates
+
+    def _promote_hero_photo_rectangles(reason: str) -> int:
+        promoted = 0
+        protected_from = {
+            "image_zone",
+            "decoration_group",
+            "decoration",
+            "unassigned",
+            "background_shape",
+            "background_gradient",
+            "base_background",
+            "color_panel",
+            "gradient_shape",
+        }
+        for _cov, _area, sid in _hero_photo_rectangle_candidates():
+            nm = out.get(sid, "").lower()
+            if (
+                nm in protected_from
+                or re.fullmatch(r"background_gradient_\d+", nm or "") is not None
+                or nm.startswith("brand_name")
+            ):
+                _force(out, sid, "hero_image", reason)
+                promoted += 1
+        return promoted
+
     def _number_background_gradient_placeholders(out: dict[str, str], reason: str) -> int:
         pending = [s for s in mid_by_id if out.get(s, "").lower() == "background_gradient"]
+        used: set[int] = set()
+        for sid in mid_by_id:
+            m = re.fullmatch(r"background_gradient_(\d+)", out.get(sid, "").lower())
+            if m:
+                used.add(int(m.group(1)))
         pending.sort(
             key=lambda s: (
                 float((mid_by_id[s].get("bounds") or {}).get("y") or 0),
@@ -1847,8 +1955,12 @@ def postprocess_semantic_names(
                 s,
             )
         )
-        for i, sid in enumerate(pending, start=1):
-            _force(out, sid, f"background_gradient_{i}", reason)
+        next_i = 1
+        for sid in pending:
+            while next_i in used:
+                next_i += 1
+            _force(out, sid, f"background_gradient_{next_i}", reason)
+            used.add(next_i)
         return len(pending)
 
     def _is_background_gradient_slot_name(nm: str) -> bool:
@@ -1880,17 +1992,33 @@ def postprocess_semantic_names(
         for _pid, sids in by_parent.items():
             if not sids:
                 continue
-            sids.sort(
+            seen_slots: set[int] = set()
+            needs_slot: list[str] = []
+            for sid in sids:
+                m = re.fullmatch(r"background_gradient_(\d+)", out.get(sid, "").lower())
+                if not m:
+                    needs_slot.append(sid)
+                    continue
+                slot = int(m.group(1))
+                if slot in seen_slots:
+                    needs_slot.append(sid)
+                    continue
+                seen_slots.add(slot)
+            needs_slot.sort(
                 key=lambda s: (
                     float((mid_by_id[s].get("bounds") or {}).get("y") or 0),
                     float((mid_by_id[s].get("bounds") or {}).get("x") or 0),
                     s,
                 )
             )
-            for i, sid in enumerate(sids, start=1):
-                want = f"background_gradient_{i}"
+            next_i = 1
+            for sid in needs_slot:
+                while next_i in seen_slots:
+                    next_i += 1
+                want = f"background_gradient_{next_i}"
                 if out.get(sid, "").lower() != want:
                     _force(out, sid, want, reason)
+                seen_slots.add(next_i)
 
     # --- User rule 1: large leaf rectangle cannot be brand_group / brand_name_* ---
     for sid, row in mid_by_id.items():
@@ -2005,20 +2133,95 @@ def postprocess_semantic_names(
         repl = _invalid_logo_part_replacement(sid, row)
         _force(out, sid, repl, "rule9_logo_part_outside_logo_subtree")
 
-    # --- Rule 10a: dominant full-frame photo rectangle -> ``hero_image`` (not a gradient slot) ---
+    # --- Rule 10a: dominant photo rectangle -> ``hero_image`` before decoration/background fallback wins ---
+    _promote_hero_photo_rectangles("rule10a_main_photo_rectangle_not_decoration_or_background")
+
+    # If a banner advertises an image zone but still has no hero, promote the strongest photo-like rectangle
+    # outside text/brand areas. This catches VLM outputs that only supplied ``decoration_group`` / ``unassigned``.
+    if _has_any_image_zone_hint() and not any(out.get(s, "").lower() == "hero_image" for s in mid_by_id):
+        candidates = _hero_photo_rectangle_candidates()
+        if candidates:
+            _force(out, candidates[0][2], "hero_image", "rule10a_no_hero_promote_largest_image_zone_rectangle")
+
+    # --- Rule 10a-dedupe: at most one dominant ``hero_image`` among leaf rectangles (wide DOOH may yield two passes) ---
+    hero_leaf_rects: list[tuple[float, str]] = []
     for sid, row in mid_by_id.items():
         if str(row.get("type") or "").lower() != "rectangle" or row.get("mid_child_ids"):
             continue
+        if out.get(sid, "").lower() != "hero_image":
+            continue
         if _has_brand_group_semantic_ancestor(sid):
             continue
-        if not _looks_like_main_hero_photo_leaf_rectangle(row):
+        hero_leaf_rects.append((_rectangle_frame_coverage_ratio(row), sid))
+    if len(hero_leaf_rects) > 1:
+        hero_leaf_rects.sort(key=lambda t: (-t[0], t[1]))
+        for _cov, sid in hero_leaf_rects[1:]:
+            row = mid_by_id[sid]
+            repl = (
+                "background_gradient"
+                if _looks_like_abstract_background_overlay(row)
+                else "image_zone"
+            )
+            _force(out, sid, repl, "rule10a_dedupe_secondary_hero_leaf_rectangle")
+
+    # --- Rule 11: ``brand_name*`` only under semantic ``brand_group`` (VLM spill onto strips / hero plate) ---
+    def _is_disallowed_brand_name_outside_group(nm: str) -> bool:
+        n = (nm or "").strip().lower()
+        return bool(n.startswith("brand_name"))
+
+    def _replacement_for_stray_brand_name_outside_group(sid: str, row: dict[str, Any]) -> str:
+        """Map mistaken ``brand_name_*`` on nodes not under ``brand_group`` to background / unassigned."""
+        typ = str(row.get("type") or "").lower()
+        if typ == "text":
+            ch = _norm_chars(str(row.get("characters") or ""))
+            low = ch.lower()
+            if any(m in low for m in _DELIVERY_MARKERS):
+                return "subheadline_delivery_time"
+            cmp_age = ch.replace(" ", "")
+            if _AGE_BADGE_STRICT.match(cmp_age):
+                return "age_badge"
+            if any(m.lower() in low for m in _LEGAL_MARKERS):
+                return "legal_text"
+            try:
+                fs = float(row.get("fontSize") or 0)
+            except (TypeError, ValueError):
+                fs = 0.0
+            try:
+                th = float((row.get("bounds") or {}).get("height") or 0)
+            except (TypeError, ValueError):
+                th = 0.0
+            if fs >= 180.0 or th >= 500.0 or (fs >= 120.0 and len(ch) >= 12):
+                return "headline"
+            return "unassigned"
+        if _looks_like_abstract_background_overlay(row):
+            return "background_gradient"
+        if typ in ("rectangle", "vector"):
+            b = row.get("bounds") or {}
+            try:
+                nw = float(b.get("width") or 0)
+                nh = float(b.get("height") or 0)
+            except (TypeError, ValueError):
+                nw, nh = 0.0, 0.0
+            if frame_w > 0 and frame_h > 0 and nw > 0 and nh > 0:
+                s_frac = min(nw / frame_w, nh / frame_h)
+                l_frac = max(nw / frame_w, nh / frame_h)
+                if s_frac <= 0.14 and l_frac >= 0.25:
+                    return "background_gradient"
+            if typ == "rectangle" and not row.get("mid_child_ids"):
+                return "background_shape"
+        if typ == "vector":
+            return "background_shape"
+        return "unassigned"
+
+    for sid, row in mid_by_id.items():
+        nm = out.get(sid, "")
+        if not _is_disallowed_brand_name_outside_group(nm):
             continue
-        nm = out.get(sid, "").lower()
-        if nm != "image_zone" and nm != "background_gradient" and not re.fullmatch(
-            r"background_gradient_\d+", nm
-        ):
+        if _has_brand_group_semantic_ancestor(sid):
             continue
-        _force(out, sid, "hero_image", "rule10a_main_photo_rectangle_not_gradient")
+        repl = _replacement_for_stray_brand_name_outside_group(sid, row)
+        if out.get(sid, "") != repl:
+            _force(out, sid, repl, "rule11_brand_name_only_under_brand_group")
 
     # --- Rule 10t: text is never ``hero_image`` (recover headline / delivery / unassigned) ---
     for sid, row in mid_by_id.items():
@@ -2065,6 +2268,26 @@ def postprocess_semantic_names(
         if not _looks_like_abstract_background_overlay(row):
             continue
         _force(out, sid, "background_gradient", "rule10_image_zone_is_abstract_background_overlay")
+
+    # --- Rule 10b: narrow full-height / full-width side overlays are gradients, not solid background shapes ---
+    # This intentionally only targets strip-like overlays so broad vector color plates remain ``background_shape``.
+    for sid, row in mid_by_id.items():
+        nm = out.get(sid, "").lower()
+        if nm not in (
+            "background_shape",
+            "base_background",
+            "color_panel",
+            "gradient_shape",
+            "decoration_group",
+            "decoration",
+            "unassigned",
+        ):
+            continue
+        if _has_brand_or_headline_ancestor(sid) or _has_brand_group_semantic_ancestor(sid):
+            continue
+        if not _looks_like_narrow_side_gradient_strip(row):
+            continue
+        _force(out, sid, "background_gradient", "rule10b_narrow_side_overlay_to_gradient")
 
     _number_background_gradient_placeholders(out, "number_background_gradient_suffix")
     _normalize_background_gradient_siblings(

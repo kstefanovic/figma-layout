@@ -158,7 +158,15 @@
 
     <div class="row">
       <label for="backend-url">Backend URL</label>
-      <input id="backend-url" value="http://localhost:20401" />
+      <input id="backend-url" value="http://localhost:20198" />
+      <p style="font-size: 11px; color: #666; margin: 6px 0 0; line-height: 1.4">
+        Figma only allows origins listed in <code>v2/manifest.json</code> →
+        <code>networkAccess.devAllowedDomains</code> (exact match: scheme, host, port). Use
+        <code>http://localhost:20198</code> here if that is what the manifest lists — typing
+        <code>127.0.0.1</code> instead will fail fetch. For a backend on another host, add that exact
+        <code>http://…</code> URL to the manifest (some patterns are rejected on plugin import).
+        Reload the development plugin after changing the manifest.
+      </p>
     </div>
 
     <div class="row">
@@ -453,6 +461,71 @@ Select one or more frames, then click “JSON to HTML/CSS Exporter”. Each fram
       window.onmessage = (event) => {
         const msg = event.data.pluginMessage;
         if (!msg) return;
+
+        if (msg.type === "semantic-json-fetch") {
+          const mid = msg.id;
+          const reply = (payload) => {
+            parent.postMessage(
+              { pluginMessage: Object.assign({ type: "semantic-json-fetch-result", id: mid }, payload) },
+              "*",
+            );
+          };
+          (async () => {
+            try {
+              const b64ToU8 = (b64) => {
+                const bin = atob(String(b64 || ""));
+                const out = new Uint8Array(bin.length);
+                for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i) & 0xff;
+                return out;
+              };
+              const bannerBytes = b64ToU8(msg.bannerB64);
+              const gridBytes = b64ToU8(msg.gridB64);
+              const fd = new FormData();
+              fd.append("banner", new Blob([bannerBytes], { type: "image/png" }), "banner.png");
+              fd.append(
+                "raw_json",
+                new Blob([String(msg.rawJsonText || "")], { type: "application/json;charset=utf-8" }),
+                "raw.json",
+              );
+              fd.append("grid", new Blob([gridBytes], { type: "image/png" }), "elements.png");
+              fd.append("max_new_tokens", String(msg.maxNewTokens || 2048));
+              const base = String(msg.backendUrl || "")
+                .trim()
+                .replace(/\/+$/, "");
+              const res = await fetch(base + "/figma/convert-semantic-json", { method: "POST", body: fd });
+              const text = await res.text();
+              let body = null;
+              try {
+                body = text ? JSON.parse(text) : null;
+              } catch (_e) {
+                body = null;
+              }
+              if (!res.ok) {
+                const detail =
+                  body && body.detail != null
+                    ? typeof body.detail === "string"
+                      ? body.detail
+                      : JSON.stringify(body.detail)
+                    : text || "HTTP " + String(res.status);
+                reply({ ok: false, data: null, error: detail });
+                return;
+              }
+              if (!body || typeof body !== "object" || !("semantic_json" in body)) {
+                reply({ ok: false, data: null, error: "Backend response missing semantic_json." });
+                return;
+              }
+              reply({ ok: true, data: body, error: null });
+            } catch (e) {
+              let detail = e && e.message ? e.message : String(e);
+              if (detail === "Failed to fetch") {
+                detail +=
+                  " Figma only allows origins in manifest.json networkAccess (devAllowedDomains / allowedDomains). Match Backend URL exactly and reload the plugin.";
+              }
+              reply({ ok: false, data: null, error: detail });
+            }
+          })();
+          return;
+        }
 
         if (msg.type === "pipeline-busy") {
           setPipelineLoading(!!msg.busy);

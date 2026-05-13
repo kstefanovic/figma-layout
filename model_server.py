@@ -1,4 +1,5 @@
 import os
+import sys
 from typing import Any, Literal
 
 from dotenv import load_dotenv
@@ -6,7 +7,31 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Keep the model pinned to the configured GPU before torch initializes CUDA.
+
+def _consume_gpu_cli_args() -> None:
+    """Let `python model_server.py --gpu 1` override QWEN_GPU_DEVICE before torch imports."""
+    argv = sys.argv[1:]
+    kept: list[str] = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--gpu", "-g") and i + 1 < len(argv):
+            os.environ["QWEN_GPU_DEVICE"] = argv[i + 1]
+            i += 2
+            continue
+        if a.startswith("--gpu="):
+            os.environ["QWEN_GPU_DEVICE"] = a.partition("=")[2]
+            i += 1
+            continue
+        kept.append(a)
+        i += 1
+    sys.argv[1:] = kept
+
+
+_consume_gpu_cli_args()
+
+# Physical GPU index(es) on the host (comma-separated allowed). Sets CUDA_VISIBLE_DEVICES
+# before torch initializes CUDA so the process only sees those device(s) as cuda:0, cuda:1, …
 GPU_DEVICE = os.getenv("QWEN_GPU_DEVICE", "0")
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", GPU_DEVICE)
 
@@ -20,7 +45,15 @@ from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 MODEL_PATH = os.getenv("QWEN_MODEL_PATH", "./Qwen2.5-VL-7B-Instruct")
 HOST = os.getenv("QWEN_HOST", "127.0.0.1")
 PORT = int(os.getenv("QWEN_PORT", "20400"))
-DEVICE = os.getenv("QWEN_DEVICE", "cuda:0" if torch.cuda.is_available() else "cpu")
+
+_explicit_device = os.getenv("QWEN_DEVICE", "").strip()
+if _explicit_device:
+    DEVICE = _explicit_device
+elif torch.cuda.is_available():
+    # After CUDA_VISIBLE_DEVICES masking, the first visible GPU is always cuda:0 here.
+    DEVICE = "cuda:0"
+else:
+    DEVICE = "cpu"
 
 
 class ContentItem(BaseModel):
@@ -77,6 +110,7 @@ def health() -> dict[str, str]:
         "status": "ok" if model is not None and processor is not None else "loading",
         "model_path": MODEL_PATH,
         "device": _device(),
+        "qwen_gpu_device": GPU_DEVICE,
         "cuda_visible_devices": os.getenv("CUDA_VISIBLE_DEVICES", ""),
     }
 
