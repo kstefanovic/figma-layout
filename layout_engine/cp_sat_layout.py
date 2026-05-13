@@ -15,10 +15,10 @@ def abs_diff(model, value, target, name):
 
 def make_vars(model, role: str, allow_overflow: bool = False):
     if allow_overflow:
-        x = model.NewIntVar(-250, 1250, f"{role}_x")
-        y = model.NewIntVar(-250, 1250, f"{role}_y")
-        w = model.NewIntVar(20, 1500, f"{role}_w")
-        h = model.NewIntVar(20, 1500, f"{role}_h")
+        x = model.NewIntVar(-1000, 2000, f"{role}_x")
+        y = model.NewIntVar(-1000, 2000, f"{role}_y")
+        w = model.NewIntVar(20, 2500, f"{role}_w")
+        h = model.NewIntVar(20, 2500, f"{role}_h")
     else:
         x = model.NewIntVar(0, SCALE, f"{role}_x")
         y = model.NewIntVar(0, SCALE, f"{role}_y")
@@ -43,18 +43,26 @@ def clamp_int(v, lo, hi):
     return max(lo, min(hi, int(v)))
 
 
-def add_prior_objective_terms(model, role, box, prior):
-    tx = clamp_int(prior["x"] * SCALE, -250, 1250)
-    ty = clamp_int(prior["y"] * SCALE, -250, 1250)
-    tw = clamp_int(prior["w"] * SCALE, 20, 1500)
-    th = clamp_int(prior["h"] * SCALE, 20, 1500)
+def add_prior_objective_terms(model, role, box, prior, weight: int = 1):
+    tx = clamp_int(prior["x"] * SCALE, -1000, 2000)
+    ty = clamp_int(prior["y"] * SCALE, -1000, 2000)
+    tw = clamp_int(prior["w"] * SCALE, 20, 2500)
+    th = clamp_int(prior["h"] * SCALE, 20, 2500)
 
-    return [
+    terms = [
         abs_diff(model, box["x"], tx, f"{role}_x"),
         abs_diff(model, box["y"], ty, f"{role}_y"),
         abs_diff(model, box["w"], tw, f"{role}_w"),
         abs_diff(model, box["h"], th, f"{role}_h"),
     ]
+    return terms * max(1, int(weight))
+
+
+def add_locked_prior_constraints(model, box, prior):
+    model.Add(box["x"] == clamp_int(prior["x"] * SCALE, -1000, 2000))
+    model.Add(box["y"] == clamp_int(prior["y"] * SCALE, -1000, 2000))
+    model.Add(box["w"] == clamp_int(prior["w"] * SCALE, 20, 2500))
+    model.Add(box["h"] == clamp_int(prior["h"] * SCALE, 20, 2500))
 
 
 def solve_layout(
@@ -62,9 +70,13 @@ def solve_layout(
     target_w: int,
     target_h: int,
     available_roles: set,
+    learned_priors: dict | None = None,
+    locked_roles: set | None = None,
 ):
     model = cp_model.CpModel()
-    priors = DEFAULT_PRIORS[orientation]
+    priors = dict(DEFAULT_PRIORS[orientation])
+    priors.update(learned_priors or {})
+    locked_roles = locked_roles or set()
 
     role_order = [
         "background",
@@ -98,8 +110,15 @@ def solve_layout(
 
     if "hero_image" in vars_by_role:
         hero = vars_by_role["hero_image"]
-        model.Add(hero["w"] >= 250)
-        model.Add(hero["h"] >= 250)
+        if "hero_image" not in locked_roles:
+            model.Add(hero["w"] >= 250)
+            model.Add(hero["h"] >= 250)
+
+    for role in locked_roles:
+        prior = priors.get(role)
+        box = vars_by_role.get(role)
+        if prior and box:
+            add_locked_prior_constraints(model, box, prior)
 
     if "legal_text" in vars_by_role:
         legal = vars_by_role["legal_text"]
@@ -148,7 +167,10 @@ def solve_layout(
         prior = priors.get(role)
         if not prior:
             continue
-        objective_terms.extend(add_prior_objective_terms(model, role, box, prior))
+        weight = 1
+        if learned_priors and role in learned_priors:
+            weight = 4
+        objective_terms.extend(add_prior_objective_terms(model, role, box, prior, weight=weight))
 
     if objective_terms:
         model.Minimize(sum(objective_terms))

@@ -7,3 +7,9 @@ raw_jsons/
 json_embeddings/
 runs/
 layout_engine/input_json/
+tmp/*.json
+gnn_layout/*.json
+gnn_layout/*.pt
+gnn_layout/*.jsonl
+
+gnn_layout/data/

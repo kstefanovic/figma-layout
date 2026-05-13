@@ -172,7 +172,8 @@ subheadline_weight, subheadline_product_name, subheadline_discount, product_name
 legal_text_group, legal_text,
 age_badge_group, age_badge,
 
-price_group, current_price, old_price, currency_symbol,
+offer_group, price_group, price_value, current_price, old_price_group, old_price, currency_symbol,
+old_price_strikethrough_1, old_price_strikethrough_2,
 discount_badge_group, discount_badge, discount_text,
 
 hero_group, image_zone, hero_image, person_image,
@@ -230,9 +231,13 @@ Do NOT classify headline or delivery promise as legal text.
 Age badge is NOT price, discount, or legal text.
 
 6. Price / discount:
-- Dominant price: `current_price`.
+- A product/offer block that combines product title + current price + optional old price is `offer_group`.
+- Price wrapper around main price parts is `price_group`.
+- Dominant price digits: `price_value` (preferred) or `current_price`.
 - Crossed/secondary price: `old_price`.
+- Old-price wrapper with the crossed price and lines: `old_price_group`.
 - ₽/$ if separate: `currency_symbol`.
+- Crossing line(s) through old price: `old_price_strikethrough_1`, `old_price_strikethrough_2`.
 - Discount badge shape: `discount_badge`.
 - Discount text like `-52%`: `discount_text`.
 
@@ -279,6 +284,8 @@ For flattened mid_json:
 - a wrapper containing headline + delivery text is headline_group
 - a compact vector row with brand word parts + logo parts is brand_group
 - compact brand vectors are never hero_group
+- a huge background/product/decorative shape cluster is never brand_group even if the VLM guessed brand names
+- a product name + price + currency + old price cluster is offer_group / price_group, not headline_group
 - delivery phrases like "с доставкой от 15 минут" are subheadline_delivery_time
 
 PRIORITY:
@@ -1443,6 +1450,99 @@ def postprocess_semantic_names(
                     stack.append(cs)
         return False
 
+    def _direct_child_ids(sid: str) -> list[str]:
+        row = mid_by_id.get(sid)
+        if not row:
+            return []
+        return [str(c) for c in (row.get("mid_child_ids") or []) if str(c) in mid_by_id]
+
+    def _descendant_ids(sid: str) -> list[str]:
+        out_ids: list[str] = []
+        stack = _direct_child_ids(sid)
+        seen: set[str] = set()
+        while stack:
+            cur = stack.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            out_ids.append(cur)
+            stack.extend(_direct_child_ids(cur))
+        return out_ids
+
+    def _text_chars(sid: str) -> str:
+        row = mid_by_id.get(sid) or {}
+        return _norm_chars(str(row.get("characters") or ""))
+
+    def _text_font_size_id(sid: str) -> float:
+        row = mid_by_id.get(sid) or {}
+        try:
+            return float(row.get("fontSize") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _looks_currency_text(chars: str) -> bool:
+        return chars.strip() in {"₽", "$", "€", "¥", "₸", "₴", "£"}
+
+    def _looks_price_number_text(chars: str) -> bool:
+        compact = re.sub(r"[\s\u00A0]", "", chars or "")
+        if not compact or "%" in compact:
+            return False
+        if compact.startswith("-"):
+            return False
+        return bool(re.fullmatch(r"\d{2,5}(?:[.,]\d{1,2})?", compact))
+
+    def _looks_product_name_text(chars: str) -> bool:
+        low = (chars or "").lower()
+        if not chars or _looks_currency_text(chars) or _looks_price_number_text(chars):
+            return False
+        if any(m in low for m in _DELIVERY_MARKERS):
+            return False
+        if any(m.lower() in low for m in _LEGAL_MARKERS):
+            return False
+        return bool(re.search(r"[A-Za-zА-Яа-яЁё]", chars))
+
+    def _looks_old_price_group(sid: str) -> bool:
+        row = mid_by_id.get(sid)
+        if not row or _normalize_figma_type(row) not in ("group", "frame", "instance"):
+            return False
+        direct = _direct_child_ids(sid)
+        line_ids = [cid for cid in direct if _normalize_figma_type(mid_by_id[cid]) == "line"]
+        text_ids = [cid for cid in direct if _normalize_figma_type(mid_by_id[cid]) == "text"]
+        if not line_ids or not text_ids:
+            return False
+        return any(_looks_price_number_text(_text_chars(tid)) for tid in text_ids)
+
+    def _looks_price_group(sid: str) -> bool:
+        row = mid_by_id.get(sid)
+        if not row or _normalize_figma_type(row) not in ("group", "frame", "instance"):
+            return False
+        direct = _direct_child_ids(sid)
+        direct_names = [out.get(cid, "").lower() for cid in direct]
+        has_currency = any(
+            _normalize_figma_type(mid_by_id[cid]) == "text" and _looks_currency_text(_text_chars(cid))
+            for cid in direct
+        ) or "currency_symbol" in direct_names
+        has_old = any(_looks_old_price_group(cid) or out.get(cid, "").lower() == "old_price_group" for cid in direct)
+        price_text_ids = [
+            cid
+            for cid in direct
+            if _normalize_figma_type(mid_by_id[cid]) == "text" and _looks_price_number_text(_text_chars(cid))
+        ]
+        return bool(has_currency and price_text_ids) or bool(has_old and price_text_ids)
+
+    def _looks_offer_group(sid: str) -> bool:
+        row = mid_by_id.get(sid)
+        if not row or _normalize_figma_type(row) not in ("group", "frame", "instance"):
+            return False
+        direct = _direct_child_ids(sid)
+        has_price = any(_looks_price_group(cid) or out.get(cid, "").lower() == "price_group" for cid in direct)
+        if not has_price:
+            return False
+        return any(
+            _normalize_figma_type(mid_by_id[cid]) == "text" and _looks_product_name_text(_text_chars(cid))
+            for cid in _descendant_ids(sid)
+        )
+
     # --- Rule 5 + user rule 2 (early): compact brand row is always ``brand_group`` ---
     # VLM may output image_zone / background_gradient / unassigned here; do not gate on forbidden parents only.
     for sid, row in mid_by_id.items():
@@ -1512,6 +1612,65 @@ def postprocess_semantic_names(
                 _force(out, tid, "headline", "rule3f_primary_marketing_line_under_headline_group")
             else:
                 _force(out, tid, "subheadline", "rule3f_secondary_marketing_line_under_headline_group")
+
+    # --- Rule 3g/3h: product + price offer blocks override generic headline/subheadline guesses ---
+    for sid, row in mid_by_id.items():
+        if not _looks_old_price_group(sid):
+            continue
+        _force(out, sid, "old_price_group", "rule3g_old_price_group_detected")
+        line_ids = [cid for cid in _direct_child_ids(sid) if _normalize_figma_type(mid_by_id[cid]) == "line"]
+        text_ids = [cid for cid in _direct_child_ids(sid) if _normalize_figma_type(mid_by_id[cid]) == "text"]
+        text_ids.sort(key=lambda tid: -_text_font_size_id(tid))
+        if text_ids:
+            _force(out, text_ids[0], "old_price", "rule3g_old_price_text_in_old_price_group")
+        line_ids.sort(
+            key=lambda cid: (
+                float((mid_by_id[cid].get("bounds") or {}).get("y") or 0),
+                float((mid_by_id[cid].get("bounds") or {}).get("x") or 0),
+            )
+        )
+        if len(line_ids) >= 1:
+            _force(out, line_ids[0], "old_price_strikethrough_1", "rule3g_old_price_strikethrough_first")
+        if len(line_ids) >= 2:
+            _force(out, line_ids[1], "old_price_strikethrough_2", "rule3g_old_price_strikethrough_second")
+
+    for sid, row in mid_by_id.items():
+        if not _looks_price_group(sid):
+            continue
+        _force(out, sid, "price_group", "rule3h_price_group_detected")
+        text_ids = [cid for cid in _direct_child_ids(sid) if _normalize_figma_type(mid_by_id[cid]) == "text"]
+        numeric_ids = [cid for cid in text_ids if _looks_price_number_text(_text_chars(cid))]
+        currency_ids = [cid for cid in text_ids if _looks_currency_text(_text_chars(cid))]
+        numeric_ids.sort(key=lambda tid: -_text_font_size_id(tid))
+        for cid in currency_ids:
+            _force(out, cid, "currency_symbol", "rule3h_currency_symbol_in_price_group")
+        if numeric_ids:
+            _force(out, numeric_ids[0], "price_value", "rule3h_primary_price_value_in_price_group")
+
+    for sid, row in mid_by_id.items():
+        if not _looks_offer_group(sid):
+            continue
+        _force(out, sid, "offer_group", "rule3i_offer_group_detected")
+        for cid in _descendant_ids(sid):
+            crow = mid_by_id[cid]
+            ctype = _normalize_figma_type(crow)
+            if ctype == "text":
+                chars = _text_chars(cid)
+                if _looks_currency_text(chars):
+                    _force(out, cid, "currency_symbol", "rule3i_currency_in_offer_group")
+                elif _looks_price_number_text(chars):
+                    parent_ids = crow.get("mid_parent_ids") or []
+                    parent_sid = str(parent_ids[-1]) if parent_ids else ""
+                    if parent_sid and out.get(parent_sid, "").lower() == "old_price_group":
+                        _force(out, cid, "old_price", "rule3i_old_price_in_offer_group")
+                    else:
+                        _force(out, cid, "price_value", "rule3i_price_value_in_offer_group")
+                elif _looks_product_name_text(chars):
+                    _force(out, cid, "product_name", "rule3i_product_name_in_offer_group")
+            elif _looks_price_group(cid):
+                _force(out, cid, "price_group", "rule3i_price_group_inside_offer_group")
+            elif _looks_old_price_group(cid):
+                _force(out, cid, "old_price_group", "rule3i_old_price_group_inside_offer_group")
 
     # --- Rule 3b/3c: legal / age wrapper groups (not root) ---
     for sid, row in mid_by_id.items():
@@ -1883,6 +2042,51 @@ def postprocess_semantic_names(
         near_top_bottom = y0 <= 0.03 * frame_h or y0 + nh >= 0.97 * frame_h
         return min(wr, hr) <= 0.16 and max(wr, hr) >= 0.72 and (near_side or near_top_bottom)
 
+    def _path_sort_key(sid: str) -> tuple[tuple[int, ...], str]:
+        raw = str((mid_by_id.get(sid) or {}).get("path") or "")
+        parts: list[int] = []
+        for p in raw.split("/"):
+            if not p:
+                continue
+            try:
+                parts.append(int(p))
+            except ValueError:
+                parts.append(10_000_000)
+        return (tuple(parts), sid)
+
+    def _looks_like_photo_asset_name(row: dict[str, Any]) -> bool:
+        raw = str(row.get("name") or "").strip().lower()
+        if not raw:
+            return False
+        if raw.isdigit() or raw.startswith("group ") or raw.startswith("star "):
+            return False
+        photo_words = (
+            "photo",
+            "image",
+            "img",
+            "picture",
+            "product",
+            "packshot",
+            "person",
+            "model",
+            "hero",
+            "фото",
+            "изображ",
+            "продукт",
+            "товар",
+            "упаков",
+            "персон",
+            "человек",
+            "лимонад",
+        )
+        if any(w in raw for w in photo_words):
+            return True
+        if re.search(r"\.(png|jpe?g|webp|avif|tiff?|psd)\b", raw):
+            return True
+        if "_" in raw and re.search(r"\d{1,2}[._-]\d{1,2}[._-]\d{2,4}", raw):
+            return True
+        return False
+
     def _zone_type_has_image_hint(row: dict[str, Any]) -> bool:
         for key in ("zone_type", "zoneType", "semantic_zone", "semanticZone"):
             raw = row.get(key)
@@ -1902,8 +2106,8 @@ def postprocess_semantic_names(
             return True
         return any(out.get(sid, "").lower() in ("image_zone", "hero_image", "person_image") for sid in mid_by_id)
 
-    def _hero_photo_rectangle_candidates() -> list[tuple[float, float, str]]:
-        candidates: list[tuple[float, float, str]] = []
+    def _hero_photo_rectangle_candidates() -> list[tuple[int, float, float, str]]:
+        candidates: list[tuple[int, float, float, str]] = []
         for sid, row in mid_by_id.items():
             if str(row.get("type") or "").lower() != "rectangle" or row.get("mid_child_ids"):
                 continue
@@ -1913,8 +2117,9 @@ def postprocess_semantic_names(
                 continue
             area = _bounds_area(row.get("bounds"))
             cov = _rectangle_frame_coverage_ratio(row)
-            candidates.append((cov, area, sid))
-        candidates.sort(key=lambda t: (-t[0], -t[1], t[2]))
+            asset_rank = 1 if _looks_like_photo_asset_name(row) else 0
+            candidates.append((asset_rank, cov, area, sid))
+        candidates.sort(key=lambda t: (-t[0], -t[1], -t[2], t[3]))
         return candidates
 
     def _promote_hero_photo_rectangles(reason: str) -> int:
@@ -1930,7 +2135,7 @@ def postprocess_semantic_names(
             "color_panel",
             "gradient_shape",
         }
-        for _cov, _area, sid in _hero_photo_rectangle_candidates():
+        for _asset_rank, _cov, _area, sid in _hero_photo_rectangle_candidates():
             nm = out.get(sid, "").lower()
             if (
                 nm in protected_from
@@ -1948,13 +2153,7 @@ def postprocess_semantic_names(
             m = re.fullmatch(r"background_gradient_(\d+)", out.get(sid, "").lower())
             if m:
                 used.add(int(m.group(1)))
-        pending.sort(
-            key=lambda s: (
-                float((mid_by_id[s].get("bounds") or {}).get("y") or 0),
-                float((mid_by_id[s].get("bounds") or {}).get("x") or 0),
-                s,
-            )
-        )
+        pending.sort(key=_path_sort_key)
         next_i = 1
         for sid in pending:
             while next_i in used:
@@ -1984,7 +2183,7 @@ def postprocess_semantic_names(
             if not _is_background_gradient_slot_name(out.get(sid, "")):
                 continue
             typ = str(row.get("type") or "").lower()
-            if typ not in ("rectangle", "vector"):
+            if typ not in ("rectangle", "vector", "ellipse"):
                 continue
             if typ == "rectangle" and row.get("mid_child_ids"):
                 continue
@@ -1992,33 +2191,11 @@ def postprocess_semantic_names(
         for _pid, sids in by_parent.items():
             if not sids:
                 continue
-            seen_slots: set[int] = set()
-            needs_slot: list[str] = []
+            sids.sort(key=_path_sort_key)
             for sid in sids:
-                m = re.fullmatch(r"background_gradient_(\d+)", out.get(sid, "").lower())
-                if not m:
-                    needs_slot.append(sid)
-                    continue
-                slot = int(m.group(1))
-                if slot in seen_slots:
-                    needs_slot.append(sid)
-                    continue
-                seen_slots.add(slot)
-            needs_slot.sort(
-                key=lambda s: (
-                    float((mid_by_id[s].get("bounds") or {}).get("y") or 0),
-                    float((mid_by_id[s].get("bounds") or {}).get("x") or 0),
-                    s,
-                )
-            )
-            next_i = 1
-            for sid in needs_slot:
-                while next_i in seen_slots:
-                    next_i += 1
-                want = f"background_gradient_{next_i}"
+                want = f"background_gradient_{sids.index(sid) + 1}"
                 if out.get(sid, "").lower() != want:
                     _force(out, sid, want, reason)
-                seen_slots.add(next_i)
 
     # --- User rule 1: large leaf rectangle cannot be brand_group / brand_name_* ---
     for sid, row in mid_by_id.items():
@@ -2061,6 +2238,19 @@ def postprocess_semantic_names(
             continue
         if out.get(sid, "").lower() != "brand_group":
             _force(out, sid, "brand_group", "rule8_compact_brand_strip_wrong_container_role")
+
+    # --- Rule 8b: keep only real compact brand rows; downgrade huge false brand groups ---
+    for sid, row in mid_by_id.items():
+        if out.get(sid, "").lower() != "brand_group":
+            continue
+        if _is_compact_vector_brand_row(sid):
+            continue
+        area = _bounds_area(row.get("bounds"))
+        area_ratio = area / frame_area if frame_area > 0 else 0.0
+        typ = _normalize_figma_type(row)
+        replacement = "background_group" if typ in ("group", "frame", "instance") else "background_shape"
+        if area_ratio >= 0.10 or _has_text_descendant(sid) is False:
+            _force(out, sid, replacement, "rule8b_false_brand_group_downgraded")
 
     # --- Rule 9: logo_back / logo_fore only under a semantic ``logo`` ancestor ---
     def _has_semantic_logo_ancestor(sid: str) -> bool:
@@ -2141,10 +2331,20 @@ def postprocess_semantic_names(
     if _has_any_image_zone_hint() and not any(out.get(s, "").lower() == "hero_image" for s in mid_by_id):
         candidates = _hero_photo_rectangle_candidates()
         if candidates:
-            _force(out, candidates[0][2], "hero_image", "rule10a_no_hero_promote_largest_image_zone_rectangle")
+            _force(out, candidates[0][3], "hero_image", "rule10a_no_hero_promote_largest_image_zone_rectangle")
+
+    def _secondary_hero_replacement(row: dict[str, Any]) -> str:
+        if _looks_like_abstract_background_overlay(row) or _looks_like_narrow_side_gradient_strip(row):
+            return "background_gradient"
+        if _looks_like_photo_asset_name(row):
+            return "image_zone"
+        typ = str(row.get("type") or "").lower()
+        if typ in ("rectangle", "vector") and not row.get("mid_child_ids"):
+            return "background_shape"
+        return "image_zone"
 
     # --- Rule 10a-dedupe: at most one dominant ``hero_image`` among leaf rectangles (wide DOOH may yield two passes) ---
-    hero_leaf_rects: list[tuple[float, str]] = []
+    hero_leaf_rects: list[tuple[int, float, float, str]] = []
     for sid, row in mid_by_id.items():
         if str(row.get("type") or "").lower() != "rectangle" or row.get("mid_child_ids"):
             continue
@@ -2152,16 +2352,19 @@ def postprocess_semantic_names(
             continue
         if _has_brand_group_semantic_ancestor(sid):
             continue
-        hero_leaf_rects.append((_rectangle_frame_coverage_ratio(row), sid))
-    if len(hero_leaf_rects) > 1:
-        hero_leaf_rects.sort(key=lambda t: (-t[0], t[1]))
-        for _cov, sid in hero_leaf_rects[1:]:
-            row = mid_by_id[sid]
-            repl = (
-                "background_gradient"
-                if _looks_like_abstract_background_overlay(row)
-                else "image_zone"
+        hero_leaf_rects.append(
+            (
+                1 if _looks_like_photo_asset_name(row) else 0,
+                _rectangle_frame_coverage_ratio(row),
+                _bounds_area(row.get("bounds")),
+                sid,
             )
+        )
+    if len(hero_leaf_rects) > 1:
+        hero_leaf_rects.sort(key=lambda t: (-t[0], -t[1], -t[2], t[3]))
+        for _asset_rank, _cov, _area, sid in hero_leaf_rects[1:]:
+            row = mid_by_id[sid]
+            repl = _secondary_hero_replacement(row)
             _force(out, sid, repl, "rule10a_dedupe_secondary_hero_leaf_rectangle")
 
     # --- Rule 11: ``brand_name*`` only under semantic ``brand_group`` (VLM spill onto strips / hero plate) ---
@@ -2195,7 +2398,7 @@ def postprocess_semantic_names(
             return "unassigned"
         if _looks_like_abstract_background_overlay(row):
             return "background_gradient"
-        if typ in ("rectangle", "vector"):
+        if typ in ("rectangle", "vector", "ellipse"):
             b = row.get("bounds") or {}
             try:
                 nw = float(b.get("width") or 0)
@@ -2207,7 +2410,7 @@ def postprocess_semantic_names(
                 l_frac = max(nw / frame_w, nh / frame_h)
                 if s_frac <= 0.14 and l_frac >= 0.25:
                     return "background_gradient"
-            if typ == "rectangle" and not row.get("mid_child_ids"):
+            if typ in ("rectangle", "ellipse") and not row.get("mid_child_ids"):
                 return "background_shape"
         if typ == "vector":
             return "background_shape"
@@ -2222,6 +2425,28 @@ def postprocess_semantic_names(
         repl = _replacement_for_stray_brand_name_outside_group(sid, row)
         if out.get(sid, "") != repl:
             _force(out, sid, repl, "rule11_brand_name_only_under_brand_group")
+
+    # --- Rule 11b: children inside downgraded false brand groups are background/decorative, not hero/brand ---
+    for sid, row in mid_by_id.items():
+        parent_ids = row.get("mid_parent_ids") or []
+        pid = str(parent_ids[-1]) if parent_ids else ""
+        if not pid or out.get(pid, "").lower() != "background_group":
+            continue
+        typ = _normalize_figma_type(row)
+        if typ not in ("rectangle", "vector", "ellipse", "group", "frame"):
+            continue
+        nm = out.get(sid, "").lower()
+        if not (
+            nm.startswith("brand_name")
+            or nm == "brand_group"
+            or nm == "hero_image"
+            or nm == "image_zone"
+        ):
+            continue
+        if _has_text_descendant(sid):
+            continue
+        repl = "background_shape" if typ in ("rectangle", "vector", "ellipse") else "decoration_group"
+        _force(out, sid, repl, "rule11b_false_brand_child_to_background")
 
     # --- Rule 10t: text is never ``hero_image`` (recover headline / delivery / unassigned) ---
     for sid, row in mid_by_id.items():

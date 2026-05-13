@@ -22,6 +22,15 @@ def predict_priors(
     target_height: float,
 ) -> dict[str, Any]:
     source = load_banner(Path(source_path))
+    return predict_priors_for_banner(checkpoint_path, source, target_width, target_height)
+
+
+def predict_priors_for_banner(
+    checkpoint_path: str | Path,
+    source: dict[str, Any],
+    target_width: float,
+    target_height: float,
+) -> dict[str, Any]:
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     config = checkpoint.get("config", {})
     model = GNNLayoutPredictor(
@@ -46,14 +55,21 @@ def predict_priors(
     with torch.no_grad():
         pred = model(data).detach().cpu().view(NUM_ROLES, 4).numpy()
 
+    target_roles = [str(r) for r in config.get("target_roles") or [] if str(r) in set(IDX_TO_ROLE.values())]
+    if not target_roles:
+        target_roles = [IDX_TO_ROLE[idx] for idx in sorted(IDX_TO_ROLE)]
+
     priors: dict[str, dict[str, float]] = {}
     for idx, role in IDX_TO_ROLE.items():
+        if role not in target_roles:
+            continue
         x, y, w, h = [float(v) for v in pred[idx]]
         priors[role] = {"x": x, "y": y, "w": w, "h": h, "confidence": 1.0}
     return {
         "orientation": orientation,
         "target_width": int(round(float(target_width))),
         "target_height": int(round(float(target_height))),
+        "target_roles": target_roles,
         "priors": priors,
     }
 

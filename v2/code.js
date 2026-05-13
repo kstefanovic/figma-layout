@@ -1,6 +1,6 @@
 /**
  * Figma plugin main thread. Flows:
- * - ``POST …/pipeline/banner-raw-to-target-json-json`` — banner + raw JSON + target size → layout clone.
+ * - ``POST …/pipeline/banner-raw-to-target-json-json`` — banner + raw JSON + target size → classify into class 1..6, retrieve best template in that class, return target JSON; plugin draws clone beside the source.
  * - ``POST …/layout-engine/convert`` — serialized frame JSON + target size → ``layout_engine.convert`` CP-SAT output; plugin clones beside the original and applies returned ``final_json``.
  * - ``POST …/figma/convert-semantic-json`` — banner + grid PNG + raw JSON → Qwen (multipart sent from the plugin UI iframe with ``FormData``, same as ``frontend/figma.html``); server merges ``{names:{id:…}}`` into full semantic JSON; main thread clones beside the original, reparents to match JSON hierarchy, then renames from that JSON.
  * - HTML/CSS export from serialized JSON + assets (local).
@@ -1614,6 +1614,41 @@ function applyJsonTreeNamesByPath(jsonTree, cloneRoot) {
   return { renamed, stamped, missing, zeroSizeRemoved: zeroSizeReport.removed };
 }
 
+function applyExactNodeNamesFromJson(jsonTree, cloneRoot) {
+  const { map: byId } = collectClonedNodesByOriginalId(cloneRoot);
+  const pathNodeMap = buildPathNodeMap(cloneRoot);
+  let renamed = 0;
+  const missing = [];
+
+  function resolve(item, path) {
+    if (!item || typeof item !== "object") return null;
+    const id = String(item.id || "").trim();
+    if (id && byId.has(id)) return byId.get(id);
+    if (path && pathNodeMap.has(path)) return pathNodeMap.get(path);
+    if (!path) return cloneRoot;
+    return null;
+  }
+
+  function walk(item, path) {
+    if (!item || typeof item !== "object") return;
+    const node = resolve(item, path);
+    const wantedName = String(item.name || "").trim();
+    if (node && wantedName) {
+      if (applySemanticNameToFigmaNode(node, wantedName)) renamed++;
+    } else if (!node && (item.id || path)) {
+      missing.push(String(item.id || path));
+    }
+    const children = Array.isArray(item.children) ? item.children : [];
+    for (let i = 0; i < children.length; i++) {
+      const childPath = path ? `${path}/${i}` : String(i);
+      walk(children[i], childPath);
+    }
+  }
+
+  walk(jsonTree, "");
+  return { renamed, missing };
+}
+
 /**
  * Index backend ``final_json`` / ``semantic_json`` by stable **source** ids and ``path`` (never clone ids).
  * Values are the JSON objects so callers can read ``.name``.
@@ -1832,6 +1867,9 @@ async function callBannerRawTargetPipeline(backendUrl, bannerPngBase64, rawJson,
     throw new Error(`Pipeline backend failed: ${detail}`);
   }
   if (!data || typeof data !== "object" || !data.final_json) {
+    if (data && typeof data === "object" && data.supported === false && Number(data.category) === -1) {
+      return data;
+    }
     throw new Error("Pipeline backend returned invalid JSON or missing final_json.");
   }
   return data;
@@ -1848,6 +1886,8 @@ async function callLayoutEngineConvert(backendUrl, rawJson, targetResolution) {
       target_width: targetResolution.width,
       target_height: targetResolution.height,
       target_resolution: `${targetResolution.width}x${targetResolution.height}`,
+      visual_mode: "retrieval",
+      visual_retrieval_top_k: 15,
     }),
   });
   const text = await response.text();
@@ -2112,6 +2152,94 @@ function applyPredictedJsonToClone(predictedJson, convertedFrame) {
   }
 
   walk(predictedJson, true);
+  return { applied, missing };
+}
+
+async function applyFinalJsonContentToClone(finalJson, convertedFrame) {
+  const { map: nodeByOriginalId } = collectClonedNodesByOriginalId(convertedFrame);
+  const pathNodeMap = buildPathNodeMap(convertedFrame);
+  let applied = 0;
+  const missing = [];
+
+  function resolve(item, isRoot) {
+    if (!item || typeof item !== "object") return null;
+    if (isRoot) return convertedFrame;
+    const id = String(item.id || "").trim();
+    const path = String(item.path || "").trim();
+    if (id && nodeByOriginalId.has(id)) return nodeByOriginalId.get(id);
+    if (path && pathNodeMap.has(path)) return pathNodeMap.get(path);
+    return null;
+  }
+
+  async function tryLoadFont(fontName) {
+    if (!fontName || typeof fontName !== "object") return false;
+    if (!fontName.family || !fontName.style) return false;
+    try {
+      await figma.loadFontAsync({ family: String(fontName.family), style: String(fontName.style) });
+      return true;
+    } catch (e) {
+      console.warn("applyFinalJsonContentToClone: loadFontAsync failed", fontName, e);
+      return false;
+    }
+  }
+
+  async function walk(item, isRoot) {
+    if (!item || typeof item !== "object") return;
+    const node = resolve(item, isRoot);
+    if (!node) {
+      if (item.id || item.path) missing.push(String(item.id || item.path));
+      return;
+    }
+
+    if (typeof item.visible === "boolean") {
+      node.visible = item.visible;
+      applied++;
+    }
+    if (typeof item.opacity === "number" && Number.isFinite(item.opacity)) {
+      try {
+        node.opacity = item.opacity;
+        applied++;
+      } catch (_e) {
+        /* some nodes may reject opacity updates */
+      }
+    }
+
+    if ("characters" in item && "characters" in node) {
+      const fontLoaded = await tryLoadFont(item.fontName);
+      if (fontLoaded && item.fontName && typeof item.fontName === "object") {
+        try {
+          node.fontName = {
+            family: String(item.fontName.family),
+            style: String(item.fontName.style),
+          };
+        } catch (e) {
+          console.warn("applyFinalJsonContentToClone: fontName apply failed", node && node.name, e);
+        }
+      }
+      try {
+        node.characters = String(item.characters || "");
+        if (typeof item.fontSize === "number" && Number.isFinite(item.fontSize)) {
+          node.fontSize = Math.max(1, item.fontSize);
+        }
+        if (item.textAlignHorizontal) {
+          node.textAlignHorizontal = item.textAlignHorizontal;
+        }
+        if (item.textAlignVertical) {
+          node.textAlignVertical = item.textAlignVertical;
+        }
+        applied++;
+      } catch (e) {
+        console.warn("applyFinalJsonContentToClone: text content apply failed", node && node.name, e);
+      }
+    }
+
+    const children = Array.isArray(item.children) ? item.children : [];
+    for (const child of children) {
+      await walk(child, false);
+    }
+  }
+
+  await walk(finalJson, true);
   return { applied, missing };
 }
 
@@ -2846,7 +2974,7 @@ figma.ui.onmessage = async (msg) => {
     const frames = collectFrameNodesFromSelection(selection);
     if (frames.length === 0) {
       figma.ui.postMessage({ type: "pipeline-busy", busy: false });
-      postError("Select one or more frames (only FRAME nodes run the pipeline).");
+      postError("Select one or more frames to run the banner classify → retrieve → draw pipeline.");
       sendSelectionInfo();
       return;
     }
@@ -2869,20 +2997,20 @@ figma.ui.onmessage = async (msg) => {
         try {
           figma.currentPage.selection = [selectedFrame];
           const targetResolution = parseTargetSize(msg.targetSize, selectedFrame);
-          postStatus(`Pipeline (${pi + 1}/${frames.length}): stamping… ${selectedFrame.name}`);
+          postStatus(`Pipeline (${pi + 1}/${frames.length}): preparing source frame… ${selectedFrame.name}`);
           const stampedNodeCount = stampOriginalNodeIds(selectedFrame);
 
-          postStatus("Pipeline: serializing selected Figma design...");
+          postStatus("Pipeline: serializing selected frame JSON...");
           const origin = getOrigin(selectedFrame);
           const rawJson = serializeNode(selectedFrame, origin, "");
           rawJson.templateId = "figma_plugin_pipeline_source";
 
-          postStatus("Pipeline: exporting banner PNG...");
+          postStatus("Pipeline: exporting banner PNG for Qwen classification...");
           const pngBytes = await exportFramePngBytes(selectedFrame);
           const pngBase64 = uint8ToBase64(pngBytes);
 
           postStatus(
-            `Pipeline (${pi + 1}/${frames.length}): calling backend for ${targetResolution.width}×${targetResolution.height} target JSON...`,
+            `Pipeline (${pi + 1}/${frames.length}): backend classify → retrieve for ${targetResolution.width}×${targetResolution.height}...`,
           );
           const result = await callBannerRawTargetPipeline(
             backendUrl,
@@ -2891,14 +3019,26 @@ figma.ui.onmessage = async (msg) => {
             targetResolution,
           );
 
+          if (result && result.supported === false && Number(result.category) === -1) {
+            const unsupportedMsg =
+              String(result.message || "").trim() || "This banner is not supported now in the plugin.";
+            postStatus(`Pipeline (${pi + 1}/${frames.length}): ${unsupportedMsg}`);
+            figma.notify(
+              `Not supported now in the plugin.\n${selectedFrame.name}`,
+              { timeout: 4 },
+            );
+            pipelineFail++;
+            continue;
+          }
+
           const selectedGuide = result.selected_candidate || {};
-          postStatus(`Pipeline: finding candidate frame "${selectedGuide.name || "unknown"}" in current page...`);
+          postStatus(`Pipeline: locating retrieved guide "${selectedGuide.name || "unknown"}" in the current page...`);
           const lookup = findCandidateFrameInCurrentPage(selectedGuide, result.final_json, selectedFrame);
           let convertedFrame;
           let drawMode;
           let applySummary = null;
           if (lookup.frame) {
-            postStatus(`Pipeline: cloning matched candidate frame (${lookup.reason}) and scaling to target size...`);
+            postStatus(`Pipeline: cloning retrieved guide frame (${lookup.reason}) and scaling to target size...`);
             stampOriginalNodeIds(lookup.frame);
             const cloned = cloneCandidateFrameBesideSelection(
               lookup.frame,
@@ -2912,21 +3052,22 @@ figma.ui.onmessage = async (msg) => {
             applySummary = cloned.summary;
             drawMode = "clone_matched_candidate_frame_scaled";
           } else {
-            postStatus("Pipeline: candidate frame not found in current page; drawing returned JSON fallback...");
+            postStatus("Pipeline: guide frame not found locally; drawing backend target JSON fallback...");
             convertedFrame = await drawJsonTreeBesideSelection(result.final_json, selectedFrame, targetResolution);
             applyJsonTreeNamesByPath(result.final_json, convertedFrame);
             removeEmptyZeroSizeNodes(convertedFrame);
             drawMode = "create_from_returned_json_fallback";
           }
 
-          const rootJsonLabel = String((result.final_json && result.final_json.name) || "").trim();
           const recon = applyFinalJsonCloneReconstruction(result.final_json, convertedFrame);
           removeEmptyZeroSizeNodes(convertedFrame);
           applyJsonTreeNamesByPath(result.final_json, convertedFrame);
           removeEmptyZeroSizeNodes(convertedFrame);
+          const contentReport = await applyFinalJsonContentToClone(result.final_json, convertedFrame);
           const namingReport = finalizeSemanticLayerNamesFromJson(result.final_json, convertedFrame);
+          const exactNameReport = applyExactNodeNamesFromJson(result.final_json, convertedFrame);
           removeEmptyZeroSizeNodes(convertedFrame);
-          convertedFrame.name = buildSemanticCloneFrameTitle(selectedFrame.name, rootJsonLabel || "layout");
+          convertedFrame.name = targetSizeName(targetResolution);
 
           figma.currentPage.selection = [convertedFrame];
           figma.viewport.scrollAndZoomIntoView([selectedFrame, convertedFrame]);
@@ -2944,7 +3085,8 @@ figma.ui.onmessage = async (msg) => {
                 `Layout (abs→rel): ${recon.layoutReport.applied} (skipped ${recon.layoutReport.skipped || 0}, json ids ${recon.layoutReport.indexIds}, map ${recon.layoutReport.mapSize})\n` +
                 `Bounds doc-fix: corrected ${recon.boundsFixReport.corrected}, child skips ${recon.boundsFixReport.skippedChildren}\n` +
                 `Empty frames removed: ${recon.emptyReport.removed}\n` +
-                `Semantic names: ${namingReport.renamed} (id map ${namingReport.mapped})\n` +
+                `Content applied: ${contentReport.applied}\n` +
+                `Semantic names: ${namingReport.renamed} (id map ${namingReport.mapped}) · Exact final rename: ${exactNameReport.renamed}\n` +
                 `Selected stamped nodes: ${stampedNodeCount}\n` +
                 (applySummary
                   ? `Scaled candidate nodes: ${applySummary.applied}\nScale: ${applySummary.scale_x.toFixed(3)} × ${applySummary.scale_y.toFixed(3)}`
@@ -2954,7 +3096,7 @@ figma.ui.onmessage = async (msg) => {
           } else {
             figma.notify(
               `Pipeline ${pi + 1}/${frames.length}: clone ready for "${selectedFrame.name}".\n` +
-                `Qwen class: ${result.category} · Mode: ${drawMode}`,
+                `Qwen class: ${result.category} · Mode: ${drawMode} · Content: ${contentReport.applied}`,
               { timeout: 4 },
             );
           }
@@ -3051,11 +3193,8 @@ figma.ui.onmessage = async (msg) => {
           const recon = applyFinalJsonCloneReconstruction(finalJson, layoutClone);
           applyJsonTreeNamesByPath(finalJson, layoutClone);
           const namingReport = finalizeSemanticLayerNamesFromJson(finalJson, layoutClone);
-          const rootJsonLabel = String((finalJson && finalJson.name) || "").trim();
-          layoutClone.name = buildSemanticCloneFrameTitle(
-            selectedFrame.name,
-            rootJsonLabel || targetSizeName(targetResolution),
-          );
+          applyExactNodeNamesFromJson(finalJson, layoutClone);
+          layoutClone.name = targetSizeName(targetResolution);
 
           figma.currentPage.selection = [layoutClone];
           figma.viewport.scrollAndZoomIntoView([selectedFrame, layoutClone]);
@@ -3199,6 +3338,7 @@ figma.ui.onmessage = async (msg) => {
         applyJsonTreeNamesByPath(data.semantic_json, semanticClone);
         removeEmptyZeroSizeNodes(semanticClone);
         const namingReport = finalizeSemanticLayerNamesFromJson(data.semantic_json, semanticClone);
+        const exactNameReport = applyExactNodeNamesFromJson(data.semantic_json, semanticClone);
         removeEmptyZeroSizeNodes(semanticClone);
         const rootJsonLabel = String((data.semantic_json && data.semantic_json.name) || "").trim();
         semanticClone.name = buildSemanticCloneFrameTitle(selectedFrame.name, rootJsonLabel || "semantic");
@@ -3213,7 +3353,7 @@ figma.ui.onmessage = async (msg) => {
               `Reorder: ${recon.reorderAfterPrune.moves}+${recon.reorderAfterStray.moves} · Stamp: ${recon.stampReport.stamped}` +
               (recon.stampReport.mismatchWarn ? ` (${recon.stampReport.mismatchWarn} mismatches)` : "") +
               `\nLayout: ${recon.layoutReport.applied} (skipped ${recon.layoutReport.skipped || 0}) · Bounds fix: ${recon.boundsFixReport.corrected} · Empty removed: ${recon.emptyReport.removed}\n` +
-              `Layers renamed: ${namingReport.renamed} (id map ${namingReport.mapped}).`,
+              `Layers renamed: ${namingReport.renamed} (id map ${namingReport.mapped}) · Exact final rename: ${exactNameReport.renamed}.`,
             { timeout: 6 },
           );
         } else {
@@ -3237,7 +3377,7 @@ figma.ui.onmessage = async (msg) => {
         postStatus(
           `Semantic JSON (${si + 1}/${frames.length}): done. Clone "${semanticClone.name}" — ` +
             `${recon.hierarchyReport.reparentMoves} sync, ${recon.layoutReport.applied} layout, ` +
-            `${recon.boundsFixReport.corrected} bounds-fix, ${namingReport.renamed} names.`,
+            `${recon.boundsFixReport.corrected} bounds-fix, ${namingReport.renamed} names, ${exactNameReport.renamed} exact overrides.`,
         );
         semOk++;
       } catch (err) {

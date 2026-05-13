@@ -40,8 +40,11 @@ from json_embedding import (
     build_all_indexes,
     parse_aspect_ratio,
     parse_resolution,
+    rerank_candidates_by_raw_similarity,
     resize_figma_json_to_resolution,
+    resize_source_json_using_guide,
     search_index,
+    select_frame,
 )
 from layout_engine.convert import convert_banner
 
@@ -76,7 +79,17 @@ FIGMA_SEMANTIC_PERSIST_RUNS = os.getenv("FIGMA_SEMANTIC_PERSIST_RUNS", "1").stri
     "no",
     "off",
 )
+VISUAL_RETRIEVAL_DB = os.getenv(
+    "VISUAL_RETRIEVAL_DB",
+    "layout_engine/retrieval_db/visual_layout_db.json",
+)
+VISUAL_RETRIEVAL_TOP_K = int(os.getenv("VISUAL_RETRIEVAL_TOP_K", "15"))
+GNN_LAYOUT_CHECKPOINT = os.getenv(
+    "GNN_LAYOUT_CHECKPOINT",
+    "gnn_layout/data/checkpoints/gnn_brand_headline_legal_smoke.pt",
+)
 FRONTEND_DIR = Path(__file__).resolve().parent / "frontend"
+UNSUPPORTED_CLASS_NUMBER = -1
 
 BANNER_VLM_CATEGORY_PROMPT = """You classify one retail / food banner image into exactly ONE of six campaigns.
 
@@ -85,12 +98,13 @@ The six categories (match by main visual theme — product, hero, colors, headli
 1. Пряники прямо на ёлку
 2. Пряничный ровер
 3. Мегапорция оливье для гостей
-4. Еловый лимонад с малиной
+4. Праздничная вишня в шоколаде
 5. Имбирный пряничный латте
-6. Праздничная вишня в шоколаде
+6. Еловый лимонад с малиной
 
 Output rules:
-- Reply with ONLY the digit 1, 2, 3, 4, 5, or 6.
+- If the banner does not belong to any of these six campaigns, reply with ONLY -1.
+- Otherwise reply with ONLY the digit 1, 2, 3, 4, 5, or 6.
 - Single line. No other words, no JSON, no markdown, no explanation."""
 
 
@@ -147,13 +161,13 @@ class FigmaConvertSemanticResponse(BaseModel):
 
 
 class BannerCategoryResponse(BaseModel):
-    """VLM banner classification into campaign 1–6."""
+    """VLM banner classification into campaign 1–6, or -1 for unsupported banners."""
 
     category: int = Field(
         ...,
-        ge=MIN_CLASS_NUMBER,
+        ge=UNSUPPORTED_CLASS_NUMBER,
         le=MAX_CLASS_NUMBER,
-        description="Campaign index per product brief",
+        description="Campaign index per product brief, or -1 when unsupported",
     )
     raw_model_text: str = Field(default="", description="Trimmed model output used for parsing")
 
@@ -195,24 +209,48 @@ class JsonEmbeddingSearchResponse(BaseModel):
     candidates: list[JsonEmbeddingCandidate]
 
 
+class JsonEmbeddingSearchByRawRequest(BaseModel):
+    class_number: int = Field(
+        ...,
+        ge=MIN_CLASS_NUMBER,
+        le=MAX_CLASS_NUMBER,
+        description="Select one of the campaign class indexes",
+    )
+    raw_json: Any = Field(..., description="Root frame dict or array of frames from the Figma plugin")
+    target_resolution: str | None = Field(None, description="WIDTHxHEIGHT or aspect ratio")
+    target_width: float | None = None
+    target_height: float | None = None
+    raw_frame_index: int = Field(default=0, ge=0)
+    top_k: int = Field(default=3, ge=1, le=20)
+    include_full_json: bool = True
+
+
+class JsonEmbeddingSearchByRawResponse(JsonEmbeddingSearchResponse):
+    raw_frame_index: int
+    selected_candidate: JsonEmbeddingCandidate
+
+
 class BannerSearchPipelineResponse(BaseModel):
-    category: int = Field(..., ge=MIN_CLASS_NUMBER, le=MAX_CLASS_NUMBER)
+    category: int = Field(..., ge=UNSUPPORTED_CLASS_NUMBER, le=MAX_CLASS_NUMBER)
     raw_model_text: str = ""
     aspect_ratio: float
     top_k: int
     candidates: list[JsonEmbeddingCandidate]
+    supported: bool = True
 
 
 class BannerRawToTargetJsonResponse(BaseModel):
-    category: int = Field(..., ge=MIN_CLASS_NUMBER, le=MAX_CLASS_NUMBER)
+    category: int = Field(..., ge=UNSUPPORTED_CLASS_NUMBER, le=MAX_CLASS_NUMBER)
     raw_model_text: str = ""
     target_width: float
     target_height: float
     aspect_ratio: float
     top_k: int
-    selected_candidate: JsonEmbeddingCandidate
+    supported: bool = True
+    message: str = ""
+    selected_candidate: JsonEmbeddingCandidate | None = None
     candidates: list[JsonEmbeddingCandidate]
-    final_json: dict[str, Any]
+    final_json: dict[str, Any] | None = None
 
 
 class BannerRawToTargetJsonJsonRequest(BaseModel):
@@ -233,6 +271,10 @@ class LayoutEngineConvertRequest(BaseModel):
     target_resolution: str | None = Field(None, description="WIDTHxHEIGHT, e.g. 1536x640")
     target_width: float | None = None
     target_height: float | None = None
+    visual_mode: Literal["default", "retrieval"] = "default"
+    visual_retrieval_db: str | None = None
+    visual_retrieval_top_k: int = Field(default=15, ge=1, le=100)
+    gnn_layout_checkpoint: str | None = None
 
 
 class LayoutEngineConvertResponse(BaseModel):
@@ -420,7 +462,7 @@ def _normalize_category(text: str) -> str:
 
 
 def _parse_banner_category(text: str) -> int:
-    """Extract campaign index from VLM reply (digit only, JSON, or first matching token)."""
+    """Extract campaign index from VLM reply, allowing -1 for unsupported banners."""
     raw = (text or "").strip()
     if not raw:
         raise ValueError("empty model response")
@@ -431,7 +473,7 @@ def _parse_banner_category(text: str) -> int:
         inner = fence.group(1).strip()
 
     def _in_range(n: int) -> bool:
-        return MIN_CLASS_NUMBER <= n <= MAX_CLASS_NUMBER
+        return n == UNSUPPORTED_CLASS_NUMBER or MIN_CLASS_NUMBER <= n <= MAX_CLASS_NUMBER
 
     if inner.startswith("{") or inner.startswith("["):
         try:
@@ -445,7 +487,7 @@ def _parse_banner_category(text: str) -> int:
                     continue
                 if isinstance(v, int) and _in_range(v):
                     return v
-                if isinstance(v, str) and v.strip().isdigit():
+                if isinstance(v, str) and re.fullmatch(r"-?\d+", v.strip()):
                     n = int(v.strip())
                     if _in_range(n):
                         return n
@@ -454,18 +496,23 @@ def _parse_banner_category(text: str) -> int:
             if isinstance(only, int) and _in_range(only):
                 return only
 
-    digit_class = rf"[{MIN_CLASS_NUMBER}-{MAX_CLASS_NUMBER}]"
     for line in inner.splitlines():
         s = line.strip()
-        if re.fullmatch(digit_class, s):
+        if re.fullmatch(r"-1", s):
+            return UNSUPPORTED_CLASS_NUMBER
+        if re.fullmatch(rf"[{MIN_CLASS_NUMBER}-{MAX_CLASS_NUMBER}]", s):
             return int(s)
 
-    m = re.search(rf"\b({digit_class})\b", inner)
+    m = re.search(r"(?<!\d)(-1)(?!\d)", inner)
+    if m:
+        return UNSUPPORTED_CLASS_NUMBER
+
+    m = re.search(rf"\b([{MIN_CLASS_NUMBER}-{MAX_CLASS_NUMBER}])\b", inner)
     if m:
         return int(m.group(1))
 
     raise ValueError(
-        f"no digit {MIN_CLASS_NUMBER}–{MAX_CLASS_NUMBER} found in: {inner[:300]!r}"
+        f"no class digit -1 or {MIN_CLASS_NUMBER}–{MAX_CLASS_NUMBER} found in: {inner[:300]!r}"
     )
 
 
@@ -491,7 +538,7 @@ def _classify_banner_bytes(body: bytes, content_type: str | None, max_new_tokens
     except ValueError as exc:
         raise HTTPException(
             status_code=502,
-            detail=f"VLM output could not be parsed as {MIN_CLASS_NUMBER}–{MAX_CLASS_NUMBER}: {exc}. Raw: {raw[:500]!r}",
+            detail=f"VLM output could not be parsed as -1 or {MIN_CLASS_NUMBER}–{MAX_CLASS_NUMBER}: {exc}. Raw: {raw[:500]!r}",
         ) from exc
     return category, raw
 
@@ -509,7 +556,28 @@ def _run_banner_raw_to_target_pipeline(
     category, raw_model_text = _classify_banner_bytes(
         banner_body, banner_content_type, max_new_tokens=max_new_tokens
     )
+    if category == UNSUPPORTED_CLASS_NUMBER:
+        try:
+            target_width, target_height = parse_resolution(target_resolution)
+            parsed_aspect = target_width / target_height
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return BannerRawToTargetJsonResponse(
+            category=category,
+            raw_model_text=raw_model_text[:2000],
+            target_width=target_width,
+            target_height=target_height,
+            aspect_ratio=parsed_aspect,
+            top_k=top_k,
+            supported=False,
+            message="This banner is not supported by the current 6-class retrieval pipeline.",
+            selected_candidate=None,
+            candidates=[],
+            final_json=None,
+        )
+
     try:
+        uploaded_frame = select_frame(uploaded_raw, raw_frame_index)
         target_width, target_height = parse_resolution(target_resolution)
         parsed_aspect = target_width / target_height
         retrieved = attach_full_json(search_index(category, target_resolution, top_k=top_k))
@@ -519,12 +587,19 @@ def _run_banner_raw_to_target_pipeline(
     if not retrieved:
         raise HTTPException(status_code=404, detail="No retrievable candidates found.")
 
-    selected = retrieved[0]
+    reranked = rerank_candidates_by_raw_similarity(uploaded_frame, retrieved)
+    selected_pool = reranked or retrieved
+    selected = selected_pool[0]
     selected_json = selected.get("full_json")
     if not isinstance(selected_json, dict):
         raise HTTPException(status_code=500, detail="Selected candidate does not include full_json.")
 
-    final_json = resize_figma_json_to_resolution(selected_json, target_width, target_height)
+    final_json = resize_source_json_using_guide(
+        uploaded_frame,
+        selected_json,
+        target_width,
+        target_height,
+    )
 
     return BannerRawToTargetJsonResponse(
         category=category,
@@ -533,8 +608,10 @@ def _run_banner_raw_to_target_pipeline(
         target_height=target_height,
         aspect_ratio=parsed_aspect,
         top_k=top_k,
+        supported=True,
+        message="",
         selected_candidate=JsonEmbeddingCandidate(**selected),
-        candidates=[JsonEmbeddingCandidate(**row) for row in retrieved],
+        candidates=[JsonEmbeddingCandidate(**row) for row in selected_pool],
         final_json=final_json,
     )
 
@@ -616,6 +693,50 @@ def search_json_embeddings(
     )
 
 
+@app.post("/json-embeddings/search-by-raw-json", response_model=JsonEmbeddingSearchByRawResponse)
+def search_json_embeddings_by_raw_json(
+    request: JsonEmbeddingSearchByRawRequest,
+) -> JsonEmbeddingSearchByRawResponse:
+    """Retrieve by class/resolution, then rerank against an uploaded raw Figma frame."""
+    if request.class_number not in VALID_CLASSES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"class_number must be one of {sorted(VALID_CLASSES)}",
+        )
+
+    target_resolution = request.target_resolution
+    if not target_resolution:
+        if request.target_width is None or request.target_height is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Provide target_resolution or both target_width and target_height.",
+            )
+        target_resolution = f"{request.target_width}x{request.target_height}"
+
+    try:
+        parsed_aspect = parse_aspect_ratio(target_resolution)
+        raw_frame = select_frame(request.raw_json, request.raw_frame_index)
+        results = search_index(request.class_number, target_resolution, top_k=request.top_k)
+        if request.include_full_json:
+            results = attach_full_json(results)
+        reranked = rerank_candidates_by_raw_similarity(raw_frame, results)
+        ranked_results = reranked or results
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if not ranked_results:
+        raise HTTPException(status_code=404, detail="No retrievable candidates found.")
+
+    return JsonEmbeddingSearchByRawResponse(
+        class_number=request.class_number,
+        aspect_ratio=parsed_aspect,
+        raw_frame_index=request.raw_frame_index,
+        top_k=request.top_k,
+        selected_candidate=JsonEmbeddingCandidate(**ranked_results[0]),
+        candidates=[JsonEmbeddingCandidate(**row) for row in ranked_results],
+    )
+
+
 @app.post("/pipeline/banner-search", response_model=BannerSearchPipelineResponse)
 async def classify_banner_then_search_json(
     file: UploadFile = File(..., description="Banner PNG/JPEG/WebP to classify"),
@@ -630,6 +751,15 @@ async def classify_banner_then_search_json(
 
     try:
         parsed_aspect = parse_aspect_ratio(target_resolution)
+        if category == UNSUPPORTED_CLASS_NUMBER:
+            return BannerSearchPipelineResponse(
+                category=category,
+                raw_model_text=raw[:2000],
+                aspect_ratio=parsed_aspect,
+                top_k=top_k,
+                candidates=[],
+                supported=False,
+            )
         results = search_index(category, target_resolution, top_k=top_k)
         if include_full_json:
             results = attach_full_json(results)
@@ -642,6 +772,7 @@ async def classify_banner_then_search_json(
         aspect_ratio=parsed_aspect,
         top_k=top_k,
         candidates=[JsonEmbeddingCandidate(**row) for row in results],
+        supported=True,
     )
 
 
@@ -735,8 +866,24 @@ def layout_engine_convert(request: LayoutEngineConvertRequest) -> LayoutEngineCo
     if not isinstance(raw, dict):
         raise HTTPException(status_code=400, detail="raw_json must be a JSON object or a non-empty list.")
 
+    retrieval_db = request.visual_retrieval_db
+    if request.visual_mode == "retrieval" and not retrieval_db:
+        retrieval_db = VISUAL_RETRIEVAL_DB
+    retrieval_top_k = request.visual_retrieval_top_k or VISUAL_RETRIEVAL_TOP_K
+    gnn_checkpoint = request.gnn_layout_checkpoint or GNN_LAYOUT_CHECKPOINT
+    if gnn_checkpoint and not Path(gnn_checkpoint).exists():
+        gnn_checkpoint = None
+
     try:
-        final_json = convert_banner(raw, tw_i, th_i)
+        final_json = convert_banner(
+            raw,
+            tw_i,
+            th_i,
+            visual_retrieval_db=retrieval_db,
+            visual_retrieval_top_k=retrieval_top_k,
+            visual_mode=request.visual_mode,
+            gnn_layout_checkpoint=gnn_checkpoint,
+        )
     except Exception as exc:
         raise HTTPException(
             status_code=500,

@@ -13,6 +13,22 @@ def set_bounds(node: dict, x: float, y: float, w: float, h: float):
     node["bounds"]["height"] = round(float(h), 2)
 
 
+def scale_text_style(node: dict, scale: float):
+    if scale <= 0:
+        return
+    if "fontSize" in node:
+        try:
+            node["fontSize"] = round(max(1.0, float(node["fontSize"]) * scale), 2)
+        except (TypeError, ValueError):
+            pass
+    style = node.get("style")
+    if isinstance(style, dict) and "fontSize" in style:
+        try:
+            style["fontSize"] = round(max(1.0, float(style["fontSize"]) * scale), 2)
+        except (TypeError, ValueError):
+            pass
+
+
 def transform_node_tree(node: dict, old_box: dict, new_box: dict):
     old_x = float(old_box.get("x", 0))
     old_y = float(old_box.get("y", 0))
@@ -23,6 +39,7 @@ def transform_node_tree(node: dict, old_box: dict, new_box: dict):
     new_y = float(new_box.get("y", 0))
     new_w = max(float(new_box.get("width", 1)), 1)
     new_h = max(float(new_box.get("height", 1)), 1)
+    font_scale = min(new_w / old_w, new_h / old_h)
 
     b = get_bounds(node)
 
@@ -38,6 +55,8 @@ def transform_node_tree(node: dict, old_box: dict, new_box: dict):
         rel_w * new_w,
         rel_h * new_h,
     )
+    if (node.get("type") or "").lower() == "text" or "fontSize" in node:
+        scale_text_style(node, font_scale)
 
     for child in node.get("children", []) or []:
         transform_node_tree(child, old_box, new_box)
@@ -46,3 +65,13 @@ def transform_node_tree(node: dict, old_box: dict, new_box: dict):
 def move_and_scale_group(node: dict, new_box: dict):
     old_box = copy.deepcopy(get_bounds(node))
     transform_node_tree(node, old_box, new_box)
+
+
+def set_bounds_and_scale_text(node: dict, x: float, y: float, w: float, h: float):
+    old_box = copy.deepcopy(get_bounds(node))
+    old_w = max(float(old_box.get("width", 1) or 1), 1)
+    old_h = max(float(old_box.get("height", 1) or 1), 1)
+    scale = min(max(float(w), 1) / old_w, max(float(h), 1) / old_h)
+    set_bounds(node, x, y, w, h)
+    if (node.get("type") or "").lower() == "text" or "fontSize" in node:
+        scale_text_style(node, scale)

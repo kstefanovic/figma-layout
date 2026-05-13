@@ -138,3 +138,43 @@ Advanced chat messages are also supported through `/chat`:
   "max_new_tokens": 256
 }
 ```
+
+## JSON Embedding Backend
+
+Build one embedding index per campaign class from the six local files in `raw_jsons/`:
+
+```bash
+curl -X POST http://localhost:20401/json-embeddings/build
+```
+
+Search within one class by aspect ratio or exact target resolution:
+
+```bash
+curl "http://localhost:20401/json-embeddings/search?class_number=2&aspect_ratio=2280x360&top_k=3"
+```
+
+Search within one class and rerank the retrieved templates against an uploaded raw Figma JSON frame:
+
+```bash
+curl -X POST http://localhost:20401/json-embeddings/search-by-raw-json \
+  -H "Content-Type: application/json" \
+  -d @- <<'JSON'
+{
+  "class_number": 2,
+  "target_resolution": "2280x360",
+  "raw_frame_index": 0,
+  "top_k": 3,
+  "raw_json": { "name": "Example frame", "bounds": { "width": 1080, "height": 1920 }, "children": [] }
+}
+JSON
+```
+
+Full banner pipeline: classify banner image to class `1..6`, retrieve from the corresponding embedding index, rerank by uploaded raw JSON similarity, and return a resized target JSON:
+
+```bash
+curl -X POST http://localhost:20401/pipeline/banner-raw-to-target-json \
+  -F "file=@/path/to/banner.png" \
+  -F "raw_json=@/path/to/source.json" \
+  -F "target_resolution=2280x360" \
+  -F "top_k=3"
+```

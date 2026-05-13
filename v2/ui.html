@@ -158,11 +158,11 @@
 
     <div class="row">
       <label for="backend-url">Backend URL</label>
-      <input id="backend-url" value="http://localhost:20198" />
+      <input id="backend-url" value="http://localhost:20401" />
       <p style="font-size: 11px; color: #666; margin: 6px 0 0; line-height: 1.4">
         Figma only allows origins listed in <code>v2/manifest.json</code> →
         <code>networkAccess.devAllowedDomains</code> (exact match: scheme, host, port). Use
-        <code>http://localhost:20198</code> here if that is what the manifest lists — typing
+        <code>http://localhost:20401</code> here if that is what the manifest lists — typing
         <code>127.0.0.1</code> instead will fail fetch. For a backend on another host, add that exact
         <code>http://…</code> URL to the manifest (some patterns are rejected on plugin import).
         Reload the development plugin after changing the manifest.
@@ -175,7 +175,7 @@
     </div>
 
       <div class="row">
-        <button id="pipeline-btn">Generate Target JSON + Draw Clone (1 or more frames)</button>
+        <button id="pipeline-btn">Banner classify + retrieve + draw beside (1+ frames)</button>
       </div>
 
     <div class="row">
@@ -396,7 +396,7 @@ Select one or more frames, then click “JSON to HTML/CSS Exporter”. Each fram
         const targetSize = normalizeTargetSizeText(document.getElementById("target-size").value);
         document.getElementById("target-size").value = targetSize;
 
-        setStatus("Preparing pipeline request...");
+        setStatus("Preparing classify → retrieve → draw pipeline...");
         setPipelineLoading(true);
 
         parent.postMessage(

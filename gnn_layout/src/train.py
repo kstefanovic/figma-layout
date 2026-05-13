@@ -31,6 +31,11 @@ def main() -> None:
     parser.add_argument("--dropout", type=float, default=0.15)
     parser.add_argument("--out", type=Path, default=Path("gnn_layout/data/checkpoints/gnn_layout.pt"))
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--target-roles",
+        default=None,
+        help="Comma-separated roles to train. Defaults to row target_roles when present, else all roles.",
+    )
     args = parser.parse_args()
 
     rows = GNNLayoutDataset._read_rows(args.pairs)
@@ -38,14 +43,23 @@ def main() -> None:
         raise SystemExit(f"No training pairs found in {args.pairs}")
 
     set_seed(args.seed)
+    target_roles = resolve_target_roles(args.target_roles, rows)
     splits = split_rows_by_family(rows, seed=args.seed)
     train_rows = splits["train"]
     val_rows = splits["val"] or train_rows
     test_rows = splits["test"]
     print_split_summary(splits)
 
-    train_loader = DataLoader(GNNLayoutDataset(args.pairs, train_rows), batch_size=args.batch_size, shuffle=True)
-    val_loader = DataLoader(GNNLayoutDataset(args.pairs, val_rows), batch_size=args.batch_size, shuffle=False)
+    train_loader = DataLoader(
+        GNNLayoutDataset(args.pairs, train_rows, target_roles=target_roles),
+        batch_size=args.batch_size,
+        shuffle=True,
+    )
+    val_loader = DataLoader(
+        GNNLayoutDataset(args.pairs, val_rows, target_roles=target_roles),
+        batch_size=args.batch_size,
+        shuffle=False,
+    )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = GNNLayoutPredictor(
@@ -69,6 +83,7 @@ def main() -> None:
         "in_channels": len(FEATURE_NAMES),
         "feature_names": FEATURE_NAMES,
         "roles": ROLES,
+        "target_roles": target_roles,
         "train_families": splits["train_families"],
         "val_families": splits["val_families"],
         "test_families": splits["test_families"],
@@ -77,9 +92,7 @@ def main() -> None:
     for epoch in range(1, args.epochs + 1):
         train_loss = run_epoch(model, train_loader, criterion, device, optimizer)
         val_loss, val_metrics = evaluate_loader(model, val_loader, criterion, device)
-        role_l1 = ", ".join(
-            f"{role}:{val_metrics['role_l1'].get(role, float('nan')):.4f}" for role in ROLES
-        )
+        role_l1 = ", ".join(f"{role}:{val_metrics['role_l1'].get(role, float('nan')):.4f}" for role in target_roles)
         print(
             f"epoch {epoch:03d} | train_loss={train_loss:.6f} | "
             f"val_loss={val_loss:.6f} | role_l1: {role_l1}"
@@ -118,6 +131,24 @@ def run_epoch(model, loader, criterion, device, optimizer) -> float:
         total_loss += float(loss.detach().cpu()) * pred.size(0)
         total_count += pred.size(0)
     return total_loss / max(1, total_count)
+
+
+def resolve_target_roles(raw: str | None, rows: list[dict[str, Any]]) -> list[str]:
+    if raw:
+        roles = [part.strip() for part in raw.split(",") if part.strip()]
+    else:
+        roles = []
+        for row in rows:
+            raw_roles = row.get("target_roles")
+            if isinstance(raw_roles, list) and raw_roles:
+                roles = [str(r) for r in raw_roles]
+                break
+    if not roles:
+        roles = list(ROLES)
+    unknown = [role for role in roles if role not in ROLES]
+    if unknown:
+        raise SystemExit(f"Unknown target role(s): {unknown}. Valid roles: {ROLES}")
+    return roles
 
 
 @torch.no_grad()
