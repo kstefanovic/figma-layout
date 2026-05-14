@@ -84,11 +84,11 @@
         background: #059669;
       }
 
-      #layout-engine-btn {
+      #layout-transformer-btn {
         background: #7c3aed;
       }
 
-      #layout-engine-btn:hover {
+      #layout-transformer-btn:hover {
         background: #6d28d9;
       }
 
@@ -179,8 +179,8 @@
       </div>
 
     <div class="row">
-      <button id="layout-engine-btn" type="button">
-        Layout engine only — JSON + target size → clone beside frame (1+ frames)
+      <button id="layout-transformer-btn" type="button">
+        Layout Transformer — semantic JSON + target size → clone beside frame (1+ frames)
       </button>
     </div>
 
@@ -236,7 +236,7 @@ Select one or more frames, then click “JSON to HTML/CSS Exporter”. Each fram
     <script>
       const statusEl = document.getElementById("status");
       const pipelineBtn = document.getElementById("pipeline-btn");
-      const layoutEngineBtn = document.getElementById("layout-engine-btn");
+      const layoutTransformerBtn = document.getElementById("layout-transformer-btn");
       const semanticJsonBtn = document.getElementById("semantic-json-btn");
       const semanticMaxTokensEl = document.getElementById("semantic-max-tokens");
       const semanticJsonResultEl = document.getElementById("semantic-json-result");
@@ -258,7 +258,7 @@ Select one or more frames, then click “JSON to HTML/CSS Exporter”. Each fram
         const busy = !!on;
         if (pipelineOverlayEl) pipelineOverlayEl.hidden = !busy;
         if (pipelineBtn) pipelineBtn.disabled = busy;
-        if (layoutEngineBtn) layoutEngineBtn.disabled = busy;
+        if (layoutTransformerBtn) layoutTransformerBtn.disabled = busy;
       }
 
       function setSelectedFrameInfo(info) {
@@ -411,16 +411,16 @@ Select one or more frames, then click “JSON to HTML/CSS Exporter”. Each fram
         );
       };
 
-      layoutEngineBtn.onclick = () => {
+      layoutTransformerBtn.onclick = () => {
         const backendUrl = document.getElementById("backend-url").value.trim();
         const targetSize = normalizeTargetSizeText(document.getElementById("target-size").value);
         document.getElementById("target-size").value = targetSize;
-        setStatus("Calling layout_engine on serialized JSON…");
+        setStatus("Calling layout transformer on semantic JSON…");
         setPipelineLoading(true);
         parent.postMessage(
           {
             pluginMessage: {
-              type: "layout-engine-convert-selected-frame",
+              type: "layout-transformer-convert-selected-frame",
               backendUrl,
               targetSize,
             },

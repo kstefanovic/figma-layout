@@ -9,6 +9,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
 from .extract import flatten_semantic_nodes, get_canvas_size
+from .roles import CHILD_ROLE_SET, FLOATING_ROLE_SET, TRAIN_ROLE_SET
 
 
 COLORS = [
@@ -57,15 +58,69 @@ def main() -> None:
         w = float(bounds.get("width") or 0)
         h = float(bounds.get("height") or 0)
         color = COLORS[index % len(COLORS)]
-        draw.rectangle([x, y, x + w, y + h], outline=color, width=3)
+        if role in FLOATING_ROLE_SET:
+            _draw_dashed_rectangle(draw, [x, y, x + w, y + h], color, width=3)
+            label_offset = 3
+        elif role in CHILD_ROLE_SET:
+            draw.rectangle([x, y, x + w, y + h], outline=color, width=1)
+            label_offset = 2
+        elif role in TRAIN_ROLE_SET:
+            draw.rectangle([x, y, x + w, y + h], outline=color, width=4)
+            label_offset = 5
+        else:
+            draw.rectangle([x, y, x + w, y + h], outline=color, width=2)
+            label_offset = 3
         label = role
-        label_box = draw.textbbox((x + 4, y + 4), label, font=font)
+        label_box = draw.textbbox((x + label_offset, y + label_offset), label, font=font)
         draw.rectangle(label_box, fill="white", outline=color)
-        draw.text((x + 4, y + 4), label, fill=color, font=font)
+        draw.text((x + label_offset, y + label_offset), label, fill=color, font=font)
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     image.save(args.out)
     print(f"Wrote: {args.out}")
+
+
+def _draw_dashed_rectangle(
+    draw: ImageDraw.ImageDraw,
+    box: list[float],
+    color: str,
+    width: int = 2,
+    dash: int = 14,
+    gap: int = 8,
+) -> None:
+    x1, y1, x2, y2 = box
+    _draw_dashed_line(draw, x1, y1, x2, y1, color, width, dash, gap)
+    _draw_dashed_line(draw, x2, y1, x2, y2, color, width, dash, gap)
+    _draw_dashed_line(draw, x2, y2, x1, y2, color, width, dash, gap)
+    _draw_dashed_line(draw, x1, y2, x1, y1, color, width, dash, gap)
+
+
+def _draw_dashed_line(
+    draw: ImageDraw.ImageDraw,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    color: str,
+    width: int,
+    dash: int,
+    gap: int,
+) -> None:
+    length = max(1.0, ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5)
+    dx = (x2 - x1) / length
+    dy = (y2 - y1) / length
+    pos = 0.0
+    while pos < length:
+        end = min(length, pos + dash)
+        draw.line(
+            [
+                (x1 + dx * pos, y1 + dy * pos),
+                (x1 + dx * end, y1 + dy * end),
+            ],
+            fill=color,
+            width=width,
+        )
+        pos += dash + gap
 
 
 if __name__ == "__main__":

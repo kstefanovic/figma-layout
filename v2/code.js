@@ -1,7 +1,7 @@
 /**
  * Figma plugin main thread. Flows:
  * - ``POST …/pipeline/banner-raw-to-target-json-json`` — banner + raw JSON + target size → classify into class 1..6, retrieve best template in that class, return target JSON; plugin draws clone beside the source.
- * - ``POST …/layout-engine/convert`` — serialized frame JSON + target size → ``layout_engine.convert`` CP-SAT output; plugin clones beside the original and applies returned ``final_json``.
+ * - ``POST …/api/layout-transformer`` — selected semantic JSON + target size → structural Layout Transformer output; plugin clones beside the original and applies returned ``final_json``.
  * - ``POST …/figma/convert-semantic-json`` — banner + grid PNG + raw JSON → Qwen (multipart sent from the plugin UI iframe with ``FormData``, same as ``frontend/figma.html``); server merges ``{names:{id:…}}`` into full semantic JSON; main thread clones beside the original, reparents to match JSON hierarchy, then renames from that JSON.
  * - HTML/CSS export from serialized JSON + assets (local).
  */
@@ -1875,19 +1875,16 @@ async function callBannerRawTargetPipeline(backendUrl, bannerPngBase64, rawJson,
   return data;
 }
 
-async function callLayoutEngineConvert(backendUrl, rawJson, targetResolution) {
+async function callLayoutTransformer(backendUrl, rawJson, targetResolution) {
   const url = String(backendUrl || "").trim().replace(/\/+$/, "");
   if (!url) throw new Error("Backend URL is empty.");
-  const response = await fetch(url + "/layout-engine/convert", {
+  const response = await fetch(url + "/api/layout-transformer", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      raw_json: rawJson,
+      source_json: rawJson,
       target_width: targetResolution.width,
       target_height: targetResolution.height,
-      target_resolution: `${targetResolution.width}x${targetResolution.height}`,
-      visual_mode: "retrieval",
-      visual_retrieval_top_k: 15,
     }),
   });
   const text = await response.text();
@@ -1904,10 +1901,10 @@ async function callLayoutEngineConvert(backendUrl, rawJson, targetResolution) {
           ? data.detail
           : JSON.stringify(data.detail)
         : text || `HTTP ${response.status}`;
-    throw new Error(`Layout engine backend failed: ${detail}`);
+    throw new Error(`Layout transformer backend failed: ${detail}`);
   }
   if (!data || typeof data !== "object" || !data.final_json) {
-    throw new Error("Layout engine returned invalid JSON or missing final_json.");
+    throw new Error("Layout transformer returned invalid JSON or missing final_json.");
   }
   return data;
 }
@@ -3145,12 +3142,12 @@ figma.ui.onmessage = async (msg) => {
     return;
   }
 
-  if (msg.type === "layout-engine-convert-selected-frame") {
+  if (msg.type === "layout-transformer-convert-selected-frame") {
     const selection = figma.currentPage.selection;
     const frames = collectFrameNodesFromSelection(selection);
     if (frames.length === 0) {
       figma.ui.postMessage({ type: "pipeline-busy", busy: false });
-      postError("Select one or more frames (only FRAME nodes run layout_engine).");
+      postError("Select one or more clean semantic frames (only FRAME nodes run layout transformer).");
       sendSelectionInfo();
       return;
     }
@@ -3173,21 +3170,21 @@ figma.ui.onmessage = async (msg) => {
         try {
           figma.currentPage.selection = [selectedFrame];
           const targetResolution = parseTargetSize(msg.targetSize, selectedFrame);
-          postStatus(`Layout engine (${li + 1}/${frames.length}): stamping… ${selectedFrame.name}`);
+          postStatus(`Layout Transformer (${li + 1}/${frames.length}): stamping… ${selectedFrame.name}`);
           stampOriginalNodeIds(selectedFrame);
 
-          postStatus("Layout engine: serializing frame JSON…");
+          postStatus("Layout Transformer: serializing selected semantic JSON…");
           const origin = getOrigin(selectedFrame);
           const rawJson = serializeNode(selectedFrame, origin, "");
-          rawJson.templateId = "figma_plugin_layout_engine";
+          rawJson.templateId = "figma_plugin_layout_transformer";
 
           postStatus(
-            `Layout engine (${li + 1}/${frames.length}): calling backend ${targetResolution.width}×${targetResolution.height}…`,
+            `Layout Transformer (${li + 1}/${frames.length}): calling backend ${targetResolution.width}×${targetResolution.height}…`,
           );
-          const result = await callLayoutEngineConvert(backendUrl, rawJson, targetResolution);
+          const result = await callLayoutTransformer(backendUrl, rawJson, targetResolution);
           const finalJson = result.final_json;
 
-          postStatus("Layout engine: cloning frame beside selection…");
+          postStatus("Layout Transformer: cloning predicted frame beside selection…");
           const layoutClone = cloneFrameBesideSource(selectedFrame);
           applyJsonTreeNamesByPath(finalJson, layoutClone);
           const recon = applyFinalJsonCloneReconstruction(finalJson, layoutClone);
@@ -3201,7 +3198,7 @@ figma.ui.onmessage = async (msg) => {
 
           if (frames.length === 1) {
             figma.notify(
-              `Layout engine clone ready.\n` +
+              `Layout Transformer clone ready.\n` +
                 `Sync: ${recon.hierarchyReport.reparentMoves} · Prune: ${recon.pruneReport.removed} · Stray: ${recon.strayReport.removed}\n` +
                 `Reorder: ${recon.reorderAfterPrune.moves}+${recon.reorderAfterStray.moves} · Stamp: ${recon.stampReport.stamped}` +
                 (recon.stampReport.mismatchWarn ? ` (${recon.stampReport.mismatchWarn} mismatches)` : "") +
@@ -3210,16 +3207,16 @@ figma.ui.onmessage = async (msg) => {
               { timeout: 6 },
             );
           } else {
-            figma.notify(`Layout engine ${li + 1}/${frames.length}: done for "${selectedFrame.name}".`, {
+            figma.notify(`Layout Transformer ${li + 1}/${frames.length}: done for "${selectedFrame.name}".`, {
               timeout: 4,
             });
           }
           ok++;
         } catch (err) {
           fail++;
-          console.error("Layout engine convert failed:", err);
+          console.error("Layout transformer convert failed:", err);
           const shortMsg = String(err && err.message ? err.message : err);
-          postStatus(`Layout engine (${li + 1}/${frames.length}) skipped: ${selectedFrame.name} — ${shortMsg}`);
+          postStatus(`Layout Transformer (${li + 1}/${frames.length}) skipped: ${selectedFrame.name} — ${shortMsg}`);
           if (err && err.message === "Failed to fetch") {
             postStatus(
               "Figma only allows requests to origins listed in manifest.json networkAccess.devAllowedDomains. Match Backend URL, then reload the plugin.",
@@ -3232,15 +3229,15 @@ figma.ui.onmessage = async (msg) => {
       sendSelectionInfo();
       figma.ui.postMessage({ type: "done" });
       if (frames.length > 1) {
-        figma.notify(`Layout engine batch: ${ok} ok, ${fail} failed.`, { timeout: 5 });
+        figma.notify(`Layout Transformer batch: ${ok} ok, ${fail} failed.`, { timeout: 5 });
       }
       if (fail > 0 && ok === 0) {
-        postError("Every frame in the layout_engine batch failed. See status above.");
+        postError("Every frame in the layout transformer batch failed. See status above.");
       } else if (fail > 0) {
-        postError(`Layout engine finished with ${fail} failure(s); ${ok} succeeded.`);
+        postError(`Layout Transformer finished with ${fail} failure(s); ${ok} succeeded.`);
       }
     } catch (err) {
-      console.error("Layout engine batch failed:", err);
+      console.error("Layout transformer batch failed:", err);
       let errMsg =
         err && err.stack ? err.message + "\n\n" + err.stack : String(err && err.message ? err.message : err);
       if (err && err.message === "Failed to fetch") {

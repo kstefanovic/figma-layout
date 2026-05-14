@@ -12,16 +12,13 @@ from typing import Any
 import torch
 
 from .extract import (
-    apply_child_relative_transform,
     copy_json_with_predicted_bounds,
-    denorm_bbox,
     flatten_semantic_nodes,
     get_bbox_norm,
     get_canvas_size,
-    place_age_badge_by_anchor,
-    place_floating_roles_by_anchor,
 )
 from .model import LayoutTransformer
+from .postprocess import postprocess_layout
 from .roles import NUM_ROLES, ROLE_TO_ID, TRAIN_ROLES
 
 RAW_NAME_RE = re.compile(r"^(?:\d+|Group\s+\d+|Group\s+#+)$", re.IGNORECASE)
@@ -47,15 +44,23 @@ class StructuralLayoutTransformerService:
         self.model.load_state_dict(checkpoint_payload["model_state"])
         self.model.eval()
         self.model_roles = list(TRAIN_ROLES)
+        self.last_report: dict[str, Any] = {
+            "transformed_children_count": 0,
+            "floating_roles_placed": [],
+            "warnings": [],
+        }
 
     def predict(self, source_json: dict[str, Any], target_width: int | float, target_height: int | float) -> dict[str, Any]:
-        return predict_structural_layout(
+        final_json, report = predict_structural_layout(
             model=self.model,
             device=self.device,
             source_json=source_json,
             target_width=target_width,
             target_height=target_height,
+            return_report=True,
         )
+        self.last_report = report
+        return final_json
 
 
 def predict_structural_layout(
@@ -65,7 +70,8 @@ def predict_structural_layout(
     source_json: dict[str, Any],
     target_width: int | float,
     target_height: int | float,
-) -> dict[str, Any]:
+    return_report: bool = False,
+) -> dict[str, Any] | tuple[dict[str, Any], dict[str, Any]]:
     """Predict structural parent roles, then deterministically postprocess children/floating roles."""
     target_w = float(target_width)
     target_h = float(target_height)
@@ -97,15 +103,17 @@ def predict_structural_layout(
         for role in TRAIN_ROLES
         if role_mask[0, ROLE_TO_ID[role]].item() > 0
     }
-    pred_role_abs_bboxes = {
-        role: denorm_bbox(bbox, target_w, target_h)
-        for role, bbox in pred_role_bboxes.items()
-    }
     output_json = copy_json_with_predicted_bounds(source_json, pred_role_bboxes, target_w, target_h)
-    apply_child_relative_transform(source_json, output_json, pred_role_abs_bboxes)
-    place_age_badge_by_anchor(source_json, output_json, target_w, target_h)
-    place_floating_roles_by_anchor(source_json, output_json, target_w, target_h)
+    output_json, report = postprocess_layout(
+        source_json=source_json,
+        output_json=output_json,
+        target_w=target_w,
+        target_h=target_h,
+        return_report=True,
+    )
     validate_predicted_layout(output_json, int(round(target_w)), int(round(target_h)))
+    if return_report:
+        return output_json, report
     return output_json
 
 
@@ -181,6 +189,9 @@ def main() -> None:
     with args.out.open("w", encoding="utf-8") as f:
         json.dump(output_json, f, ensure_ascii=False, indent=2)
     print(f"Predicted structural roles: {len(service.model_roles)}")
+    print(f"transformed_children_count: {service.last_report.get('transformed_children_count', 0)}")
+    print(f"floating_roles_placed: {service.last_report.get('floating_roles_placed', [])}")
+    print(f"warnings: {service.last_report.get('warnings', [])}")
     print(f"Wrote: {args.out}")
 
 
