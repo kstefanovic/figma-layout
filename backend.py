@@ -47,6 +47,8 @@ from json_embedding import (
     select_frame,
 )
 from layout_engine.convert import convert_banner
+from layout_transformer.src.predict import StructuralLayoutTransformerService
+from layout_transformer.src.roles import TRAIN_ROLES
 
 
 load_dotenv()
@@ -88,6 +90,13 @@ GNN_LAYOUT_CHECKPOINT = os.getenv(
     "GNN_LAYOUT_CHECKPOINT",
     "gnn_layout/data/checkpoints/gnn_brand_headline_legal_smoke.pt",
 )
+LAYOUT_TRANSFORMER_CHECKPOINT = Path(
+    os.getenv(
+        "LAYOUT_TRANSFORMER_CHECKPOINT",
+        "layout_transformer/checkpoints/layout_transformer_structural.pt",
+    )
+).resolve()
+LAYOUT_TRANSFORMER_DEVICE = os.getenv("LAYOUT_TRANSFORMER_DEVICE", "").strip() or None
 FRONTEND_DIR = Path(__file__).resolve().parent / "frontend"
 UNSUPPORTED_CLASS_NUMBER = -1
 
@@ -283,6 +292,24 @@ class LayoutEngineConvertResponse(BaseModel):
     target_height: int
 
 
+class LayoutTransformerRequest(BaseModel):
+    source_json: dict[str, Any]
+    target_width: int = Field(..., ge=1)
+    target_height: int = Field(..., ge=1)
+
+
+class LayoutTransformerDebug(BaseModel):
+    target_width: int
+    target_height: int
+    model_roles: list[str]
+
+
+class LayoutTransformerResponse(BaseModel):
+    final_json: dict[str, Any]
+    engine: Literal["layout_transformer_structural"] = "layout_transformer_structural"
+    debug: LayoutTransformerDebug
+
+
 app = FastAPI(title="Public Qwen2.5-VL Backend")
 app.add_middleware(
     CORSMiddleware,
@@ -291,6 +318,21 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+layout_transformer_service: StructuralLayoutTransformerService | None = None
+
+
+@app.on_event("startup")
+def load_layout_transformer_service() -> None:
+    global layout_transformer_service
+    if layout_transformer_service is not None:
+        return
+    if not LAYOUT_TRANSFORMER_CHECKPOINT.exists():
+        raise RuntimeError(f"Layout Transformer checkpoint not found: {LAYOUT_TRANSFORMER_CHECKPOINT}")
+    layout_transformer_service = StructuralLayoutTransformerService(
+        LAYOUT_TRANSFORMER_CHECKPOINT,
+        device=LAYOUT_TRANSFORMER_DEVICE,
+    )
 
 
 def _model_url(path: str) -> str:
@@ -627,6 +669,11 @@ def health() -> dict[str, Any]:
         "status": "ok",
         "model_service_url": MODEL_SERVICE_URL,
         "model": model_health,
+        "layout_transformer": {
+            "checkpoint": str(LAYOUT_TRANSFORMER_CHECKPOINT),
+            "loaded": layout_transformer_service is not None,
+            "roles": (layout_transformer_service.model_roles if layout_transformer_service else TRAIN_ROLES),
+        },
     }
 
 
@@ -894,6 +941,35 @@ def layout_engine_convert(request: LayoutEngineConvertRequest) -> LayoutEngineCo
         final_json=final_json,
         target_width=tw_i,
         target_height=th_i,
+    )
+
+
+@app.post("/api/layout-transformer", response_model=LayoutTransformerResponse)
+def layout_transformer_predict(request: LayoutTransformerRequest) -> LayoutTransformerResponse:
+    """
+    Predict a target clean semantic JSON from a source clean semantic JSON and target size.
+    Uses the structural Layout Transformer; no family id is accepted or required.
+    """
+    if layout_transformer_service is None:
+        raise HTTPException(status_code=503, detail="Layout Transformer service is not loaded.")
+    try:
+        final_json = layout_transformer_service.predict(
+            request.source_json,
+            request.target_width,
+            request.target_height,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"layout transformer prediction failed: {exc}") from exc
+
+    return LayoutTransformerResponse(
+        final_json=final_json,
+        debug=LayoutTransformerDebug(
+            target_width=request.target_width,
+            target_height=request.target_height,
+            model_roles=layout_transformer_service.model_roles,
+        ),
     )
 
 

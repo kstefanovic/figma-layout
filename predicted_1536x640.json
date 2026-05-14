@@ -1,0 +1,284 @@
+{
+  "id": "8:48430",
+  "name": "DOOH_1080x1920 · banner_root",
+  "type": "frame",
+  "bounds": {
+    "x": 0,
+    "y": 0,
+    "width": 1536.0,
+    "height": 640.0
+  },
+  "visible": true,
+  "opacity": 1,
+  "layoutMode": "NONE",
+  "itemSpacing": 0,
+  "padding": {
+    "top": 0,
+    "right": 0,
+    "bottom": 0,
+    "left": 0
+  },
+  "children": [
+    {
+      "id": "8:48432",
+      "name": "hero_image",
+      "type": "rectangle",
+      "bounds": {
+        "x": 453.4510803222656,
+        "y": -549.2016983032227,
+        "width": 1510.1384582519531,
+        "height": 1727.476806640625
+      },
+      "visible": true,
+      "opacity": 1
+    },
+    {
+      "id": "8:48436",
+      "name": "background_shape",
+      "type": "vector",
+      "bounds": {
+        "x": -53.654090881347656,
+        "y": -56.62789821624756,
+        "width": 888.3241882324219,
+        "height": 850.4265594482422
+      },
+      "visible": true,
+      "opacity": 1
+    },
+    {
+      "id": "8:48437",
+      "name": "background_gradient_1",
+      "type": "rectangle",
+      "bounds": {
+        "x": -47.3023567199707,
+        "y": -30.159001350402832,
+        "width": 317.36002349853516,
+        "height": 691.7778015136719
+      },
+      "visible": true,
+      "opacity": 1
+    },
+    {
+      "id": "8:48438",
+      "name": "background_gradient_2",
+      "type": "rectangle",
+      "bounds": {
+        "x": 839.2062377929688,
+        "y": 751.1624908447266,
+        "width": 498.6258544921875,
+        "height": 672.7756500244141
+      },
+      "visible": true,
+      "opacity": 1
+    },
+    {
+      "id": "8:48440",
+      "name": "star_decoration_1",
+      "type": "star",
+      "bounds": {
+        "x": 748.634765625,
+        "y": 293.06556701660156,
+        "width": 156.07453536987305,
+        "height": 167.12451934814453
+      },
+      "visible": true,
+      "opacity": 1
+    },
+    {
+      "id": "8:48442",
+      "name": "star_decoration_2",
+      "type": "star",
+      "bounds": {
+        "x": 144.79847717285156,
+        "y": 292.7350044250488,
+        "width": 102.13285446166992,
+        "height": 109.67670440673828
+      },
+      "visible": true,
+      "opacity": 1
+    },
+    {
+      "id": "8:48444",
+      "name": "legal_text",
+      "type": "text",
+      "bounds": {
+        "x": 54.99934387207031,
+        "y": 512.402229309082,
+        "width": 662.5408630371094,
+        "height": 69.12802696228027
+      },
+      "visible": true,
+      "opacity": 1,
+      "characters": "Доставку осуществляют партнёры сервиса Яндекс Еда.  Продавец —  ООО «Яндекс.Лавка» (123112, г. Москва, пр. 1-й Красно-гвардейский, д. 22, \nстр. 1, эт. 12, пом. 12-40, ОГРН 1187746479250)"
+    },
+    {
+      "id": "8:48445",
+      "name": "age_badge",
+      "type": "text",
+      "bounds": {
+        "x": 1400.5264892578125,
+        "y": 146.12605094909668,
+        "width": 55.299516677856445,
+        "height": 43.89498233795166
+      },
+      "visible": true,
+      "opacity": 0.95,
+      "characters": "0+"
+    },
+    {
+      "id": "8:48446",
+      "name": "headline_group",
+      "type": "frame",
+      "bounds": {
+        "x": 59.008174896240234,
+        "y": 184.31480407714844,
+        "width": 663.1098175048828,
+        "height": 288.98468017578125
+      },
+      "visible": true,
+      "opacity": 1,
+      "layoutMode": "NONE",
+      "itemSpacing": 0,
+      "padding": {
+        "top": 0,
+        "right": 0,
+        "bottom": 0,
+        "left": 0
+      },
+      "children": [
+        {
+          "id": "8:48447",
+          "name": "headline",
+          "type": "text",
+          "bounds": {
+            "x": 46.875972747802734,
+            "y": 186.54054641723633,
+            "width": 679.9715881347656,
+            "height": 200.6808090209961
+          },
+          "visible": true,
+          "opacity": 1,
+          "characters": "Еловый лимонад \nс малиной"
+        },
+        {
+          "id": "8:48448",
+          "name": "subheadline_delivery_time",
+          "type": "text",
+          "bounds": {
+            "x": 56.94924545288086,
+            "y": 409.8627471923828,
+            "width": 548.9111938476562,
+            "height": 54.60395336151123
+          },
+          "visible": true,
+          "opacity": 1,
+          "characters": "с доставкой от 15 минут"
+        }
+      ]
+    },
+    {
+      "id": "8:48449",
+      "name": "brand_group",
+      "type": "frame",
+      "bounds": {
+        "x": 67.63540649414062,
+        "y": 55.383219718933105,
+        "width": 560.6923828125,
+        "height": 74.6424674987793
+      },
+      "visible": true,
+      "opacity": 1,
+      "layoutMode": "NONE",
+      "itemSpacing": 15.979394912719727,
+      "padding": {
+        "top": 0,
+        "right": 0,
+        "bottom": 0,
+        "left": 0
+      },
+      "children": [
+        {
+          "id": "8:48451",
+          "name": "brand_name_first_part_1",
+          "type": "vector",
+          "bounds": {
+            "x": 53.63953399658203,
+            "y": 60.970168113708496,
+            "width": 45.86523914337158,
+            "height": 57.68571376800537
+          },
+          "visible": true,
+          "opacity": 1
+        },
+        {
+          "id": "8:48450",
+          "name": "brand_name_first_part_2",
+          "type": "vector",
+          "bounds": {
+            "x": 114.0359115600586,
+            "y": 85.99295616149902,
+            "width": 196.174072265625,
+            "height": 49.32260036468506
+          },
+          "visible": true,
+          "opacity": 1
+        },
+        {
+          "id": "8:48453",
+          "name": "logo",
+          "type": "boolean operation",
+          "bounds": {
+            "x": 313.79898834228516,
+            "y": 57.15567588806152,
+            "width": 77.42481422424316,
+            "height": 80.0855827331543
+          },
+          "visible": true,
+          "opacity": 1,
+          "children": [
+            {
+              "id": "8:48454",
+              "name": "logo_back",
+              "type": "vector",
+              "bounds": {
+                "x": 320.9219741821289,
+                "y": 56.74610137939453,
+                "width": 74.96148490905762,
+                "height": 79.78518009185791
+              },
+              "visible": true,
+              "opacity": 1
+            },
+            {
+              "id": "8:48456",
+              "name": "logo_fore",
+              "type": "vector",
+              "bounds": {
+                "x": 341.96898651123047,
+                "y": 78.38268756866455,
+                "width": 40.19307231903076,
+                "height": 44.48564052581787
+              },
+              "visible": true,
+              "opacity": 1
+            }
+          ]
+        },
+        {
+          "id": "8:48452",
+          "name": "brand_name_second",
+          "type": "vector",
+          "bounds": {
+            "x": 419.1290588378906,
+            "y": 64.1632604598999,
+            "width": 187.66647720336914,
+            "height": 59.01587963104248
+          },
+          "visible": true,
+          "opacity": 1
+        }
+      ]
+    }
+  ],
+  "templateId": "19"
+}

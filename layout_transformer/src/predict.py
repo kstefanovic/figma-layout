@@ -1,0 +1,202 @@
+"""Predict target semantic role bounds for one clean semantic JSON."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import re
+from pathlib import Path
+from typing import Any
+
+import torch
+
+from .extract import (
+    apply_child_relative_transform,
+    copy_json_with_predicted_bounds,
+    denorm_bbox,
+    flatten_semantic_nodes,
+    get_bbox_norm,
+    get_canvas_size,
+    place_age_badge_by_anchor,
+    place_floating_roles_by_anchor,
+)
+from .model import LayoutTransformer
+from .roles import NUM_ROLES, ROLE_TO_ID, TRAIN_ROLES
+
+RAW_NAME_RE = re.compile(r"^(?:\d+|Group\s+\d+|Group\s+#+)$", re.IGNORECASE)
+
+
+class StructuralLayoutTransformerService:
+    """Loaded structural layout transformer plus deterministic postprocess."""
+
+    def __init__(self, checkpoint: str | Path, device: str | None = None) -> None:
+        self.checkpoint = Path(checkpoint)
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        if self.device.startswith("cuda") and not torch.cuda.is_available():
+            raise RuntimeError("CUDA was requested but torch.cuda.is_available() is false")
+        checkpoint_payload = torch.load(self.checkpoint, map_location=self.device, weights_only=False)
+        checkpoint_roles = checkpoint_payload.get("roles")
+        if checkpoint_roles is not None and list(checkpoint_roles) != TRAIN_ROLES:
+            raise ValueError(
+                f"{self.checkpoint} was trained for roles {checkpoint_roles!r}; expected {TRAIN_ROLES!r}"
+            )
+        model_kwargs = dict(checkpoint_payload["model_kwargs"])
+        model_kwargs["num_roles"] = NUM_ROLES
+        self.model = LayoutTransformer(**model_kwargs).to(self.device)
+        self.model.load_state_dict(checkpoint_payload["model_state"])
+        self.model.eval()
+        self.model_roles = list(TRAIN_ROLES)
+
+    def predict(self, source_json: dict[str, Any], target_width: int | float, target_height: int | float) -> dict[str, Any]:
+        return predict_structural_layout(
+            model=self.model,
+            device=self.device,
+            source_json=source_json,
+            target_width=target_width,
+            target_height=target_height,
+        )
+
+
+def predict_structural_layout(
+    *,
+    model: LayoutTransformer,
+    device: str,
+    source_json: dict[str, Any],
+    target_width: int | float,
+    target_height: int | float,
+) -> dict[str, Any]:
+    """Predict structural parent roles, then deterministically postprocess children/floating roles."""
+    target_w = float(target_width)
+    target_h = float(target_height)
+    if target_w <= 0 or target_h <= 0:
+        raise ValueError("target_width and target_height must be positive")
+    source_w, source_h = get_canvas_size(source_json)
+    source_bboxes = torch.zeros((1, NUM_ROLES, 4), dtype=torch.float32)
+    role_mask = torch.zeros((1, NUM_ROLES), dtype=torch.float32)
+    nodes = flatten_semantic_nodes(source_json)
+    for role in TRAIN_ROLES:
+        node = nodes.get(role)
+        if node is None:
+            continue
+        role_id = ROLE_TO_ID[role]
+        source_bboxes[0, role_id] = torch.tensor(get_bbox_norm(node, source_w, source_h), dtype=torch.float32)
+        role_mask[0, role_id] = 1.0
+
+    with torch.no_grad():
+        pred = model(
+            torch.arange(NUM_ROLES, dtype=torch.long, device=device),
+            source_bboxes.to(device),
+            torch.tensor([[source_w, source_h]], dtype=torch.float32, device=device),
+            torch.tensor([[target_w, target_h]], dtype=torch.float32, device=device),
+            role_mask.to(device),
+        )[0].cpu()
+
+    pred_role_bboxes = {
+        role: pred[ROLE_TO_ID[role]].tolist()
+        for role in TRAIN_ROLES
+        if role_mask[0, ROLE_TO_ID[role]].item() > 0
+    }
+    pred_role_abs_bboxes = {
+        role: denorm_bbox(bbox, target_w, target_h)
+        for role, bbox in pred_role_bboxes.items()
+    }
+    output_json = copy_json_with_predicted_bounds(source_json, pred_role_bboxes, target_w, target_h)
+    apply_child_relative_transform(source_json, output_json, pred_role_abs_bboxes)
+    place_age_badge_by_anchor(source_json, output_json, target_w, target_h)
+    place_floating_roles_by_anchor(source_json, output_json, target_w, target_h)
+    validate_predicted_layout(output_json, int(round(target_w)), int(round(target_h)))
+    return output_json
+
+
+def validate_predicted_layout(final_json: dict[str, Any], target_width: int, target_height: int) -> None:
+    """Validate production output before returning it to the plugin."""
+    width, height = get_canvas_size(final_json)
+    if int(round(width)) != int(target_width) or int(round(height)) != int(target_height):
+        raise ValueError(
+            f"root bounds size {width}x{height} does not match target {target_width}x{target_height}"
+        )
+
+    nodes = flatten_semantic_nodes(final_json)
+    missing = [role for role in TRAIN_ROLES if role not in nodes]
+    if missing:
+        raise ValueError(f"predicted JSON is missing required roles: {missing}")
+
+    raw_names: list[str] = []
+    invalid_bounds: list[str] = []
+    for node in _walk_dict_nodes(final_json):
+        name = str(node.get("name") or "")
+        if RAW_NAME_RE.fullmatch(name.strip()):
+            raw_names.append(name)
+        bounds = node.get("bounds")
+        if isinstance(bounds, dict):
+            for key in ("x", "y", "width", "height"):
+                value = bounds.get(key)
+                try:
+                    number = float(value)
+                except (TypeError, ValueError):
+                    invalid_bounds.append(f"{name}.{key}={value!r}")
+                    continue
+                if not math.isfinite(number):
+                    invalid_bounds.append(f"{name}.{key}={value!r}")
+
+    if raw_names:
+        preview = raw_names[:20]
+        raise ValueError(f"predicted JSON contains raw layer names: {preview}")
+    if invalid_bounds:
+        preview = invalid_bounds[:20]
+        raise ValueError(f"predicted JSON contains invalid bounds: {preview}")
+
+
+def _walk_dict_nodes(node: Any) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+
+    def walk(item: Any) -> None:
+        if not isinstance(item, dict):
+            return
+        out.append(item)
+        for child in item.get("children") or []:
+            walk(child)
+
+    walk(node)
+    return out
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--checkpoint", required=True, type=Path)
+    parser.add_argument("--source-json", required=True, type=Path)
+    parser.add_argument("--source-index", type=int, default=0)
+    parser.add_argument("--target-width", required=True, type=float)
+    parser.add_argument("--target-height", required=True, type=float)
+    parser.add_argument("--out", required=True, type=Path)
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    args = parser.parse_args()
+
+    service = StructuralLayoutTransformerService(args.checkpoint, args.device)
+    source = _load_source(args.source_json, args.source_index)
+    output_json = service.predict(source, args.target_width, args.target_height)
+
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    with args.out.open("w", encoding="utf-8") as f:
+        json.dump(output_json, f, ensure_ascii=False, indent=2)
+    print(f"Predicted structural roles: {len(service.model_roles)}")
+    print(f"Wrote: {args.out}")
+
+
+def _load_source(path: Path, source_index: int) -> dict:
+    with path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    if isinstance(data, list):
+        if not data or not isinstance(data[0], dict):
+            raise ValueError("source JSON list must contain at least one frame object")
+        if source_index < 0 or source_index >= len(data):
+            raise IndexError(f"--source-index {source_index} is out of range for {len(data)} source frames")
+        return data[source_index]
+    if isinstance(data, dict):
+        return data
+    raise ValueError("source JSON must contain a frame object or a list of frame objects")
+
+
+if __name__ == "__main__":
+    main()

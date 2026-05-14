@@ -12,3 +12,4 @@ ortools
 torch
 torchvision
 torchaudio
+tqdm

@@ -13,3 +13,7 @@ gnn_layout/*.pt
 gnn_layout/*.jsonl
 
 gnn_layout/data/
+
+layout_transformer/checkpoints/
+layout_transformer/data/
+layout_transformer/previews/
