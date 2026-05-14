@@ -192,6 +192,10 @@ def postprocess_layout(
     report: dict[str, Any] = {
         "transformed_children_count": 0,
         "floating_roles_placed": [],
+        "text_alignment": None,
+        "text_alignment_applied": 0,
+        "headline_children_aligned": 0,
+        "font_size_fitted": 0,
         "warnings": [],
     }
 
@@ -207,6 +211,15 @@ def postprocess_layout(
         subreport = transform_subtree_by_parent(source_json, output_json, "offer_group", OFFER_CHILD_ROLES)
         report["transformed_children_count"] += int(subreport.get("transformed") or 0)
         report["warnings"].extend(subreport.get("warnings") or [])
+
+    from .postprocess_solver import apply_orientation_text_layout
+
+    alignment_report = apply_orientation_text_layout(source_json, output_json, target_w, target_h)
+    report["text_alignment"] = alignment_report.get("text_alignment")
+    report["text_alignment_applied"] = alignment_report.get("text_alignment_applied", 0)
+    report["headline_children_aligned"] = alignment_report.get("headline_children_aligned", 0)
+    report["font_size_fitted"] = alignment_report.get("font_size_fitted", 0)
+    report["warnings"].extend(alignment_report.get("warnings") or [])
 
     for role in FLOATING_RULE_ROLES:
         result = place_floating_by_anchor(source_json, output_json, role, target_w, target_h)

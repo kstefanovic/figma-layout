@@ -29,6 +29,10 @@ function absoluteBox(node, origin) {
   };
 }
 
+function finiteNumber(value) {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
 function serializeNode(node, origin, path) {
   const base = {
     id: node.id,
@@ -42,10 +46,11 @@ function serializeNode(node, origin, path) {
 
   if ("characters" in node) {
     base.characters = node.characters;
-    if ("fontSize" in node) base.fontSize = node.fontSize;
+    if ("fontSize" in node && finiteNumber(node.fontSize)) base.fontSize = node.fontSize;
     if ("fontName" in node) base.fontName = node.fontName;
     if ("textAlignHorizontal" in node) base.textAlignHorizontal = node.textAlignHorizontal;
     if ("textAlignVertical" in node) base.textAlignVertical = node.textAlignVertical;
+    if ("textAutoResize" in node) base.textAutoResize = node.textAutoResize;
   }
 
   if ("layoutMode" in node) {
@@ -1949,9 +1954,18 @@ async function createNodeFromJsonItem(item, parent, parentBounds, isRoot) {
   if (figmaType === "TEXT") {
     await figma.loadFontAsync({ family: "Inter", style: "Regular" });
     node = figma.createText();
+    if ("textAutoResize" in node) {
+      try {
+        node.textAutoResize = item.textAutoResize || "NONE";
+      } catch (_e) {
+        /* keep Figma default */
+      }
+    }
     node.characters = String(item.characters || item.name || "Text");
     node.fontName = { family: "Inter", style: "Regular" };
     node.fontSize = typeof item.fontSize === "number" ? Math.max(1, item.fontSize) : 16;
+    if (item.textAlignHorizontal) node.textAlignHorizontal = item.textAlignHorizontal;
+    if (item.textAlignVertical) node.textAlignVertical = item.textAlignVertical;
     node.fills = [{ type: "SOLID", color: { r: 0.05, g: 0.06, b: 0.08 } }];
   } else if (figmaType === "FRAME") {
     node = figma.createFrame();
@@ -2214,6 +2228,17 @@ async function applyFinalJsonContentToClone(finalJson, convertedFrame) {
         }
       }
       try {
+        if ("textAutoResize" in node) {
+          try {
+            node.textAutoResize = item.textAutoResize || "NONE";
+          } catch (_e) {
+            /* ignore text nodes that reject fixed resize mode */
+          }
+        }
+        const b = item.bounds && typeof item.bounds === "object" ? item.bounds : null;
+        if (b && typeof b.width === "number" && typeof b.height === "number") {
+          resizeNodeIfPossible(node, b.width, b.height);
+        }
         node.characters = String(item.characters || "");
         if (typeof item.fontSize === "number" && Number.isFinite(item.fontSize)) {
           node.fontSize = Math.max(1, item.fontSize);
@@ -2223,6 +2248,9 @@ async function applyFinalJsonContentToClone(finalJson, convertedFrame) {
         }
         if (item.textAlignVertical) {
           node.textAlignVertical = item.textAlignVertical;
+        }
+        if (b && typeof b.width === "number" && typeof b.height === "number") {
+          resizeNodeIfPossible(node, b.width, b.height);
         }
         applied++;
       } catch (e) {
@@ -3189,8 +3217,11 @@ figma.ui.onmessage = async (msg) => {
           applyJsonTreeNamesByPath(finalJson, layoutClone);
           const recon = applyFinalJsonCloneReconstruction(finalJson, layoutClone);
           applyJsonTreeNamesByPath(finalJson, layoutClone);
+          const contentReport = await applyFinalJsonContentToClone(finalJson, layoutClone);
+          applyFinalAbsoluteBoundsCorrection(finalJson, layoutClone);
           const namingReport = finalizeSemanticLayerNamesFromJson(finalJson, layoutClone);
           applyExactNodeNamesFromJson(finalJson, layoutClone);
+          applyFinalAbsoluteBoundsCorrection(finalJson, layoutClone);
           layoutClone.name = targetSizeName(targetResolution);
 
           figma.currentPage.selection = [layoutClone];
@@ -3203,7 +3234,7 @@ figma.ui.onmessage = async (msg) => {
                 `Reorder: ${recon.reorderAfterPrune.moves}+${recon.reorderAfterStray.moves} · Stamp: ${recon.stampReport.stamped}` +
                 (recon.stampReport.mismatchWarn ? ` (${recon.stampReport.mismatchWarn} mismatches)` : "") +
                 `\nLayout: ${recon.layoutReport.applied} · Bounds fix: ${recon.boundsFixReport.corrected} · Empty removed: ${recon.emptyReport.removed}\n` +
-                `Layers renamed: ${namingReport.renamed} (id map ${namingReport.mapped}).`,
+                `Text/content: ${contentReport.applied} · Layers renamed: ${namingReport.renamed} (id map ${namingReport.mapped}).`,
               { timeout: 6 },
             );
           } else {

@@ -47,6 +47,7 @@ class StructuralLayoutTransformerService:
         self.last_report: dict[str, Any] = {
             "transformed_children_count": 0,
             "floating_roles_placed": [],
+            "font_size_fitted": 0,
             "warnings": [],
         }
 
@@ -190,6 +191,10 @@ def main() -> None:
         json.dump(output_json, f, ensure_ascii=False, indent=2)
     print(f"Predicted structural roles: {len(service.model_roles)}")
     print(f"transformed_children_count: {service.last_report.get('transformed_children_count', 0)}")
+    print(f"text_alignment: {service.last_report.get('text_alignment')}")
+    print(f"text_alignment_applied: {service.last_report.get('text_alignment_applied', 0)}")
+    print(f"headline_children_aligned: {service.last_report.get('headline_children_aligned', 0)}")
+    print(f"font_size_fitted: {service.last_report.get('font_size_fitted', 0)}")
     print(f"floating_roles_placed: {service.last_report.get('floating_roles_placed', [])}")
     print(f"warnings: {service.last_report.get('warnings', [])}")
     print(f"Wrote: {args.out}")
