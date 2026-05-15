@@ -8,7 +8,7 @@ from typing import Any
 
 from .postprocess import find_by_role, get_bounds, set_bounds, validate_postprocess_bounds
 from .postprocess_solver import _is_text_node
-from .prototype_index import CHILD_PARENT, FLOATING_PROTO_ROLES
+from .prototype_index import CHILD_PARENT, FLOATING_PROTO_ROLES, inferred_text_font_size_for_role
 
 TEXT_ROLE_CLAMPS = {
     "headline": (28.0, 80.0),
@@ -16,9 +16,10 @@ TEXT_ROLE_CLAMPS = {
     "legal_text": (5.0, 18.0),
 }
 PORTRAIT_640_TEXT_CLAMPS = {
-    "headline": (30.0, 34.0),
-    "subheadline_delivery_time": (13.0, 16.0),
-    "legal_text": (6.0, 8.0),
+    # Match general clamps so geometry-based scaling is not capped at ~34px headline.
+    "headline": (28.0, 80.0),
+    "subheadline_delivery_time": (10.0, 36.0),
+    "legal_text": (5.0, 18.0),
 }
 NON_CLIPPING_FRAME_ROLES = {"brand_group", "offer_group"}
 
@@ -45,7 +46,33 @@ BRAND_GROUP_LAYOUT_ROLES = (
     "logo",
 )
 LOGO_LAYOUT_ROLES = ("logo_back", "logo_fore")
-TEXT_ROLES_STYLE = ("headline", "subheadline_delivery_time", "legal_text")
+TEXT_ROLES_STYLE = ("headline", "subheadline_delivery_time", "legal_text", "age_badge")
+PORTRAIT_640_EXACT_TEXT_STYLES: dict[str, dict[str, Any]] = {
+    "headline": {
+        "fontSize": 36.0,
+        "textAutoResize": "NONE",
+        "textAlignHorizontal": "CENTER",
+        "textAlignVertical": "CENTER",
+    },
+    "subheadline_delivery_time": {
+        "fontSize": 14.0,
+        "textAutoResize": "NONE",
+        "textAlignHorizontal": "CENTER",
+        "textAlignVertical": "CENTER",
+    },
+    "legal_text": {
+        "fontSize": 6.0,
+        "textAutoResize": "NONE",
+        "textAlignHorizontal": "CENTER",
+        "textAlignVertical": "CENTER",
+    },
+    "age_badge": {
+        "fontSize": 25.0,
+        "textAutoResize": "NONE",
+        "textAlignHorizontal": "CENTER",
+        "textAlignVertical": "CENTER",
+    },
+}
 
 PROTO_TEXT_STYLE_KEYS = (
     "fontSize",
@@ -136,7 +163,7 @@ def apply_prototype_postprocess(
         "warnings": [],
         "debug": {
             "text_postprocess_mode": "prototype_relative_to_parent",
-            "text_roles_applied": ["headline", "subheadline_delivery_time", "legal_text"],
+            "text_roles_applied": list(TEXT_ROLES_STYLE),
         },
     }
     if not isinstance(prototype, dict):
@@ -206,7 +233,7 @@ def _apply_clipping_rules(root: dict[str, Any]) -> None:
         if name in NON_CLIPPING_FRAME_ROLES:
             node["clipsContent"] = False
         elif name == "headline_group":
-            node["clipsContent"] = True
+            node["clipsContent"] = False
         for child in node.get("children") or []:
             walk(child)
 
@@ -447,6 +474,16 @@ def _apply_proto_text_style_keys(proto_style: dict[str, Any], target_node: dict[
             target_node[key] = value
 
 
+def _apply_exact_text_style(style: dict[str, Any], target_node: dict[str, Any]) -> None:
+    for key, value in style.items():
+        if key in ("fontName", "lineHeight", "letterSpacing"):
+            target_node[key] = copy.deepcopy(value)
+        elif key in ("fontSize", "opacity") and isinstance(value, (int, float)):
+            target_node[key] = float(value)
+        else:
+            target_node[key] = value
+
+
 def _copy_characters_and_fallback_paint(source_node: dict[str, Any] | None, target_node: dict[str, Any]) -> None:
     if not isinstance(source_node, dict):
         return
@@ -463,6 +500,12 @@ def _copy_characters_and_fallback_paint(source_node: dict[str, Any] | None, targ
 
 def _default_align_horizontal(target_w: float, target_h: float) -> str:
     return "CENTER" if target_w <= target_h else "LEFT"
+
+
+def _exact_text_style_for_target(role: str, target_w: float, target_h: float) -> dict[str, Any] | None:
+    if _is_640_portrait_like(target_w, target_h):
+        return PORTRAIT_640_EXACT_TEXT_STYLES.get(role)
+    return None
 
 
 def _apply_prototype_text_styles(
@@ -483,18 +526,25 @@ def _apply_prototype_text_styles(
         if node is None or not _is_text_node(node):
             continue
         source_node = find_by_role(source_json, role)
-        proto_style = proto_styles.get(role) if isinstance(proto_styles.get(role), dict) else {}
         _copy_characters_and_fallback_paint(source_node, node)
-        had_proto_font_size = isinstance(proto_style.get("fontSize"), (int, float)) and math.isfinite(float(proto_style["fontSize"]))
+        exact_style = _exact_text_style_for_target(role, target_w, target_h)
+        if exact_style is not None:
+            _apply_exact_text_style(exact_style, node)
+            report["font_size_fitted"] += 1
+            continue
+
+        proto_style = proto_styles.get(role) if isinstance(proto_styles.get(role), dict) else {}
         _apply_proto_text_style_keys(proto_style, node)
 
-        if not had_proto_font_size or not isinstance(node.get("fontSize"), (int, float)):
-            scaled = _prototype_scaled_font_size(role, source_node, node, prototype, proto_style, target_w, target_h)
-            if scaled is None:
-                scaled = _role_based_font_size(role, node, headline_size, target_w, target_h)
-            if scaled is not None:
-                node["fontSize"] = scaled
-                report["font_size_fitted"] += 1
+        scaled = _prototype_scaled_font_size(role, source_node, node, prototype, proto_style, target_w, target_h)
+        if scaled is None:
+            scaled = _role_based_font_size(role, node, headline_size, target_w, target_h)
+        if scaled is not None:
+            node["fontSize"] = scaled
+            report["font_size_fitted"] += 1
+            lh = node.get("lineHeight")
+            if isinstance(lh, dict) and str(lh.get("unit", "")).upper() == "PIXELS":
+                node["lineHeight"] = {"unit": "PIXELS", "value": max(1.0, round(float(scaled) * 1.15))}
 
         ha = node.get("textAlignHorizontal")
         if not isinstance(ha, str) or not ha.strip():
@@ -522,7 +572,7 @@ def _headline_anchor_font_size(headline_node: dict[str, Any] | None, target_w: f
     height = get_bounds(headline_node)["height"]
     if height <= 0:
         return None
-    return _clamp_role_font("headline", height * 0.38, target_w, target_h)
+    return _clamp_role_font("headline", height * 0.48, target_w, target_h)
 
 
 def _role_based_font_size(
@@ -553,6 +603,26 @@ def _is_640_portrait_like(target_w: float | None, target_h: float | None) -> boo
     return target_w <= target_h and abs(target_w - 640.0) <= 80.0 and abs(target_h - 720.0) <= 120.0
 
 
+def _font_size_from_source_layout(
+    role: str,
+    source_node: dict[str, Any] | None,
+    target_node: dict[str, Any],
+) -> float | None:
+    """Scale effective source font size by target/source text box height (tracks reflow across aspect ratios)."""
+    if not isinstance(source_node, dict):
+        return None
+    sb = get_bounds(source_node)
+    tb = get_bounds(target_node)
+    if sb["height"] <= 0 or tb["height"] <= 0:
+        return None
+    raw = source_node.get("fontSize")
+    if isinstance(raw, (int, float)) and math.isfinite(float(raw)):
+        src_fs = float(raw)
+    else:
+        src_fs = inferred_text_font_size_for_role(role, source_node)
+    return src_fs * tb["height"] / sb["height"]
+
+
 def _prototype_scaled_font_size(
     role: str,
     source_node: dict[str, Any] | None,
@@ -563,19 +633,19 @@ def _prototype_scaled_font_size(
     target_h: float,
 ) -> float | None:
     target_height = get_bounds(target_node)["height"]
+    if target_height <= 0:
+        return None
+
+    from_source = _font_size_from_source_layout(role, source_node, target_node)
+    if from_source is not None and math.isfinite(from_source):
+        return _clamp_role_font(role, from_source, target_w, target_h)
+
     proto_font_size = proto_style.get("fontSize")
     proto_height = _prototype_abs_height(role, prototype)
     if isinstance(proto_font_size, (int, float)) and math.isfinite(float(proto_font_size)) and proto_height > 0:
         size = float(proto_font_size) * target_height / proto_height
-    else:
-        if not isinstance(source_node, dict):
-            return None
-        source_bounds = get_bounds(source_node)
-        source_size = source_node.get("fontSize")
-        if not isinstance(source_size, (int, float)) or not math.isfinite(float(source_size)) or source_bounds["height"] <= 0:
-            return None
-        size = float(source_size) * target_height / source_bounds["height"]
-    return _clamp_role_font(role, size, target_w, target_h)
+        return _clamp_role_font(role, size, target_w, target_h)
+    return None
 
 
 def _prototype_parent_norm_bbox(parent_role: str, prototype: dict[str, Any]) -> dict[str, Any] | None:

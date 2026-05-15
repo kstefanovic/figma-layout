@@ -55,7 +55,10 @@ class PrototypeTextPostprocessTest(unittest.TestCase):
         self.assertEqual(service.last_report.get("postprocess_mode"), "prototype_relative_text")
         dbg = service.last_report.get("debug") or {}
         self.assertEqual(dbg.get("text_postprocess_mode"), "prototype_relative_to_parent")
-        self.assertEqual(dbg.get("text_roles_applied"), ["headline", "subheadline_delivery_time", "legal_text"])
+        self.assertEqual(
+            dbg.get("text_roles_applied"),
+            ["headline", "subheadline_delivery_time", "legal_text", "age_badge"],
+        )
 
         hg = _find_first_by_name(final_json, "headline_group")
         self.assertIsNotNone(hg)
@@ -71,6 +74,43 @@ class PrototypeTextPostprocessTest(unittest.TestCase):
         self.assertIsNotNone(headline)
         self.assertIsInstance(headline.get("fontSize"), (int, float))
         self.assertGreater(float(headline["fontSize"]), 0.0)
+        self.assertEqual(
+            _text_style_subset(headline),
+            {
+                "fontSize": 36.0,
+                "textAutoResize": "NONE",
+                "textAlignHorizontal": "CENTER",
+                "textAlignVertical": "CENTER",
+            },
+        )
+        self.assertEqual(
+            _text_style_subset(find_by_role(final_json, "subheadline_delivery_time")),
+            {
+                "fontSize": 14.0,
+                "textAutoResize": "NONE",
+                "textAlignHorizontal": "CENTER",
+                "textAlignVertical": "CENTER",
+            },
+        )
+        self.assertEqual(
+            _text_style_subset(find_by_role(final_json, "legal_text")),
+            {
+                "fontSize": 6.0,
+                "textAutoResize": "NONE",
+                "textAlignHorizontal": "CENTER",
+                "textAlignVertical": "CENTER",
+            },
+        )
+        age_badge = find_by_role(final_json, "age_badge")
+        self.assertEqual(
+            _text_style_subset(age_badge),
+            {
+                "fontSize": 25.0,
+                "textAutoResize": "NONE",
+                "textAlignHorizontal": "CENTER",
+                "textAlignVertical": "CENTER",
+            },
+        )
         pb = get_bounds(hg)
         hb = get_bounds(headline)
         rh = rels["headline"]
@@ -159,6 +199,17 @@ def _find_first_by_name(frame: dict[str, Any], role: str) -> dict[str, Any] | No
 
     walk(frame)
     return found
+
+
+def _text_style_subset(node: dict[str, Any] | None) -> dict[str, Any]:
+    assert node is not None
+    keys = [
+        "fontSize",
+        "textAutoResize",
+        "textAlignHorizontal",
+        "textAlignVertical",
+    ]
+    return {key: node.get(key) for key in keys}
 
 
 if __name__ == "__main__":

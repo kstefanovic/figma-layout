@@ -301,6 +301,17 @@ def _norm_bbox(bounds: dict[str, float], canvas: dict[str, float]) -> dict[str, 
     }
 
 
+def default_font_name_for_role(role: str | None) -> dict[str, str]:
+    """Fallback font when clean semantic JSON omits ``fontName`` (common for training exports)."""
+    if role == "headline":
+        return {"family": "YS Display Compressed", "style": "Heavy"}
+    if role == "subheadline_delivery_time":
+        return {"family": "YS Text", "style": "Medium"}
+    if role == "legal_text":
+        return {"family": "YS Text", "style": "Regular"}
+    return {"family": "YS Text", "style": "Regular"}
+
+
 def _text_style(
     node: dict[str, Any],
     *,
@@ -362,7 +373,7 @@ def _text_style(
     if "fontSize" not in out:
         out["fontSize"] = _inferred_font_size_from_bounds(role, child_bounds)
     if "fontName" not in out:
-        out["fontName"] = {"family": "Inter", "style": "Regular"}
+        out["fontName"] = default_font_name_for_role(role)
     if "textAlignHorizontal" not in out:
         if parent_bounds is not None and parent_bounds.get("width", 0.0) > 0:
             out["textAlignHorizontal"] = _infer_text_align_horizontal(child_bounds, parent_bounds)
@@ -393,11 +404,11 @@ def _inferred_font_size_from_bounds(role: str | None, child_bounds: dict[str, fl
     if h <= 0:
         return 16.0
     if role == "headline":
-        factor = 0.38
+        factor = 0.48
     elif role == "subheadline_delivery_time":
-        factor = 0.40
+        factor = 0.44
     elif role == "legal_text":
-        factor = 0.24
+        factor = 0.28
     else:
         factor = 0.34
     return max(8.0, min(128.0, h * factor))
@@ -441,6 +452,13 @@ def _bounds(node: dict[str, Any] | None) -> dict[str, float]:
         "width": _num(raw.get("width"), 0.0),
         "height": _num(raw.get("height"), 0.0),
     }
+
+
+def inferred_text_font_size_for_role(role: str | None, node: dict[str, Any] | None) -> float:
+    """Nominal ``fontSize`` from text bounds when JSON omits explicit typography."""
+    if not isinstance(node, dict):
+        return _inferred_font_size_from_bounds(role, {"x": 0.0, "y": 0.0, "width": 0.0, "height": 0.0})
+    return _inferred_font_size_from_bounds(role, _bounds(node))
 
 
 def _area(bounds: dict[str, float]) -> float:

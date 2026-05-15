@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Frame to JSON</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+      }
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        margin: 0;
+        padding: 16px;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+      h1 {
+        font-size: 16px;
+        margin: 0;
+      }
+      #status {
+        font-size: 12px;
+        color: var(--figma-color-text-secondary, #666);
+      }
+      textarea {
+        flex: 1;
+        width: 100%;
+        min-height: 360px;
+        resize: vertical;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 12px;
+        padding: 10px;
+        border-radius: 6px;
+        border: 1px solid rgba(0, 0, 0, 0.1);
+      }
+      button {
+        align-self: flex-start;
+        padding: 8px 12px;
+        font-size: 12px;
+        border-radius: 6px;
+        border: 1px solid rgba(0, 0, 0, 0.1);
+        background: #18a0fb;
+        color: white;
+        cursor: pointer;
+      }
+      button:active {
+        transform: translateY(1px);
+      }
+      .error {
+        color: #e5534b;
+      }
+    </style>
+  </head>
+  <body>
+    <button id="get-top-level-frames" style="display: none">
+      Get Top Level Frames
+    </button>
+
+    <!-- <input id="desired-children-count" type="number" value="8" /> -->
+    <input id="template-id" value="" placeholder="template id" />
+    <div id="status"></div>
+    <button id="export-selected-frames">Export Selected Frames</button>
+
+    <script>
+      const getTopFramesButton = document.getElementById(
+        "get-top-level-frames"
+      );
+      const templateIdInput = document.getElementById("template-id");
+      const exportButton = document.getElementById("export-selected-frames");
+      const statusElement = document.getElementById("status");
+      getTopFramesButton.addEventListener("click", async () => {
+        parent.postMessage(
+          {
+            pluginMessage: {
+              type: "get-top-level-frames",
+              // id: chosenId,
+              // overrides: {
+              //   x: newX.value,
+              //   y: newY.value,
+              //   width: newW.value,
+              //   height: newH.value,
+              // },
+            },
+          },
+          "*"
+        );
+      });
+
+      exportButton.addEventListener("click", async () => {
+        // const desiredChildrenCount = parseInt(
+        //   desiredChildrenCountInput.nodeValue
+        // );
+        statusElement.innerText = "";
+        const templateId = templateIdInput.value;
+        parent.postMessage(
+          {
+            pluginMessage: {
+              type: "export-selected-frames",
+              templateId,
+            },
+          },
+          "*"
+        );
+      });
+
+      onmessage = (event) => {
+        if (event.data.pluginMessage.type === "export-json") {
+          const data = event.data.pluginMessage.data;
+          const id = event.data.pluginMessage.templateId;
+          downloadJSON(id, data);
+        } else if (event.data.pluginMessage.type === "error") {
+          statusElement.innerText = event.data.pluginMessage.msg;
+        }
+      };
+
+      function downloadJSON(id, data) {
+        const blob = new Blob([JSON.stringify(data, null, 2)], {
+          type: "application/json",
+        });
+
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `layout_${id}_${Date.now()}.json`;
+        a.click();
+        URL.revokeObjectURL(url);
+
+        statusElement.innerText = "Export completed";
+      }
+    </script>
+  </body>
+</html>

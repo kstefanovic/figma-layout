@@ -9,6 +9,12 @@ figma.showUI(__html__, { width: 400, height: 760 });
 
 /** Horizontal gap between the source frame and a sibling created by the plugin (px). */
 const BESIDE_FRAME_GAP = 80;
+const SOURCE_STYLE_TEXT_ROLES = new Set([
+  "headline",
+  "subheadline_delivery_time",
+  "legal_text",
+  "age_badge",
+]);
 
 function normalizeType(type) {
   return String(type || "").toLowerCase().replace(/_/g, " ");
@@ -776,6 +782,14 @@ function getSemanticName(item) {
     return item.semantic_name || item.semanticName || item.role || null;
   }
   return null;
+}
+
+function semanticRoleName(item) {
+  return String(item && (item.name || item.semantic_name || item.semanticName || item.role) || "").trim();
+}
+
+function shouldCloneSourceTextForRole(item) {
+  return SOURCE_STYLE_TEXT_ROLES.has(semanticRoleName(item));
 }
 
 function sanitizeLayerName(name) {
@@ -2007,14 +2021,14 @@ function applyJsonTextStyle(node, item) {
   if (!node || !item) return 0;
   let applied = 0;
   for (const key of [
-    "fills",
-    "opacity",
     "lineHeight",
     "letterSpacing",
     "paragraphSpacing",
     "paragraphIndent",
     "textCase",
     "textDecoration",
+    "fills",
+    "opacity",
   ]) {
     if (applyJsonPropertyIfPresent(node, item, key)) applied++;
   }
@@ -2023,7 +2037,7 @@ function applyJsonTextStyle(node, item) {
 
 function shouldDisableClippingForJsonItem(item) {
   const name = String(item && item.name ? item.name : "").trim();
-  return name === "brand_group" || name === "offer_group";
+  return name === "brand_group" || name === "headline_group" || name === "offer_group";
 }
 
 function isJsonRootFrame(item) {
@@ -2294,9 +2308,124 @@ function applyPredictedJsonToClone(predictedJson, convertedFrame) {
   return { applied, missing };
 }
 
-async function applyFinalJsonContentToClone(finalJson, convertedFrame) {
+function findTextNodeBySemanticRole(root, role) {
+  if (!root || !role || !("findAll" in root)) return null;
+  const wanted = String(role).trim();
+  const matches = root.findAll((node) => {
+    if (!node || !("characters" in node)) return false;
+    const directName = String(node.name || "").trim();
+    let semanticName = "";
+    try {
+      semanticName = String(node.getPluginData("semanticName") || node.getPluginData("semanticRole") || "").trim();
+    } catch (_e) {
+      semanticName = "";
+    }
+    return directName === wanted || semanticName === wanted;
+  });
+  return matches.length ? matches[0] : null;
+}
+
+function resolveSourceTextNodeForJson(item, sourceNodeByOriginalId, sourcePathNodeMap, sourceFrame) {
+  if (!item || typeof item !== "object") return null;
+  const id = String(item.id || "").trim();
+  const path = String(item.path || "").trim();
+  if (id && sourceNodeByOriginalId && sourceNodeByOriginalId.has(id)) {
+    const node = sourceNodeByOriginalId.get(id);
+    if (node && "characters" in node) return node;
+  }
+  if (path && sourcePathNodeMap && sourcePathNodeMap.has(path)) {
+    const node = sourcePathNodeMap.get(path);
+    if (node && "characters" in node) return node;
+  }
+  return findTextNodeBySemanticRole(sourceFrame, semanticRoleName(item));
+}
+
+function loadUniformTextFont(node, role) {
+  const fontName = node && node.fontName;
+  if (fontName && typeof fontName === "object" && fontName.family && fontName.style) {
+    return loadJsonFontName(fontName);
+  }
+  console.error("[TEXT_FONT_LOAD_FAILED]", role, "source text has mixed or invalid fontName", fontName);
+  throw new Error(`Source text font unavailable for ${role}: mixed or invalid fontName.`);
+}
+
+async function cloneSourceTextIntoJsonParent(item, parentJsonNode, convertedFrame, resolveTarget, sourceNodeByOriginalId, sourcePathNodeMap, sourceFrame) {
+  const role = semanticRoleName(item);
+  const sourceText = resolveSourceTextNodeForJson(item, sourceNodeByOriginalId, sourcePathNodeMap, sourceFrame);
+  if (!sourceText || !("characters" in sourceText)) {
+    console.warn("[TEXT_CLONE_MISSING_SOURCE]", role, item && (item.id || item.path || item.name));
+    return null;
+  }
+
+  const parentNode = parentJsonNode ? resolveTarget(parentJsonNode, false) : convertedFrame;
+  if (!parentNode || typeof parentNode.appendChild !== "function") {
+    console.warn("[TEXT_CLONE_MISSING_PARENT]", role, parentJsonNode && (parentJsonNode.id || parentJsonNode.path || parentJsonNode.name));
+    return null;
+  }
+
+  const existing = resolveTarget(item, false);
+  const insertIndex =
+    existing && existing.parent && existing.parent.id === parentNode.id && Array.isArray(parentNode.children)
+      ? parentNode.children.indexOf(existing)
+      : parentNode.children.length;
+
+  const node = sourceText.clone();
+  await loadUniformTextFont(node, role);
+  try {
+    node.setPluginData("originalNodeId", String(item.id || ""));
+    node.setPluginData("semanticName", role);
+  } catch (_e) {
+    /* plugin data is best-effort */
+  }
+  node.name = role || String(item.name || sourceText.name || "text");
+
+  if (insertIndex >= 0 && insertIndex < parentNode.children.length && typeof parentNode.insertChild === "function") {
+    parentNode.insertChild(insertIndex, node);
+  } else {
+    parentNode.appendChild(node);
+  }
+  if (existing && existing.id !== node.id) {
+    try {
+      existing.remove();
+    } catch (e) {
+      console.warn("[TEXT_CLONE_REMOVE_OLD_FAILED]", role, e);
+    }
+  }
+
+  if ("textAutoResize" in node) node.textAutoResize = "NONE";
+  node.characters = String(item.characters || "");
+  const b = item.bounds && typeof item.bounds === "object" ? item.bounds : null;
+  const pb = parentJsonNode && parentJsonNode.bounds && typeof parentJsonNode.bounds === "object" ? parentJsonNode.bounds : null;
+  if (b && typeof b.width === "number" && typeof b.height === "number") {
+    resizeNodeIfPossible(node, b.width, b.height);
+    node.x = typeof b.x === "number" ? b.x - (pb && typeof pb.x === "number" ? pb.x : 0) : node.x;
+    node.y = typeof b.y === "number" ? b.y - (pb && typeof pb.y === "number" ? pb.y : 0) : node.y;
+  }
+  if (typeof item.fontSize === "number" && Number.isFinite(item.fontSize)) {
+    node.fontSize = Math.max(1, item.fontSize);
+  }
+  if (item.textAlignHorizontal) node.textAlignHorizontal = item.textAlignHorizontal;
+  if (item.textAlignVertical) node.textAlignVertical = item.textAlignVertical;
+
+  console.log("[TEXT_APPLIED]", role, {
+    fontSize: node.fontSize,
+    fontName: node.fontName,
+    textAutoResize: node.textAutoResize,
+    alignH: node.textAlignHorizontal,
+    alignV: node.textAlignVertical,
+    width: node.width,
+    height: node.height,
+    x: node.x,
+    y: node.y,
+  });
+  return node;
+}
+
+async function applyFinalJsonContentToClone(finalJson, convertedFrame, sourceFrame) {
   const { map: nodeByOriginalId } = collectClonedNodesByOriginalId(convertedFrame);
+  const { map: sourceNodeByOriginalId } = sourceFrame ? collectClonedNodesByOriginalId(sourceFrame) : { map: new Map() };
   const pathNodeMap = buildPathNodeMap(convertedFrame);
+  const sourcePathNodeMap = sourceFrame ? buildPathNodeMap(sourceFrame) : new Map();
   let applied = 0;
   const missing = [];
 
@@ -2310,8 +2439,26 @@ async function applyFinalJsonContentToClone(finalJson, convertedFrame) {
     return null;
   }
 
-  async function walk(item, isRoot) {
+  async function walk(item, parentJsonNode, isRoot) {
     if (!item || typeof item !== "object") return;
+    if (!isRoot && sourceFrame && shouldCloneSourceTextForRole(item)) {
+      const cloned = await cloneSourceTextIntoJsonParent(
+        item,
+        parentJsonNode,
+        convertedFrame,
+        resolve,
+        sourceNodeByOriginalId,
+        sourcePathNodeMap,
+        sourceFrame,
+      );
+      if (cloned) applied++;
+      const children = Array.isArray(item.children) ? item.children : [];
+      for (const child of children) {
+        await walk(child, item, false);
+      }
+      return;
+    }
+
     const node = resolve(item, isRoot);
     if (!node) {
       if (item.id || item.path) missing.push(String(item.id || item.path));
@@ -2338,23 +2485,24 @@ async function applyFinalJsonContentToClone(finalJson, convertedFrame) {
 
     if (isJsonTextNode) {
       try {
-        node.fontName = await loadJsonFontName(item.fontName);
+        const fontName = await loadJsonFontName(item.fontName);
+        node.fontName = fontName;
         node.characters = String(item.characters || "");
         if ("textAutoResize" in node) node.textAutoResize = "NONE";
-        if (typeof item.fontSize === "number" && Number.isFinite(item.fontSize)) {
-          node.fontSize = Math.max(1, item.fontSize);
-        }
         const b = item.bounds && typeof item.bounds === "object" ? item.bounds : null;
         if (b && typeof b.width === "number" && typeof b.height === "number") {
           resizeNodeIfPossible(node, b.width, b.height);
         }
-        applied += applyJsonTextStyle(node, item);
+        if (typeof item.fontSize === "number" && Number.isFinite(item.fontSize)) {
+          node.fontSize = Math.max(1, item.fontSize);
+        }
         if (item.textAlignHorizontal) {
           node.textAlignHorizontal = item.textAlignHorizontal;
         }
         if (item.textAlignVertical) {
           node.textAlignVertical = item.textAlignVertical;
         }
+        applied += applyJsonTextStyle(node, item);
         applied++;
       } catch (e) {
         console.warn("applyFinalJsonContentToClone: text content apply failed", node && node.name, e);
@@ -2363,11 +2511,11 @@ async function applyFinalJsonContentToClone(finalJson, convertedFrame) {
 
     const children = Array.isArray(item.children) ? item.children : [];
     for (const child of children) {
-      await walk(child, false);
+      await walk(child, item, false);
     }
   }
 
-  await walk(finalJson, true);
+  await walk(finalJson, null, true);
   return { applied, missing };
 }
 
@@ -3191,7 +3339,7 @@ figma.ui.onmessage = async (msg) => {
           removeEmptyZeroSizeNodes(convertedFrame);
           applyJsonTreeNamesByPath(result.final_json, convertedFrame);
           removeEmptyZeroSizeNodes(convertedFrame);
-          const contentReport = await applyFinalJsonContentToClone(result.final_json, convertedFrame);
+          const contentReport = await applyFinalJsonContentToClone(result.final_json, convertedFrame, selectedFrame);
           const namingReport = finalizeSemanticLayerNamesFromJson(result.final_json, convertedFrame);
           const exactNameReport = applyExactNodeNamesFromJson(result.final_json, convertedFrame);
           removeEmptyZeroSizeNodes(convertedFrame);
@@ -3320,7 +3468,7 @@ figma.ui.onmessage = async (msg) => {
           applyJsonTreeNamesByPath(finalJson, layoutClone);
           const recon = applyFinalJsonCloneReconstruction(finalJson, layoutClone);
           applyJsonTreeNamesByPath(finalJson, layoutClone);
-          const contentReport = await applyFinalJsonContentToClone(finalJson, layoutClone);
+          const contentReport = await applyFinalJsonContentToClone(finalJson, layoutClone, selectedFrame);
           applyFinalAbsoluteBoundsCorrection(finalJson, layoutClone);
           const namingReport = finalizeSemanticLayerNamesFromJson(finalJson, layoutClone);
           applyExactNodeNamesFromJson(finalJson, layoutClone);
