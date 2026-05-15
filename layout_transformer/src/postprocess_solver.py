@@ -55,7 +55,7 @@ def apply_orientation_text_layout(
     target_w: float,
     target_h: float,
 ) -> dict[str, Any]:
-    """Apply landscape-center / portrait-left text rules after child placement."""
+    """Apply target-orientation text alignment after child placement."""
     align = get_target_text_alignment(target_w, target_h)
     report: dict[str, Any] = {
         "text_alignment": align,
@@ -64,7 +64,6 @@ def apply_orientation_text_layout(
         "font_size_fitted": 0,
         "warnings": [],
     }
-    _align_headline_children(source_root, output_root, align, report)
     text_report = apply_text_alignment_recursive(output_root, align)
     report["text_alignment_applied"] = text_report["text_alignment_applied"]
     report["font_size_fitted"] = text_report["font_size_fitted"]
@@ -223,12 +222,14 @@ def _scale_subtree(node: dict[str, Any], origin_x: float, origin_y: float, scale
         for field in ("fontSize", "letterSpacing", "strokeWeight", "cornerRadius"):
             value = item.get(field)
             if isinstance(value, (int, float)):
-                item[field] = float(value) * scale
+                scaled = float(value) * scale
+                item[field] = min(128.0, max(4.0, scaled)) if field == "fontSize" else scaled
             style = item.get("style")
             if isinstance(style, dict):
                 style_value = style.get(field)
                 if isinstance(style_value, (int, float)):
-                    style[field] = float(style_value) * scale
+                    scaled = float(style_value) * scale
+                    style[field] = min(128.0, max(4.0, scaled)) if field == "fontSize" else scaled
 
 
 def _translate_subtree(node: dict[str, Any], dx: float, dy: float) -> None:
@@ -266,7 +267,7 @@ def _numeric(value: Any) -> float | None:
 
 
 def _set_font_size(node: dict[str, Any], font_size: float) -> None:
-    size = max(1.0, float(font_size))
+    size = min(128.0, max(4.0, float(font_size)))
     node["fontSize"] = size
     node["textAutoResize"] = "NONE"
     style = node.get("style")

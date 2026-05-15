@@ -71,11 +71,20 @@ FIGMA_CONVERT_TIMEOUT = float(os.getenv("FIGMA_CONVERT_TIMEOUT", str(max(REQUEST
 FIGMA_SEMANTIC_RUNS_DIR = Path(
     os.getenv("FIGMA_SEMANTIC_RUNS_DIR", "runs/figma_convert_semantic_json"),
 ).resolve()
+FIGMA_LAYOUT_TRANSFORMER_RUNS_DIR = Path(
+    os.getenv("FIGMA_LAYOUT_TRANSFORMER_RUNS_DIR", "runs/layout_transformer"),
+).resolve()
 # Max long edge (px) for images sent to Qwen on /figma/convert-semantic-json (0 = disable).
 FIGMA_SEMANTIC_BANNER_MAX_EDGE = int(os.getenv("FIGMA_SEMANTIC_BANNER_MAX_EDGE", "1024"))
 FIGMA_SEMANTIC_GRID_MAX_EDGE = int(os.getenv("FIGMA_SEMANTIC_GRID_MAX_EDGE", "1024"))
 # When false (0/no/false), skip writing per-request run folders (faster I/O; no artifacts for debugging).
 FIGMA_SEMANTIC_PERSIST_RUNS = os.getenv("FIGMA_SEMANTIC_PERSIST_RUNS", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+FIGMA_LAYOUT_TRANSFORMER_PERSIST_RUNS = os.getenv("FIGMA_LAYOUT_TRANSFORMER_PERSIST_RUNS", "1").strip().lower() not in (
     "0",
     "false",
     "no",
@@ -483,6 +492,49 @@ def _write_figma_semantic_run_meta(run_dir: Path, meta: dict[str, Any]) -> None:
     payload = dict(meta)
     payload["finished_at_utc"] = datetime.now(timezone.utc).isoformat()
     (run_dir / "meta.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _persist_layout_transformer_run_input(
+    run_dir: Path,
+    *,
+    run_id: str,
+    request: LayoutTransformerRequest,
+) -> dict[str, Any]:
+    """Write the Layout Transformer plugin request under ``run_dir`` and return base metadata."""
+    run_dir.mkdir(parents=True, exist_ok=True)
+    input_payload = request.model_dump(mode="json")
+    (run_dir / "input.json").write_text(
+        json.dumps(input_payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return {
+        "run_id": run_id,
+        "run_dir": str(run_dir),
+        "endpoint": "/api/layout-transformer",
+        "started_at_utc": datetime.now(timezone.utc).isoformat(),
+        "target_width": request.target_width,
+        "target_height": request.target_height,
+        "input_files": {
+            "input.json": {"bytes": (run_dir / "input.json").stat().st_size},
+        },
+    }
+
+
+def _write_layout_transformer_run_meta(run_dir: Path, meta: dict[str, Any]) -> None:
+    payload = dict(meta)
+    payload["finished_at_utc"] = datetime.now(timezone.utc).isoformat()
+    (run_dir / "meta.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _write_layout_transformer_run_response(
+    run_dir: Path,
+    *,
+    filename: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    path = run_dir / filename
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {filename: {"bytes": path.stat().st_size}}
 
 
 def _decode_base64_bytes(value: str, field_name: str) -> bytes:
@@ -950,8 +1002,42 @@ def layout_transformer_predict(request: LayoutTransformerRequest) -> LayoutTrans
     Predict a target clean semantic JSON from a source clean semantic JSON and target size.
     Uses the structural Layout Transformer; no family id is accepted or required.
     """
+    run_id = _new_figma_semantic_run_id()
+    run_dir = FIGMA_LAYOUT_TRANSFORMER_RUNS_DIR / run_id
+    meta_base: dict[str, Any] | None = None
+    if FIGMA_LAYOUT_TRANSFORMER_PERSIST_RUNS:
+        try:
+            meta_base = _persist_layout_transformer_run_input(
+                run_dir,
+                run_id=run_id,
+                request=request,
+            )
+        except OSError:
+            meta_base = None
+
     if layout_transformer_service is None:
+        if meta_base is not None:
+            try:
+                error_payload = {"detail": "Layout Transformer service is not loaded."}
+                output_files = _write_layout_transformer_run_response(
+                    run_dir,
+                    filename="error_response.json",
+                    payload=error_payload,
+                )
+                _write_layout_transformer_run_meta(
+                    run_dir,
+                    {
+                        **meta_base,
+                        "status": "error",
+                        "error": "service_not_loaded",
+                        "http_status": 503,
+                        "output_files": output_files,
+                    },
+                )
+            except OSError:
+                pass
         raise HTTPException(status_code=503, detail="Layout Transformer service is not loaded.")
+
     try:
         final_json = layout_transformer_service.predict(
             request.source_json,
@@ -959,11 +1045,52 @@ def layout_transformer_predict(request: LayoutTransformerRequest) -> LayoutTrans
             request.target_height,
         )
     except ValueError as exc:
+        if meta_base is not None:
+            try:
+                error_payload = {"detail": str(exc)}
+                output_files = _write_layout_transformer_run_response(
+                    run_dir,
+                    filename="error_response.json",
+                    payload=error_payload,
+                )
+                _write_layout_transformer_run_meta(
+                    run_dir,
+                    {
+                        **meta_base,
+                        "status": "error",
+                        "error": "validation_failed",
+                        "http_status": 422,
+                        "output_files": output_files,
+                    },
+                )
+            except OSError:
+                pass
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"layout transformer prediction failed: {exc}") from exc
+        detail = f"layout transformer prediction failed: {exc}"
+        if meta_base is not None:
+            try:
+                error_payload = {"detail": detail}
+                output_files = _write_layout_transformer_run_response(
+                    run_dir,
+                    filename="error_response.json",
+                    payload=error_payload,
+                )
+                _write_layout_transformer_run_meta(
+                    run_dir,
+                    {
+                        **meta_base,
+                        "status": "error",
+                        "error": "prediction_failed",
+                        "http_status": 500,
+                        "output_files": output_files,
+                    },
+                )
+            except OSError:
+                pass
+        raise HTTPException(status_code=500, detail=detail) from exc
 
-    return LayoutTransformerResponse(
+    response = LayoutTransformerResponse(
         final_json=final_json,
         debug=LayoutTransformerDebug(
             target_width=request.target_width,
@@ -971,6 +1098,24 @@ def layout_transformer_predict(request: LayoutTransformerRequest) -> LayoutTrans
             model_roles=layout_transformer_service.model_roles,
         ),
     )
+    if meta_base is not None:
+        try:
+            output_files = _write_layout_transformer_run_response(
+                run_dir,
+                filename="response.json",
+                payload=response.model_dump(mode="json"),
+            )
+            _write_layout_transformer_run_meta(
+                run_dir,
+                {
+                    **meta_base,
+                    "status": "ok",
+                    "output_files": output_files,
+                },
+            )
+        except OSError:
+            pass
+    return response
 
 
 @app.post("/chat", response_model=ChatResponse)

@@ -1294,7 +1294,7 @@ function applyFinalJsonAbsoluteLayout(jsonTree, cloneRoot) {
   let applied = 0;
   let skipped = 0;
 
-  function walk(item, parentJsonAbs) {
+  function walk(item, parentJsonNode) {
     if (!item || typeof item !== "object") return;
     const abs = jsonBounds(item);
     const id = String(item.id || "").trim();
@@ -1306,27 +1306,20 @@ function applyFinalJsonAbsoluteLayout(jsonTree, cloneRoot) {
         applied++;
       }
     } else if (node) {
-      if (typeof abs.width === "number" && typeof abs.height === "number") {
-        resizeNodeIfPossible(node, abs.width, abs.height);
-      }
-      const relX = abs.x - parentJsonAbs.x;
-      const relY = abs.y - parentJsonAbs.y;
-      node.x = relX;
-      node.y = relY;
+      applyBoundsFromAbsoluteJson(node, item, parentJsonNode);
       applied++;
     } else if (id) {
       skipped++;
     }
 
-    const passToChildren = id ? abs : parentJsonAbs;
+    const passToChildren = id ? item : parentJsonNode;
     const kids = Array.isArray(item.children) ? item.children : [];
     for (let i = 0; i < kids.length; i++) {
       walk(kids[i], passToChildren);
     }
   }
 
-  const rootAbs = jsonBounds(jsonTree);
-  walk(jsonTree, rootAbs);
+  walk(jsonTree, null);
 
   const indexIds = collectFinalJsonNodeIds(jsonTree).size;
   return { applied, skipped, indexIds, mapSize: byId.size };
@@ -1937,6 +1930,27 @@ function jsonBounds(item) {
   };
 }
 
+function applyBoundsFromAbsoluteJson(figmaNode, jsonNode, parentJsonNode) {
+  if (!figmaNode || !jsonNode || typeof jsonNode !== "object") return;
+  const b = jsonBounds(jsonNode);
+  const pb = parentJsonNode && parentJsonNode.bounds && typeof parentJsonNode.bounds === "object"
+    ? jsonBounds(parentJsonNode)
+    : null;
+
+  figmaNode.resizeWithoutConstraints(
+    Math.max(0.01, b.width),
+    Math.max(0.01, b.height)
+  );
+
+  if (pb) {
+    figmaNode.x = b.x - pb.x;
+    figmaNode.y = b.y - pb.y;
+  } else {
+    figmaNode.x = b.x;
+    figmaNode.y = b.y;
+  }
+}
+
 function figmaNodeTypeFromJson(item, isRoot) {
   const type = normalizeType(item && item.type ? item.type : "");
   const hasChildren = Array.isArray(item && item.children) && item.children.length > 0;
@@ -1980,12 +1994,7 @@ async function createNodeFromJsonItem(item, parent, parentBounds, isRoot) {
   }
 
   node.name = String(item.name || item.type || "json_node");
-  if (!isRoot) {
-    // ``bounds`` / ``parentBounds`` are absolute in banner-root space (same as backend ``final_json``).
-    node.x = bounds.x - parentBounds.x;
-    node.y = bounds.y - parentBounds.y;
-  }
-  resizeNodeIfPossible(node, bounds.width, bounds.height);
+  applyBoundsFromAbsoluteJson(node, item, isRoot ? null : { bounds: parentBounds });
   parent.appendChild(node);
 
   const children = Array.isArray(item.children) ? item.children : [];
@@ -2139,17 +2148,13 @@ function applyPredictedJsonToClone(predictedJson, convertedFrame) {
     return null;
   }
 
-  function walk(item, isRoot) {
+  function walk(item, parentJsonNode, isRoot) {
     if (!item || typeof item !== "object") return;
     const node = isRoot ? convertedFrame : resolve(item);
     const bounds = item.bounds && typeof item.bounds === "object" ? item.bounds : null;
     if (node) {
       if (!isRoot && bounds) {
-        if (typeof bounds.x === "number") node.x = bounds.x;
-        if (typeof bounds.y === "number") node.y = bounds.y;
-        if (typeof bounds.width === "number" && typeof bounds.height === "number") {
-          resizeNodeIfPossible(node, bounds.width, bounds.height);
-        }
+        applyBoundsFromAbsoluteJson(node, item, parentJsonNode);
       } else if (isRoot && bounds && typeof bounds.width === "number" && typeof bounds.height === "number") {
         resizeNodeIfPossible(node, bounds.width, bounds.height);
       }
@@ -2159,10 +2164,10 @@ function applyPredictedJsonToClone(predictedJson, convertedFrame) {
       missing.push(String(item.id || item.path));
     }
     const children = Array.isArray(item.children) ? item.children : [];
-    for (const child of children) walk(child, false);
+    for (const child of children) walk(child, item, false);
   }
 
-  walk(predictedJson, true);
+  walk(predictedJson, null, true);
   return { applied, missing };
 }
 

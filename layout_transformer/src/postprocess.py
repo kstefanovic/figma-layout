@@ -27,6 +27,8 @@ OFFER_CHILD_ROLES = {
 }
 STRUCTURAL_PARENT_ROLES = ["hero_image", "headline_group", "brand_group", "background_shape"]
 STYLE_SCALE_FIELDS = ("fontSize", "letterSpacing", "strokeWeight", "cornerRadius")
+FONT_SIZE_MIN = 4.0
+FONT_SIZE_MAX = 128.0
 FLOATING_RULE_ROLES = [
     "age_badge",
     "star_decoration_1",
@@ -207,6 +209,10 @@ def postprocess_layout(
         report["transformed_children_count"] += int(subreport.get("transformed") or 0)
         report["warnings"].extend(subreport.get("warnings") or [])
 
+    font_report = apply_text_font_size_scaling(source_json, output_json)
+    report["font_size_fitted"] += int(font_report.get("scaled") or 0)
+    report["warnings"].extend(font_report.get("warnings") or [])
+
     if find_by_role(source_json, "offer_group") is not None and find_by_role(output_json, "offer_group") is not None:
         subreport = transform_subtree_by_parent(source_json, output_json, "offer_group", OFFER_CHILD_ROLES)
         report["transformed_children_count"] += int(subreport.get("transformed") or 0)
@@ -218,7 +224,7 @@ def postprocess_layout(
     report["text_alignment"] = alignment_report.get("text_alignment")
     report["text_alignment_applied"] = alignment_report.get("text_alignment_applied", 0)
     report["headline_children_aligned"] = alignment_report.get("headline_children_aligned", 0)
-    report["font_size_fitted"] = alignment_report.get("font_size_fitted", 0)
+    report["font_size_fitted"] += alignment_report.get("font_size_fitted", 0)
     report["warnings"].extend(alignment_report.get("warnings") or [])
 
     for role in FLOATING_RULE_ROLES:
@@ -314,7 +320,93 @@ def _scale_style_fields(node: dict[str, Any], scale: float) -> None:
     for field in STYLE_SCALE_FIELDS:
         value = node.get(field)
         if isinstance(value, (int, float)) and math.isfinite(float(value)):
-            node[field] = float(value) * scale
+            scaled = float(value) * scale
+            node[field] = _clamp_font_size(scaled) if field == "fontSize" else scaled
+        style = node.get("style")
+        if isinstance(style, dict):
+            style_value = style.get(field)
+            if isinstance(style_value, (int, float)) and math.isfinite(float(style_value)):
+                scaled = float(style_value) * scale
+                style[field] = _clamp_font_size(scaled) if field == "fontSize" else scaled
+
+
+def apply_text_font_size_scaling(
+    source_root: dict[str, Any],
+    output_root: dict[str, Any],
+) -> dict[str, Any]:
+    """Scale text font sizes from source using the role's target/source bbox scale."""
+    report: dict[str, Any] = {"scaled": 0, "warnings": []}
+    warnings = report["warnings"]
+    if not isinstance(warnings, list):
+        return report
+
+    parent_specs = (
+        ("headline", "headline_group"),
+        ("subheadline_delivery_time", "headline_group"),
+    )
+    for text_role, parent_role in parent_specs:
+        source_text = find_by_role(source_root, text_role)
+        output_text = find_by_role(output_root, text_role)
+        source_parent = find_by_role(source_root, parent_role)
+        output_parent = find_by_role(output_root, parent_role)
+        if source_text is None or output_text is None or source_parent is None or output_parent is None:
+            continue
+        scale = _bbox_min_scale(get_bounds(source_parent), get_bounds(output_parent))
+        if scale is None:
+            warnings.append(f"bad font scale bounds for {text_role}/{parent_role}")
+            continue
+        if _set_scaled_font_size_from_source(source_text, output_text, scale):
+            report["scaled"] = int(report["scaled"]) + 1
+
+    source_legal = find_by_role(source_root, "legal_text")
+    output_legal = find_by_role(output_root, "legal_text")
+    if source_legal is not None and output_legal is not None:
+        scale = _bbox_min_scale(get_bounds(source_legal), get_bounds(output_legal))
+        if scale is None:
+            warnings.append("bad font scale bounds for legal_text")
+        elif _set_scaled_font_size_from_source(source_legal, output_legal, scale):
+            report["scaled"] = int(report["scaled"]) + 1
+    return report
+
+
+def _bbox_min_scale(source_bounds: dict[str, float], target_bounds: dict[str, float]) -> float | None:
+    if source_bounds["width"] <= 0 or source_bounds["height"] <= 0:
+        return None
+    return max(0.01, min(target_bounds["width"] / source_bounds["width"], target_bounds["height"] / source_bounds["height"]))
+
+
+def _set_scaled_font_size_from_source(
+    source_node: dict[str, Any],
+    output_node: dict[str, Any],
+    scale: float,
+) -> bool:
+    source_size = _node_font_size(source_node)
+    if source_size is None:
+        return False
+    size = _clamp_font_size(source_size * scale)
+    output_node["fontSize"] = size
+    output_node["textAutoResize"] = "NONE"
+    style = output_node.get("style")
+    if isinstance(style, dict):
+        style["fontSize"] = size
+        style["textAutoResize"] = "NONE"
+    return True
+
+
+def _node_font_size(node: dict[str, Any]) -> float | None:
+    value = node.get("fontSize")
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+        return float(value)
+    style = node.get("style")
+    if isinstance(style, dict):
+        style_value = style.get("fontSize")
+        if isinstance(style_value, (int, float)) and math.isfinite(float(style_value)):
+            return float(style_value)
+    return None
+
+
+def _clamp_font_size(value: float) -> float:
+    return min(FONT_SIZE_MAX, max(FONT_SIZE_MIN, float(value)))
 
 
 def _fit_active_subtrees_inside_parent(
@@ -395,21 +487,11 @@ def _place_age_badge(
     width = max(1.0, source_bounds["width"] / source_min * target_min)
     height = max(1.0, source_bounds["height"] / source_min * target_min)
     nearest = _nearest_corner(source_bounds, source_canvas["width"], source_canvas["height"])
-    corners = [nearest] + [corner for corner in ("top_left", "top_right", "bottom_left", "bottom_right") if corner != nearest]
-    blockers = [find_by_role(output_root, role) for role in ("headline_group", "brand_group", "legal_text")]
-    blockers = [node for node in blockers if node is not None]
-    chosen = None
-    for corner in corners:
-        x, y = _corner_position(source_bounds, source_canvas, corner, target_w, target_h, width, height, target_min)
-        candidate = {"x": x, "y": y, "width": width, "height": height}
-        if all(_overlap_area(candidate, get_bounds(node)) <= 0.2 * bbox_area(candidate) for node in blockers):
-            chosen = (x, y, corner)
-            break
-    if chosen is None:
-        x, y = _corner_position(source_bounds, source_canvas, nearest, target_w, target_h, width, height, target_min)
-        chosen = (x, y, nearest)
-    set_bounds(output_node, chosen[0], chosen[1], width, height)
-    return {"role": "age_badge", "placed": True, "anchor": chosen[2]}
+    x, y = _corner_position(source_bounds, source_canvas, nearest, target_w, target_h, width, height, target_min)
+    x = min(max(0.0, x), max(0.0, target_w - width))
+    y = min(max(0.0, y), max(0.0, target_h - height))
+    set_bounds(output_node, x, y, width, height)
+    return {"role": "age_badge", "placed": True, "anchor": nearest}
 
 
 def _place_star(source_root: dict[str, Any], output_root: dict[str, Any], role: str) -> dict[str, Any]:
