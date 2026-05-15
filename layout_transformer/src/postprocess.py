@@ -178,7 +178,7 @@ def place_floating_by_anchor(
     if role == "age_badge":
         return _place_age_badge(source_root, output_root, target_w, target_h)
     if role in {"star_decoration_1", "star_decoration_2"}:
-        return _place_star(source_root, output_root, role)
+        return _place_star(source_root, output_root, role, target_w, target_h)
     if role in {"background_gradient_1", "background_gradient_2"}:
         return _place_gradient(source_root, output_root, role, target_w, target_h)
     return {"role": role, "placed": False, "warning": f"unsupported floating role {role}"}
@@ -488,39 +488,99 @@ def _place_age_badge(
     height = max(1.0, source_bounds["height"] / source_min * target_min)
     nearest = _nearest_corner(source_bounds, source_canvas["width"], source_canvas["height"])
     x, y = _corner_position(source_bounds, source_canvas, nearest, target_w, target_h, width, height, target_min)
-    x = min(max(0.0, x), max(0.0, target_w - width))
-    y = min(max(0.0, y), max(0.0, target_h - height))
-    set_bounds(output_node, x, y, width, height)
-    return {"role": "age_badge", "placed": True, "anchor": nearest}
+    candidate = _clamp_candidate_to_canvas({"x": x, "y": y, "width": width, "height": height}, target_w, target_h)
+    blockers = [find_by_role(output_root, role) for role in ("legal_text", "headline_group", "brand_group")]
+    blockers = [node for node in blockers if node is not None]
+    chosen = candidate
+    anchor = nearest
+
+    if _badge_has_bad_overlap(candidate, blockers):
+        alternatives: list[tuple[str, dict[str, float]]] = []
+        legal = find_by_role(output_root, "legal_text")
+        if legal is not None:
+            legal_bounds = get_bounds(legal)
+            gap = max(4.0, target_min * 0.012)
+            alternatives.append(
+                (
+                    "above_legal_right",
+                    _clamp_candidate_to_canvas(
+                        {
+                            "x": candidate["x"],
+                            "y": legal_bounds["y"] - height - gap,
+                            "width": width,
+                            "height": height,
+                        },
+                        target_w,
+                        target_h,
+                    ),
+                )
+            )
+
+        background = find_by_role(output_root, "background_shape")
+        if background is not None:
+            bg = get_bounds(background)
+            margin = max(4.0, target_min * 0.018)
+            alternatives.append(
+                (
+                    "background_shape_top_right",
+                    _clamp_candidate_to_canvas(
+                        {
+                            "x": bg["x"] + bg["width"] - width - margin,
+                            "y": bg["y"] + margin,
+                            "width": width,
+                            "height": height,
+                        },
+                        target_w,
+                        target_h,
+                    ),
+                )
+            )
+
+        for corner in ("top_right", "bottom_right", "top_left", "bottom_left"):
+            cx, cy = _corner_position(source_bounds, source_canvas, corner, target_w, target_h, width, height, target_min)
+            alternatives.append(
+                (
+                    f"safest_{corner}",
+                    _clamp_candidate_to_canvas(
+                        {"x": cx, "y": cy, "width": width, "height": height},
+                        target_w,
+                        target_h,
+                    ),
+                )
+            )
+
+        for candidate_anchor, alternative in alternatives:
+            if not _badge_has_bad_overlap(alternative, blockers):
+                anchor, chosen = candidate_anchor, alternative
+                break
+        else:
+            anchor, chosen = min(alternatives, key=lambda item: _candidate_overlap_score(item[1], blockers))
+
+    set_bounds(output_node, chosen["x"], chosen["y"], chosen["width"], chosen["height"])
+    return {"role": "age_badge", "placed": True, "anchor": anchor}
 
 
-def _place_star(source_root: dict[str, Any], output_root: dict[str, Any], role: str) -> dict[str, Any]:
+def _place_star(
+    source_root: dict[str, Any],
+    output_root: dict[str, Any],
+    role: str,
+    target_w: float,
+    target_h: float,
+) -> dict[str, Any]:
     source_node = find_by_role(source_root, role)
     output_node = find_by_role(output_root, role)
     if source_node is None or output_node is None:
         return {"role": role, "placed": False, "warning": f"missing {role}"}
-    source_parent = _nearest_source_parent(source_root, get_bounds(source_node))
-    if source_parent is None:
-        return {"role": role, "placed": False, "warning": f"no structural parent for {role}"}
-    parent_role, source_parent_node = source_parent
-    output_parent = find_by_role(output_root, parent_role)
-    if output_parent is None:
-        return {"role": role, "placed": False, "warning": f"missing target parent {parent_role} for {role}"}
+    source_canvas = get_bounds(source_root)
     source_bounds = get_bounds(source_node)
-    spb = get_bounds(source_parent_node)
-    tpb = get_bounds(output_parent)
-    if spb["width"] <= 0 or spb["height"] <= 0 or tpb["width"] <= 0 or tpb["height"] <= 0:
-        return {"role": role, "placed": False, "warning": f"bad parent bounds for {role}"}
-    cx, cy = bbox_center(source_bounds)
-    rel_cx = (cx - spb["x"]) / spb["width"]
-    rel_cy = (cy - spb["y"]) / spb["height"]
-    size_scale = min(tpb["width"], tpb["height"]) / max(1.0, min(spb["width"], spb["height"]))
-    width = max(1.0, source_bounds["width"] * size_scale)
-    height = max(1.0, source_bounds["height"] * size_scale)
-    target_cx = tpb["x"] + rel_cx * tpb["width"]
-    target_cy = tpb["y"] + rel_cy * tpb["height"]
-    set_bounds(output_node, target_cx - width / 2.0, target_cy - height / 2.0, width, height)
-    return {"role": role, "placed": True, "anchor": parent_role}
+    if source_canvas["width"] <= 0 or source_canvas["height"] <= 0:
+        return {"role": role, "placed": False, "warning": f"bad source canvas bounds for {role}"}
+    width = max(1.0, source_bounds["width"] / source_canvas["width"] * target_w)
+    height = max(1.0, source_bounds["height"] / source_canvas["width"] * target_w)
+    x = (source_bounds["x"] - source_canvas["x"]) / source_canvas["width"] * target_w
+    y = (source_bounds["y"] - source_canvas["y"]) / source_canvas["height"] * target_h
+    set_bounds(output_node, x, y, width, height)
+    return {"role": role, "placed": True, "anchor": "canvas_normalized"}
 
 
 def _place_gradient(
@@ -598,6 +658,34 @@ def _corner_position(
     x = left_margin if corner.endswith("left") else target_w - right_margin - width
     y = top_margin if corner.startswith("top") else target_h - bottom_margin - height
     return x, y
+
+
+def _clamp_candidate_to_canvas(
+    candidate: dict[str, float],
+    target_w: float,
+    target_h: float,
+) -> dict[str, float]:
+    width = max(1.0, candidate["width"])
+    height = max(1.0, candidate["height"])
+    return {
+        "x": min(max(0.0, candidate["x"]), max(0.0, target_w - width)),
+        "y": min(max(0.0, candidate["y"]), max(0.0, target_h - height)),
+        "width": width,
+        "height": height,
+    }
+
+
+def _badge_has_bad_overlap(candidate: dict[str, float], blockers: list[dict[str, Any]]) -> bool:
+    area = max(1.0, bbox_area(candidate))
+    return any(_overlap_area(candidate, get_bounds(blocker)) > 0.2 * area for blocker in blockers)
+
+
+def _candidate_overlap_score(candidate: dict[str, float], blockers: list[dict[str, Any]]) -> tuple[float, float]:
+    overlap = sum(_overlap_area(candidate, get_bounds(blocker)) for blocker in blockers)
+    cx, cy = bbox_center(candidate)
+    # Prefer the right side for the small legal badge when overlap ties.
+    right_bias = -cx + cy * 0.001
+    return (overlap, right_bias)
 
 
 def _contains_center(bounds: dict[str, float], cx: float, cy: float) -> bool:

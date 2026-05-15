@@ -19,6 +19,8 @@ from .extract import (
 )
 from .model import LayoutTransformer
 from .postprocess import postprocess_layout
+from .prototype_index import DEFAULT_PROTOTYPES_PATH, build_prototypes, load_prototypes, save_prototypes, select_target_prototype_match
+from .prototype_postprocess import apply_prototype_postprocess
 from .roles import NUM_ROLES, ROLE_TO_ID, TRAIN_ROLES
 
 RAW_NAME_RE = re.compile(r"^(?:\d+|Group\s+\d+|Group\s+#+)$", re.IGNORECASE)
@@ -44,6 +46,7 @@ class StructuralLayoutTransformerService:
         self.model.load_state_dict(checkpoint_payload["model_state"])
         self.model.eval()
         self.model_roles = list(TRAIN_ROLES)
+        self.prototypes = self._load_or_build_prototypes()
         self.last_report: dict[str, Any] = {
             "transformed_children_count": 0,
             "floating_roles_placed": [],
@@ -58,10 +61,34 @@ class StructuralLayoutTransformerService:
             source_json=source_json,
             target_width=target_width,
             target_height=target_height,
+            prototypes=self.prototypes,
             return_report=True,
         )
         self.last_report = report
         return final_json
+
+    def _load_or_build_prototypes(self) -> list[dict[str, Any]]:
+        try:
+            prototypes = load_prototypes(DEFAULT_PROTOTYPES_PATH)
+            if prototypes and not any(isinstance(p.get("role_bboxes"), dict) and p.get("role_bboxes") for p in prototypes):
+                return self._build_and_save_prototypes()
+            return prototypes
+        except FileNotFoundError:
+            return self._build_and_save_prototypes()
+        except Exception as exc:
+            print(f"Warning: failed loading layout prototypes from {DEFAULT_PROTOTYPES_PATH}: {exc}")
+            return []
+
+    def _build_and_save_prototypes(self) -> list[dict[str, Any]]:
+        input_dir = Path("layout_transformer/data/clean_families")
+        if not input_dir.exists():
+            return []
+        prototypes = build_prototypes(input_dir)
+        try:
+            save_prototypes(prototypes, DEFAULT_PROTOTYPES_PATH)
+        except OSError as exc:
+            print(f"Warning: failed saving layout prototypes to {DEFAULT_PROTOTYPES_PATH}: {exc}")
+        return prototypes
 
 
 def predict_structural_layout(
@@ -71,6 +98,7 @@ def predict_structural_layout(
     source_json: dict[str, Any],
     target_width: int | float,
     target_height: int | float,
+    prototypes: list[dict[str, Any]] | None = None,
     return_report: bool = False,
 ) -> dict[str, Any] | tuple[dict[str, Any], dict[str, Any]]:
     """Predict structural parent roles, then deterministically postprocess children/floating roles."""
@@ -79,6 +107,24 @@ def predict_structural_layout(
     if target_w <= 0 or target_h <= 0:
         raise ValueError("target_width and target_height must be positive")
     source_w, source_h = get_canvas_size(source_json)
+    prototype_match = select_target_prototype_match(source_json, target_w, target_h, prototypes or [])
+    prototype = prototype_match.get("prototype") if isinstance(prototype_match, dict) else None
+    if prototype is not None and _is_strict_prototype_match(prototype_match):
+        output_json = copy_json_with_predicted_bounds(source_json, {}, target_w, target_h)
+        output_json, report = apply_prototype_postprocess(
+            source_json=source_json,
+            output_json=output_json,
+            target_w=target_w,
+            target_h=target_h,
+            prototype=prototype,
+            prototype_match=prototype_match,
+            return_report=True,
+        )
+        validate_predicted_layout(output_json, int(round(target_w)), int(round(target_h)))
+        if return_report:
+            return output_json, report
+        return output_json
+
     source_bboxes = torch.zeros((1, NUM_ROLES, 4), dtype=torch.float32)
     role_mask = torch.zeros((1, NUM_ROLES), dtype=torch.float32)
     nodes = flatten_semantic_nodes(source_json)
@@ -105,17 +151,46 @@ def predict_structural_layout(
         if role_mask[0, ROLE_TO_ID[role]].item() > 0
     }
     output_json = copy_json_with_predicted_bounds(source_json, pred_role_bboxes, target_w, target_h)
-    output_json, report = postprocess_layout(
-        source_json=source_json,
-        output_json=output_json,
-        target_w=target_w,
-        target_h=target_h,
-        return_report=True,
-    )
+    if prototype is not None:
+        output_json, report = apply_prototype_postprocess(
+            source_json=source_json,
+            output_json=output_json,
+            target_w=target_w,
+            target_h=target_h,
+            prototype=prototype,
+            prototype_match=prototype_match,
+            return_report=True,
+        )
+    else:
+        output_json, report = postprocess_layout(
+            source_json=source_json,
+            output_json=output_json,
+            target_w=target_w,
+            target_h=target_h,
+            return_report=True,
+        )
     validate_predicted_layout(output_json, int(round(target_w)), int(round(target_h)))
     if return_report:
         return output_json, report
     return output_json
+
+
+def _is_strict_prototype_match(match: dict[str, Any] | None) -> bool:
+    if not isinstance(match, dict):
+        return False
+    aspect_diff = _num(match.get("aspect_diff"), 999.0)
+    width_diff = _num(match.get("width_diff_ratio"), 999.0)
+    height_diff = _num(match.get("height_diff_ratio"), 999.0)
+    exact_size = bool(match.get("exact_size"))
+    return aspect_diff < 0.05 and (exact_size or (width_diff < 0.10 and height_diff < 0.10))
+
+
+def _num(value: Any, default: float) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if math.isfinite(number) else default
 
 
 def validate_predicted_layout(final_json: dict[str, Any], target_width: int, target_height: int) -> None:

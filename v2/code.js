@@ -33,6 +33,21 @@ function finiteNumber(value) {
   return typeof value === "number" && Number.isFinite(value);
 }
 
+function jsonSafeValue(value) {
+  if (value === figma.mixed || typeof value === "symbol" || typeof value === "function") return undefined;
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch (_e) {
+    return undefined;
+  }
+}
+
+function copySerializableNodeProperty(target, node, key) {
+  if (!(key in node)) return;
+  const value = jsonSafeValue(node[key]);
+  if (value !== undefined) target[key] = value;
+}
+
 function serializeNode(node, origin, path) {
   const base = {
     id: node.id,
@@ -47,10 +62,27 @@ function serializeNode(node, origin, path) {
   if ("characters" in node) {
     base.characters = node.characters;
     if ("fontSize" in node && finiteNumber(node.fontSize)) base.fontSize = node.fontSize;
-    if ("fontName" in node) base.fontName = node.fontName;
+    copySerializableNodeProperty(base, node, "fontName");
     if ("textAlignHorizontal" in node) base.textAlignHorizontal = node.textAlignHorizontal;
     if ("textAlignVertical" in node) base.textAlignVertical = node.textAlignVertical;
     if ("textAutoResize" in node) base.textAutoResize = node.textAutoResize;
+    for (const key of [
+      "fills",
+      "lineHeight",
+      "letterSpacing",
+      "paragraphSpacing",
+      "paragraphIndent",
+      "textCase",
+      "textDecoration",
+      "textStyleId",
+      "hyperlink",
+    ]) {
+      copySerializableNodeProperty(base, node, key);
+    }
+  }
+
+  for (const key of ["fills", "strokes", "strokeWeight", "effects", "blendMode", "cornerRadius"]) {
+    copySerializableNodeProperty(base, node, key);
   }
 
   if ("layoutMode" in node) {
@@ -1301,10 +1333,12 @@ function applyFinalJsonAbsoluteLayout(jsonTree, cloneRoot) {
     const node = id ? byId.get(id) : null;
 
     if (node && cloneRoot && node.id === cloneRoot.id) {
+      applyJsonClippingBehavior(node, item);
       if (typeof abs.width === "number" && typeof abs.height === "number") {
         resizeNodeIfPossible(node, abs.width, abs.height);
         applied++;
       }
+      applyJsonClippingBehavior(node, item);
     } else if (node) {
       applyBoundsFromAbsoluteJson(node, item, parentJsonNode);
       applied++;
@@ -1930,8 +1964,93 @@ function jsonBounds(item) {
   };
 }
 
+async function loadJsonFontName(fontName) {
+  if (fontName && typeof fontName === "object" && fontName.family && fontName.style) {
+    const wanted = { family: String(fontName.family), style: String(fontName.style) };
+    try {
+      await figma.loadFontAsync(wanted);
+      return wanted;
+    } catch (e) {
+      console.error("loadJsonFontName: JSON font could not be loaded; not falling back silently", wanted, e);
+      throw new Error(
+        `JSON font unavailable in Figma: ${wanted.family} ${wanted.style}. Install/enable the font or update backend fontName.`,
+      );
+    }
+  }
+  console.error("loadJsonFontName: JSON text node is missing a valid fontName", fontName);
+  throw new Error("JSON text node is missing a valid fontName; refusing silent font fallback.");
+}
+
+function applyJsonPropertyIfPresent(node, item, key) {
+  if (!node || !item || !(key in item) || !(key in node)) return false;
+  const value = jsonSafeValue(item[key]);
+  if (value === undefined) return false;
+  try {
+    node[key] = value;
+    return true;
+  } catch (e) {
+    console.warn(`applyJsonPropertyIfPresent: failed applying ${key}`, node && node.name, e);
+    return false;
+  }
+}
+
+function applyJsonVisualStyle(node, item) {
+  if (!node || !item) return 0;
+  let applied = 0;
+  for (const key of ["fills", "strokes", "strokeWeight", "effects", "blendMode", "cornerRadius"]) {
+    if (applyJsonPropertyIfPresent(node, item, key)) applied++;
+  }
+  return applied;
+}
+
+function applyJsonTextStyle(node, item) {
+  if (!node || !item) return 0;
+  let applied = 0;
+  for (const key of [
+    "fills",
+    "opacity",
+    "lineHeight",
+    "letterSpacing",
+    "paragraphSpacing",
+    "paragraphIndent",
+    "textCase",
+    "textDecoration",
+  ]) {
+    if (applyJsonPropertyIfPresent(node, item, key)) applied++;
+  }
+  return applied;
+}
+
+function shouldDisableClippingForJsonItem(item) {
+  const name = String(item && item.name ? item.name : "").trim();
+  return name === "headline_group" || name === "brand_group" || name === "offer_group";
+}
+
+function isJsonRootFrame(item) {
+  if (!item || typeof item !== "object") return false;
+  const name = String(item.name || "").trim();
+  const path = item.path != null ? String(item.path).trim() : "";
+  return path === "" || name.indexOf("banner_root") !== -1;
+}
+
+function applyJsonClippingBehavior(figmaNode, jsonNode) {
+  if (!figmaNode || !jsonNode || !("clipsContent" in figmaNode)) return;
+  try {
+    if (isJsonRootFrame(jsonNode)) {
+      figmaNode.clipsContent = true;
+    } else if (typeof jsonNode.clipsContent === "boolean") {
+      figmaNode.clipsContent = jsonNode.clipsContent;
+    } else if (shouldDisableClippingForJsonItem(jsonNode)) {
+      figmaNode.clipsContent = false;
+    }
+  } catch (_e) {
+    /* some node types do not support clipsContent */
+  }
+}
+
 function applyBoundsFromAbsoluteJson(figmaNode, jsonNode, parentJsonNode) {
   if (!figmaNode || !jsonNode || typeof jsonNode !== "object") return;
+  applyJsonClippingBehavior(figmaNode, jsonNode);
   const b = jsonBounds(jsonNode);
   const pb = parentJsonNode && parentJsonNode.bounds && typeof parentJsonNode.bounds === "object"
     ? jsonBounds(parentJsonNode)
@@ -1949,6 +2068,7 @@ function applyBoundsFromAbsoluteJson(figmaNode, jsonNode, parentJsonNode) {
     figmaNode.x = b.x;
     figmaNode.y = b.y;
   }
+  applyJsonClippingBehavior(figmaNode, jsonNode);
 }
 
 function figmaNodeTypeFromJson(item, isRoot) {
@@ -1966,21 +2086,11 @@ async function createNodeFromJsonItem(item, parent, parentBounds, isRoot) {
   let node;
 
   if (figmaType === "TEXT") {
-    await figma.loadFontAsync({ family: "Inter", style: "Regular" });
+    const fontName = await loadJsonFontName(item.fontName);
     node = figma.createText();
-    if ("textAutoResize" in node) {
-      try {
-        node.textAutoResize = item.textAutoResize || "NONE";
-      } catch (_e) {
-        /* keep Figma default */
-      }
-    }
+    node.fontName = fontName;
     node.characters = String(item.characters || item.name || "Text");
-    node.fontName = { family: "Inter", style: "Regular" };
-    node.fontSize = typeof item.fontSize === "number" ? Math.max(1, item.fontSize) : 16;
-    if (item.textAlignHorizontal) node.textAlignHorizontal = item.textAlignHorizontal;
-    if (item.textAlignVertical) node.textAlignVertical = item.textAlignVertical;
-    node.fills = [{ type: "SOLID", color: { r: 0.05, g: 0.06, b: 0.08 } }];
+    if ("textAutoResize" in node) node.textAutoResize = "NONE";
   } else if (figmaType === "FRAME") {
     node = figma.createFrame();
     node.layoutMode = "NONE";
@@ -1988,13 +2098,26 @@ async function createNodeFromJsonItem(item, parent, parentBounds, isRoot) {
     node.fills = isRoot ? [{ type: "SOLID", color: { r: 1, g: 1, b: 1 } }] : [];
   } else {
     node = figma.createRectangle();
-    node.fills = [{ type: "SOLID", color: { r: 0.72, g: 0.78, b: 0.86 }, opacity: 0.28 }];
-    node.strokes = [{ type: "SOLID", color: { r: 0.34, g: 0.45, b: 0.58 } }];
-    node.strokeWeight = 1;
+    if (applyJsonVisualStyle(node, item) === 0) {
+      node.fills = [{ type: "SOLID", color: { r: 0.72, g: 0.78, b: 0.86 }, opacity: 0.28 }];
+      node.strokes = [{ type: "SOLID", color: { r: 0.34, g: 0.45, b: 0.58 } }];
+      node.strokeWeight = 1;
+    }
   }
 
   node.name = String(item.name || item.type || "json_node");
+  applyJsonClippingBehavior(node, item);
   applyBoundsFromAbsoluteJson(node, item, isRoot ? null : { bounds: parentBounds });
+  if (figmaType === "TEXT") {
+    if (typeof item.fontSize === "number" && Number.isFinite(item.fontSize)) node.fontSize = Math.max(1, item.fontSize);
+    if (item.textAlignHorizontal) node.textAlignHorizontal = item.textAlignHorizontal;
+    if (item.textAlignVertical) node.textAlignVertical = item.textAlignVertical;
+    if (applyJsonTextStyle(node, item) === 0 && !item.fills) {
+      node.fills = [{ type: "SOLID", color: { r: 0.05, g: 0.06, b: 0.08 } }];
+    }
+  } else {
+    applyJsonVisualStyle(node, item);
+  }
   parent.appendChild(node);
 
   const children = Array.isArray(item.children) ? item.children : [];
@@ -2014,7 +2137,7 @@ async function drawJsonTreeBesideSelection(finalJson, sourceFrame, targetResolut
   root.x = sourceFrame.x + sourceFrame.width + BESIDE_FRAME_GAP;
   root.y = sourceFrame.y;
   root.layoutMode = "NONE";
-  root.clipsContent = false;
+  root.clipsContent = true;
   root.fills = [{ type: "SOLID", color: { r: 1, g: 1, b: 1 } }];
   resizeNodeIfPossible(root, rootBounds.width, rootBounds.height);
   figma.currentPage.appendChild(root);
@@ -2187,18 +2310,6 @@ async function applyFinalJsonContentToClone(finalJson, convertedFrame) {
     return null;
   }
 
-  async function tryLoadFont(fontName) {
-    if (!fontName || typeof fontName !== "object") return false;
-    if (!fontName.family || !fontName.style) return false;
-    try {
-      await figma.loadFontAsync({ family: String(fontName.family), style: String(fontName.style) });
-      return true;
-    } catch (e) {
-      console.warn("applyFinalJsonContentToClone: loadFontAsync failed", fontName, e);
-      return false;
-    }
-  }
-
   async function walk(item, isRoot) {
     if (!item || typeof item !== "object") return;
     const node = resolve(item, isRoot);
@@ -2219,44 +2330,32 @@ async function applyFinalJsonContentToClone(finalJson, convertedFrame) {
         /* some nodes may reject opacity updates */
       }
     }
+    applyJsonClippingBehavior(node, item);
+    const isJsonTextNode = "characters" in item && "characters" in node;
+    if (!isJsonTextNode) {
+      applied += applyJsonVisualStyle(node, item);
+    }
 
-    if ("characters" in item && "characters" in node) {
-      const fontLoaded = await tryLoadFont(item.fontName);
-      if (fontLoaded && item.fontName && typeof item.fontName === "object") {
-        try {
-          node.fontName = {
-            family: String(item.fontName.family),
-            style: String(item.fontName.style),
-          };
-        } catch (e) {
-          console.warn("applyFinalJsonContentToClone: fontName apply failed", node && node.name, e);
-        }
-      }
+    if (isJsonTextNode) {
       try {
-        if ("textAutoResize" in node) {
-          try {
-            node.textAutoResize = item.textAutoResize || "NONE";
-          } catch (_e) {
-            /* ignore text nodes that reject fixed resize mode */
-          }
-        }
+        node.fontName = await loadJsonFontName(item.fontName);
+        node.characters = String(item.characters || "");
+        if ("textAutoResize" in node) node.textAutoResize = "NONE";
         const b = item.bounds && typeof item.bounds === "object" ? item.bounds : null;
         if (b && typeof b.width === "number" && typeof b.height === "number") {
           resizeNodeIfPossible(node, b.width, b.height);
         }
-        node.characters = String(item.characters || "");
         if (typeof item.fontSize === "number" && Number.isFinite(item.fontSize)) {
           node.fontSize = Math.max(1, item.fontSize);
         }
+        applied += applyJsonTextStyle(node, item);
         if (item.textAlignHorizontal) {
           node.textAlignHorizontal = item.textAlignHorizontal;
         }
         if (item.textAlignVertical) {
           node.textAlignVertical = item.textAlignVertical;
         }
-        if (b && typeof b.width === "number" && typeof b.height === "number") {
-          resizeNodeIfPossible(node, b.width, b.height);
-        }
+        applied += applyJsonTextStyle(node, item);
         applied++;
       } catch (e) {
         console.warn("applyFinalJsonContentToClone: text content apply failed", node && node.name, e);

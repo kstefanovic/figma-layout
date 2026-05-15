@@ -311,6 +311,10 @@ class LayoutTransformerDebug(BaseModel):
     target_width: int
     target_height: int
     model_roles: list[str]
+    postprocess_mode: str | None = None
+    prototype_id: str | None = None
+    prototype_match_score: float | None = None
+    postprocess_report: dict[str, Any] | None = None
 
 
 class LayoutTransformerResponse(BaseModel):
@@ -1096,6 +1100,10 @@ def layout_transformer_predict(request: LayoutTransformerRequest) -> LayoutTrans
             target_width=request.target_width,
             target_height=request.target_height,
             model_roles=layout_transformer_service.model_roles,
+            postprocess_mode=layout_transformer_service.last_report.get("postprocess_mode"),
+            prototype_id=layout_transformer_service.last_report.get("prototype_id"),
+            prototype_match_score=layout_transformer_service.last_report.get("prototype_match_score"),
+            postprocess_report=layout_transformer_service.last_report,
         ),
     )
     if meta_base is not None:
