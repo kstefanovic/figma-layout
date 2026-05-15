@@ -97,6 +97,22 @@ def build_text_alignment_constraints(
     return constraints
 
 
+def align_headline_children_in_parent(
+    source_root: dict[str, Any],
+    output_root: dict[str, Any],
+    horizontal_align: str,
+) -> dict[str, Any]:
+    """Horizontally place headline + subheadline inside ``headline_group``, then pack vertically."""
+    report: dict[str, Any] = {"headline_children_aligned": 0, "warnings": []}
+    align = str(horizontal_align or "").strip().upper() or "CENTER"
+    if align == "JUSTIFIED":
+        align = "LEFT"
+    if align not in ("LEFT", "CENTER", "RIGHT"):
+        align = "CENTER"
+    _align_headline_children(source_root, output_root, align, report)
+    return report
+
+
 def _align_headline_children(
     source_root: dict[str, Any],
     output_root: dict[str, Any],
@@ -122,6 +138,17 @@ def _align_headline_children(
                 continue
             bounds = get_bounds(child)
             dx = target_x - bounds["x"]
+            _translate_subtree(child, dx, 0.0)
+            report["headline_children_aligned"] += 1
+    elif align == "RIGHT":
+        pad_ratio = _source_right_padding(source_root)
+        target_right = parent_bounds["x"] + parent_bounds["width"] - pad_ratio * parent_bounds["width"]
+        for role in HEADLINE_TEXT_ROLES:
+            child = find_by_role(output_root, role)
+            if child is None:
+                continue
+            bounds = get_bounds(child)
+            dx = target_right - bounds["x"] - bounds["width"]
             _translate_subtree(child, dx, 0.0)
             report["headline_children_aligned"] += 1
     else:
@@ -151,6 +178,23 @@ def _source_left_padding(source_root: dict[str, Any]) -> float:
             continue
         child_bounds = get_bounds(child)
         pad_ratio = (child_bounds["x"] - parent_bounds["x"]) / parent_bounds["width"]
+        return min(0.15, max(0.0, pad_ratio))
+    return 0.0
+
+
+def _source_right_padding(source_root: dict[str, Any]) -> float:
+    source_parent = find_by_role(source_root, "headline_group")
+    if source_parent is None:
+        return 0.0
+    parent_bounds = get_bounds(source_parent)
+    if parent_bounds["width"] <= 0:
+        return 0.0
+    for role in HEADLINE_TEXT_ROLES:
+        child = find_by_role(source_root, role)
+        if child is None:
+            continue
+        child_bounds = get_bounds(child)
+        pad_ratio = (parent_bounds["x"] + parent_bounds["width"] - child_bounds["x"] - child_bounds["width"]) / parent_bounds["width"]
         return min(0.15, max(0.0, pad_ratio))
     return 0.0
 

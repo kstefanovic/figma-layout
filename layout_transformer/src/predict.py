@@ -19,7 +19,13 @@ from .extract import (
 )
 from .model import LayoutTransformer
 from .postprocess import postprocess_layout
-from .prototype_index import DEFAULT_PROTOTYPES_PATH, build_prototypes, load_prototypes, save_prototypes, select_target_prototype_match
+from .prototype_index import (
+    DEFAULT_PROTOTYPES_PATH,
+    build_prototypes,
+    load_prototypes,
+    save_prototypes,
+    select_target_prototype_match,
+)
 from .prototype_postprocess import apply_prototype_postprocess
 from .roles import NUM_ROLES, ROLE_TO_ID, TRAIN_ROLES
 
@@ -109,22 +115,6 @@ def predict_structural_layout(
     source_w, source_h = get_canvas_size(source_json)
     prototype_match = select_target_prototype_match(source_json, target_w, target_h, prototypes or [])
     prototype = prototype_match.get("prototype") if isinstance(prototype_match, dict) else None
-    if prototype is not None and _is_strict_prototype_match(prototype_match):
-        output_json = copy_json_with_predicted_bounds(source_json, {}, target_w, target_h)
-        output_json, report = apply_prototype_postprocess(
-            source_json=source_json,
-            output_json=output_json,
-            target_w=target_w,
-            target_h=target_h,
-            prototype=prototype,
-            prototype_match=prototype_match,
-            return_report=True,
-        )
-        validate_predicted_layout(output_json, int(round(target_w)), int(round(target_h)))
-        if return_report:
-            return output_json, report
-        return output_json
-
     source_bboxes = torch.zeros((1, NUM_ROLES, 4), dtype=torch.float32)
     role_mask = torch.zeros((1, NUM_ROLES), dtype=torch.float32)
     nodes = flatten_semantic_nodes(source_json)
@@ -173,16 +163,6 @@ def predict_structural_layout(
     if return_report:
         return output_json, report
     return output_json
-
-
-def _is_strict_prototype_match(match: dict[str, Any] | None) -> bool:
-    if not isinstance(match, dict):
-        return False
-    aspect_diff = _num(match.get("aspect_diff"), 999.0)
-    width_diff = _num(match.get("width_diff_ratio"), 999.0)
-    height_diff = _num(match.get("height_diff_ratio"), 999.0)
-    exact_size = bool(match.get("exact_size"))
-    return aspect_diff < 0.05 and (exact_size or (width_diff < 0.10 and height_diff < 0.10))
 
 
 def _num(value: Any, default: float) -> float:

@@ -184,6 +184,204 @@ def place_floating_by_anchor(
     return {"role": role, "placed": False, "warning": f"unsupported floating role {role}"}
 
 
+def _portrait_stack_start_y(hero_b: dict[str, float], target_h: float, gap: float) -> float:
+    """First Y for brand/headline/legal stack under the photo region.
+
+    When ``hero_image`` bounds are taller than the canvas (bleed/crop quirks), the numeric
+    bottom is past the visible hero; use a capped split so copy stays in the lower band.
+    """
+    raw_bottom = hero_b["y"] + hero_b["height"]
+    if hero_b["height"] > target_h * 0.82:
+        clipped_bottom = hero_b["y"] + min(hero_b["height"], target_h * 0.56)
+        return max(clipped_bottom, target_h * 0.48) + gap
+    return raw_bottom + gap
+
+
+# Figma paints later siblings on top. ``brand_group`` must appear *before* ``headline_group`` in
+# ``root.children`` so headline/subheadline draw above the logo when boxes are tight.
+PORTRAIT_ROOT_CHILD_Z_ORDER = (
+    "hero_image",
+    "background_shape",
+    "background_gradient_1",
+    "background_gradient_2",
+    "star_decoration_1",
+    "star_decoration_2",
+    "offer_group",
+    "brand_group",
+    "headline_group",
+    "legal_text",
+    "age_badge",
+)
+
+
+def normalize_portrait_root_child_order(root: dict[str, Any], target_w: float, target_h: float) -> bool:
+    """Reorder root ``children`` for portrait so z-index matches DOOH (copy above logo)."""
+    if target_w > target_h:
+        return False
+    children = root.get("children")
+    if not isinstance(children, list) or len(children) < 2:
+        return False
+    rank = {name: i for i, name in enumerate(PORTRAIT_ROOT_CHILD_Z_ORDER)}
+    enumerated = list(enumerate(children))
+
+    def sort_key(item: tuple[int, Any]) -> tuple[int, int]:
+        orig_idx, node = item
+        if not isinstance(node, dict):
+            return (10_000, orig_idx)
+        name = str(node.get("name") or "")
+        return (rank.get(name, 1000), orig_idx)
+
+    enumerated.sort(key=sort_key)
+    new_children = [node for _i, node in enumerated]
+    if new_children == children:
+        return False
+    root["children"] = new_children
+    return True
+
+
+def _clamp_node_bounds_inside_rect(
+    node: dict[str, Any],
+    pb: dict[str, float],
+    label: str,
+    warnings: list[str] | None,
+) -> int:
+    """Translate then uniformly scale a subtree so its bounds fit inside ``pb``. Returns adjustment count."""
+    steps = 0
+    b = get_bounds(node)
+    if b["width"] <= 0 or b["height"] <= 0 or pb["width"] <= 0 or pb["height"] <= 0:
+        return steps
+    dx = 0.0
+    dy = 0.0
+    if b["x"] < pb["x"]:
+        dx = pb["x"] - b["x"]
+    elif b["x"] + b["width"] > pb["x"] + pb["width"]:
+        dx = pb["x"] + pb["width"] - b["x"] - b["width"]
+    if b["y"] < pb["y"]:
+        dy = pb["y"] - b["y"]
+    elif b["y"] + b["height"] > pb["y"] + pb["height"]:
+        dy = pb["y"] + pb["height"] - b["y"] - b["height"]
+    if dx or dy:
+        _translate_subtree_bounds(node, dx, dy)
+        steps += 1
+        if isinstance(warnings, list):
+            warnings.append(f"{label}: clamped translate ({dx:.2f},{dy:.2f}) inside parent")
+    b = get_bounds(node)
+    sx = 1.0 if b["width"] <= pb["width"] else pb["width"] / b["width"]
+    sy = 1.0 if b["height"] <= pb["height"] else pb["height"] / b["height"]
+    scale = min(1.0, sx, sy)
+    if scale < 1.0:
+        _scale_subtree_bounds(node, b["x"], b["y"], scale)
+        _scale_style_fields(node, scale)
+        steps += 1
+        if isinstance(warnings, list):
+            warnings.append(f"{label}: clamped scale {scale:.4f} inside parent")
+    return steps
+
+
+def ensure_layout_text_containment(
+    output_root: dict[str, Any],
+    target_w: float,
+    target_h: float,
+    warnings: list[str] | None,
+) -> int:
+    """Keep headline/subheadline inside ``headline_group`` and ``legal_text`` inside the root frame."""
+    total = 0
+    parent = find_by_role(output_root, "headline_group")
+    if parent is not None:
+        pb = get_bounds(parent)
+        for role in HEADLINE_CHILD_ROLES:
+            node = find_by_role(output_root, role)
+            if node is None:
+                continue
+            total += _clamp_node_bounds_inside_rect(node, pb, role, warnings)
+    legal = find_by_role(output_root, "legal_text")
+    if legal is not None:
+        canvas = get_bounds(output_root)
+        if canvas["width"] <= 0 or canvas["height"] <= 0:
+            canvas = {"x": 0.0, "y": 0.0, "width": float(target_w), "height": float(target_h)}
+        total += _clamp_node_bounds_inside_rect(legal, canvas, "legal_text", warnings)
+    return total
+
+
+def resolve_portrait_content_stack(
+    output_root: dict[str, Any],
+    target_w: float,
+    target_h: float,
+) -> dict[str, Any]:
+    """Portrait: place brand, headline group, and legal under ``hero_image``, then center on canvas width.
+
+    The structural model can leave ``headline_group`` overlapping the hero or ``brand_group``; this pass
+    enforces a DOOH-style vertical stack and horizontal centering so children match 640×720-style targets.
+    """
+    report: dict[str, Any] = {"portrait_stack_adjustments": [], "warnings": []}
+    if target_w > target_h:
+        return report
+    hero = find_by_role(output_root, "hero_image")
+    if hero is None:
+        return report
+
+    gap = max(8.0, target_h * 0.012)
+    hb = get_bounds(hero)
+    cursor_y = _portrait_stack_start_y(hb, target_h, gap)
+
+    brand = find_by_role(output_root, "brand_group")
+    if brand is not None:
+        bb = get_bounds(brand)
+        if bb["y"] < cursor_y - 0.5:
+            dy = cursor_y - bb["y"]
+            _translate_subtree_bounds(brand, 0.0, dy)
+            report["portrait_stack_adjustments"].append({"role": "brand_group", "dy": dy})
+        bb = get_bounds(brand)
+        cursor_y = bb["y"] + bb["height"] + gap
+
+    hgroup = find_by_role(output_root, "headline_group")
+    if hgroup is not None:
+        gb = get_bounds(hgroup)
+        if gb["y"] < cursor_y - 0.5:
+            dy = cursor_y - gb["y"]
+            _translate_subtree_bounds(hgroup, 0.0, dy)
+            report["portrait_stack_adjustments"].append({"role": "headline_group", "dy": dy})
+        gb = get_bounds(hgroup)
+        cursor_y = gb["y"] + gb["height"] + gap
+
+    legal = find_by_role(output_root, "legal_text")
+    if legal is not None:
+        lb = get_bounds(legal)
+        if lb["y"] < cursor_y - 0.5:
+            dy = cursor_y - lb["y"]
+            _translate_subtree_bounds(legal, 0.0, dy)
+            report["portrait_stack_adjustments"].append({"role": "legal_text", "dy": dy})
+
+    brand = find_by_role(output_root, "brand_group")
+    hgroup = find_by_role(output_root, "headline_group")
+    if brand is not None and hgroup is not None:
+        bb = get_bounds(brand)
+        gb = get_bounds(hgroup)
+        gap_brand = max(8.0, target_h * 0.012)
+        min_headline_y = bb["y"] + bb["height"] + gap_brand
+        if gb["y"] < min_headline_y - 0.5:
+            dy = min_headline_y - gb["y"]
+            _translate_subtree_bounds(hgroup, 0.0, dy)
+            report["portrait_stack_adjustments"].append({"role": "headline_group", "dy": dy, "reason": "below_brand"})
+
+    for role in ("brand_group", "headline_group", "legal_text"):
+        node = find_by_role(output_root, role)
+        if node is None:
+            continue
+        b = get_bounds(node)
+        if b["width"] <= 0:
+            continue
+        dx = (target_w - b["width"]) / 2.0 - b["x"]
+        if abs(dx) >= 0.25:
+            _translate_subtree_bounds(node, dx, 0.0)
+            report["portrait_stack_adjustments"].append({"role": role, "dx": dx})
+
+    if normalize_portrait_root_child_order(output_root, target_w, target_h):
+        report["portrait_stack_adjustments"].append({"role": "__root__", "action": "portrait_child_z_order"})
+
+    return report
+
+
 def postprocess_layout(
     source_json: dict[str, Any],
     output_json: dict[str, Any],
@@ -198,6 +396,8 @@ def postprocess_layout(
         "text_alignment_applied": 0,
         "headline_children_aligned": 0,
         "font_size_fitted": 0,
+        "portrait_stack_adjustments": [],
+        "text_containment_steps": 0,
         "warnings": [],
     }
 
@@ -218,7 +418,13 @@ def postprocess_layout(
         report["transformed_children_count"] += int(subreport.get("transformed") or 0)
         report["warnings"].extend(subreport.get("warnings") or [])
 
-    from .postprocess_solver import apply_orientation_text_layout
+    from .postprocess_solver import (
+        _fit_text_font_to_bounds,
+        _is_text_node,
+        align_headline_children_in_parent,
+        apply_orientation_text_layout,
+        get_target_text_alignment,
+    )
 
     alignment_report = apply_orientation_text_layout(source_json, output_json, target_w, target_h)
     report["text_alignment"] = alignment_report.get("text_alignment")
@@ -227,12 +433,34 @@ def postprocess_layout(
     report["font_size_fitted"] += alignment_report.get("font_size_fitted", 0)
     report["warnings"].extend(alignment_report.get("warnings") or [])
 
+    headline_layout = align_headline_children_in_parent(
+        source_json, output_json, get_target_text_alignment(target_w, target_h)
+    )
+    report["headline_children_aligned"] += int(headline_layout.get("headline_children_aligned") or 0)
+    report["warnings"].extend(headline_layout.get("warnings") or [])
+
+    stack_report = resolve_portrait_content_stack(output_json, target_w, target_h)
+    report["portrait_stack_adjustments"] = stack_report.get("portrait_stack_adjustments") or []
+    report["warnings"].extend(stack_report.get("warnings") or [])
+
+    report["text_containment_steps"] = ensure_layout_text_containment(
+        output_json, target_w, target_h, report["warnings"]
+    )
+    for role in ("headline", "subheadline_delivery_time", "legal_text"):
+        node = find_by_role(output_json, role)
+        if node is not None and _is_text_node(node) and _fit_text_font_to_bounds(node, role):
+            report["font_size_fitted"] += 1
+
     for role in FLOATING_RULE_ROLES:
         result = place_floating_by_anchor(source_json, output_json, role, target_w, target_h)
         if result.get("placed"):
             report["floating_roles_placed"].append(role)
         if result.get("warning"):
             report["warnings"].append(result["warning"])
+
+    headline_group = find_by_role(output_json, "headline_group")
+    if headline_group is not None:
+        headline_group["clipsContent"] = True
 
     validation_warnings = validate_postprocess_bounds(output_json)
     report["warnings"].extend(validation_warnings)

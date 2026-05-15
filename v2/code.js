@@ -2023,7 +2023,7 @@ function applyJsonTextStyle(node, item) {
 
 function shouldDisableClippingForJsonItem(item) {
   const name = String(item && item.name ? item.name : "").trim();
-  return name === "headline_group" || name === "brand_group" || name === "offer_group";
+  return name === "brand_group" || name === "offer_group";
 }
 
 function isJsonRootFrame(item) {
@@ -2341,12 +2341,12 @@ async function applyFinalJsonContentToClone(finalJson, convertedFrame) {
         node.fontName = await loadJsonFontName(item.fontName);
         node.characters = String(item.characters || "");
         if ("textAutoResize" in node) node.textAutoResize = "NONE";
+        if (typeof item.fontSize === "number" && Number.isFinite(item.fontSize)) {
+          node.fontSize = Math.max(1, item.fontSize);
+        }
         const b = item.bounds && typeof item.bounds === "object" ? item.bounds : null;
         if (b && typeof b.width === "number" && typeof b.height === "number") {
           resizeNodeIfPossible(node, b.width, b.height);
-        }
-        if (typeof item.fontSize === "number" && Number.isFinite(item.fontSize)) {
-          node.fontSize = Math.max(1, item.fontSize);
         }
         applied += applyJsonTextStyle(node, item);
         if (item.textAlignHorizontal) {
@@ -2355,7 +2355,6 @@ async function applyFinalJsonContentToClone(finalJson, convertedFrame) {
         if (item.textAlignVertical) {
           node.textAlignVertical = item.textAlignVertical;
         }
-        applied += applyJsonTextStyle(node, item);
         applied++;
       } catch (e) {
         console.warn("applyFinalJsonContentToClone: text content apply failed", node && node.name, e);

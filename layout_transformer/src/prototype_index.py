@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 from pathlib import Path
@@ -14,8 +15,8 @@ CHILD_PARENT = {
     "headline": "headline_group",
     "subheadline_delivery_time": "headline_group",
     "logo": "brand_group",
-    "logo_back": "brand_group",
-    "logo_fore": "brand_group",
+    "logo_back": "logo",
+    "logo_fore": "logo",
     "brand_name_first_part_1": "brand_group",
     "brand_name_first_part_2": "brand_group",
     "brand_name_second": "brand_group",
@@ -68,21 +69,28 @@ def build_prototypes(input_dir: Path) -> list[dict[str, Any]]:
                     rel = _relative_bbox(_bounds(child), _bounds(parent))
                     if rel is not None:
                         prototype["child_relative_bboxes"][role] = rel
-                        style = _text_style(child)
-                        if style:
-                            prototype["text_styles"][role] = style
+                        prototype["text_styles"][role] = _text_style(
+                            child, role=role, parent_bounds=_bounds(parent)
+                        )
             for role in FLOATING_PROTO_ROLES:
                 node = nodes.get(role)
                 if node is not None:
                     prototype["floating_bboxes"][role] = _norm_bbox(_bounds(node), canvas)
-                    style = _text_style(node)
-                    if style:
-                        prototype["text_styles"][role] = style
+                    prototype["text_styles"][role] = _text_style(node, role=role, parent_bounds=canvas)
             legal = nodes.get("legal_text")
             if legal is not None:
-                style = _text_style(legal)
-                if style:
-                    prototype["text_styles"]["legal_text"] = style
+                prototype["text_styles"]["legal_text"] = _text_style(
+                    legal, role="legal_text", parent_bounds=canvas
+                )
+                lb = _bounds(legal)
+                bg = nodes.get("background_shape")
+                rel_bg = _relative_bbox(lb, _bounds(bg)) if bg is not None else None
+                if rel_bg is not None:
+                    prototype["legal_text_relative"] = {"anchor": "background_shape", **rel_bg}
+                else:
+                    rel_canvas = _relative_bbox(lb, canvas)
+                    if rel_canvas is not None:
+                        prototype["legal_text_relative"] = {"anchor": "canvas", **rel_canvas}
             prototypes.append(prototype)
     return prototypes
 
@@ -99,6 +107,37 @@ def load_prototypes(path: Path = DEFAULT_PROTOTYPES_PATH) -> list[dict[str, Any]
     if isinstance(data, list):
         return [item for item in data if isinstance(item, dict)]
     raise ValueError(f"prototype file has invalid shape: {path}")
+
+
+def default_clean_families_dir() -> Path:
+    """Directory of ``*_clean_fixed_semantic.json`` frames used to build prototypes."""
+    return Path(__file__).resolve().parent.parent / "data" / "clean_families"
+
+
+def load_prototype_semantic_frame(
+    prototype: dict[str, Any],
+    *,
+    clean_families_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Return a deep copy of the full semantic frame for this prototype (index + file)."""
+    if not isinstance(prototype, dict):
+        raise TypeError("prototype must be a dict")
+    source_file = prototype.get("source_file")
+    if not isinstance(source_file, str) or not source_file.strip():
+        raise ValueError("prototype missing source_file")
+    try:
+        frame_index = int(prototype.get("frame_index", 0))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("prototype has invalid frame_index") from exc
+    base = clean_families_dir or default_clean_families_dir()
+    path = base / source_file
+    if not path.is_file():
+        raise FileNotFoundError(f"prototype source frame file not found: {path}")
+    data = _load_json(path)
+    frames = _coerce_frames(data)
+    if frame_index < 0 or frame_index >= len(frames):
+        raise IndexError(f"prototype frame_index {frame_index} out of range for {path} ({len(frames)} frames)")
+    return copy.deepcopy(frames[frame_index])
 
 
 def select_target_prototype(
@@ -262,19 +301,117 @@ def _norm_bbox(bounds: dict[str, float], canvas: dict[str, float]) -> dict[str, 
     }
 
 
-def _text_style(node: dict[str, Any]) -> dict[str, Any]:
+def _text_style(
+    node: dict[str, Any],
+    *,
+    role: str | None = None,
+    parent_bounds: dict[str, float] | None = None,
+) -> dict[str, Any]:
+    """Full text style record for prototype ``text_styles`` (required keys for plugin / postprocess).
+
+    Copies fields present on the semantic node (and optional nested ``style``). Any missing required
+    keys are filled with layout-informed defaults so exports without typography still get a usable
+    template.
+    """
+    src: dict[str, Any] = dict(node)
+    nested = node.get("style")
+    if isinstance(nested, dict):
+        for key in (
+            "fontSize",
+            "fontName",
+            "textAlignHorizontal",
+            "textAlignVertical",
+            "textAutoResize",
+            "lineHeight",
+            "letterSpacing",
+            "fills",
+            "opacity",
+        ):
+            if key in nested and key not in src:
+                src[key] = nested[key]
+
     out: dict[str, Any] = {}
-    font_size = node.get("fontSize")
+    font_size = src.get("fontSize")
     if isinstance(font_size, (int, float)) and math.isfinite(float(font_size)):
         out["fontSize"] = float(font_size)
-    font_name = node.get("fontName")
+    font_name = src.get("fontName")
     if isinstance(font_name, dict) and font_name.get("family") and font_name.get("style"):
         out["fontName"] = {"family": str(font_name["family"]), "style": str(font_name["style"])}
+    tar = src.get("textAutoResize")
+    if isinstance(tar, str) and tar.strip():
+        out["textAutoResize"] = tar.strip()
     for key in ("textAlignHorizontal", "textAlignVertical"):
-        value = node.get(key)
-        if isinstance(value, str) and value:
-            out[key] = value
+        value = src.get(key)
+        if isinstance(value, str) and value.strip():
+            out[key] = value.strip()
+    for key in ("lineHeight", "letterSpacing"):
+        if key not in src:
+            continue
+        val = src[key]
+        if isinstance(val, (dict, list)):
+            out[key] = copy.deepcopy(val)
+        else:
+            out[key] = val
+    if "fills" in src and src["fills"] is not None:
+        out["fills"] = copy.deepcopy(src["fills"])
+    opacity = src.get("opacity")
+    if isinstance(opacity, (int, float)) and math.isfinite(float(opacity)):
+        out["opacity"] = float(opacity)
+
+    child_bounds = _bounds(node)
+    if "fontSize" not in out:
+        out["fontSize"] = _inferred_font_size_from_bounds(role, child_bounds)
+    if "fontName" not in out:
+        out["fontName"] = {"family": "Inter", "style": "Regular"}
+    if "textAlignHorizontal" not in out:
+        if parent_bounds is not None and parent_bounds.get("width", 0.0) > 0:
+            out["textAlignHorizontal"] = _infer_text_align_horizontal(child_bounds, parent_bounds)
+        else:
+            out["textAlignHorizontal"] = "LEFT"
+    if "textAlignVertical" not in out:
+        out["textAlignVertical"] = "TOP"
+    if "textAutoResize" not in out:
+        out["textAutoResize"] = "NONE"
+    fs = float(out["fontSize"])
+    if "lineHeight" not in out:
+        out["lineHeight"] = {"unit": "PIXELS", "value": max(1.0, round(fs * 1.15))}
+    if "letterSpacing" not in out:
+        out["letterSpacing"] = {"unit": "PIXELS", "value": 0.0}
+    if "fills" not in out:
+        out["fills"] = [{"type": "SOLID", "color": {"r": 1.0, "g": 1.0, "b": 1.0}}]
+    if "opacity" not in out:
+        op = node.get("opacity")
+        if isinstance(op, (int, float)) and math.isfinite(float(op)):
+            out["opacity"] = float(op)
+        else:
+            out["opacity"] = 1.0
     return out
+
+
+def _inferred_font_size_from_bounds(role: str | None, child_bounds: dict[str, float]) -> float:
+    h = max(0.0, child_bounds.get("height", 0.0))
+    if h <= 0:
+        return 16.0
+    if role == "headline":
+        factor = 0.38
+    elif role == "subheadline_delivery_time":
+        factor = 0.40
+    elif role == "legal_text":
+        factor = 0.24
+    else:
+        factor = 0.34
+    return max(8.0, min(128.0, h * factor))
+
+
+def _infer_text_align_horizontal(child: dict[str, float], parent: dict[str, float]) -> str:
+    pw = parent.get("width", 0.0)
+    if pw <= 0:
+        return "LEFT"
+    cx = child.get("x", 0.0) + max(0.0, child.get("width", 0.0)) / 2.0
+    pc = parent.get("x", 0.0) + pw / 2.0
+    if abs(cx - pc) < pw * 0.08:
+        return "CENTER"
+    return "LEFT"
 
 
 def _load_json(path: Path) -> Any:
