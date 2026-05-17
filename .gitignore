@@ -17,3 +17,9 @@ gnn_layout/data/
 layout_transformer/checkpoints/
 layout_transformer/data/
 layout_transformer/previews/
+
+layout_transformer_v2/checkpoints
+
+layout_transformer_v2/data/dataset
+
+layout_transformer_v2/previews

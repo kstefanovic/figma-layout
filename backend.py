@@ -47,8 +47,8 @@ from json_embedding import (
     select_frame,
 )
 from layout_engine.convert import convert_banner
-from layout_transformer.src.predict import StructuralLayoutTransformerService
-from layout_transformer.src.roles import TRAIN_ROLES
+from layout_transformer_v2.src.predict import LayoutTransformerV2Service
+from layout_transformer_v2.src.schema import ALL_ROLES as LAYOUT_TRANSFORMER_V2_ROLES
 
 
 load_dotenv()
@@ -99,11 +99,14 @@ GNN_LAYOUT_CHECKPOINT = os.getenv(
     "GNN_LAYOUT_CHECKPOINT",
     "gnn_layout/data/checkpoints/gnn_brand_headline_legal_smoke.pt",
 )
-LAYOUT_TRANSFORMER_CHECKPOINT = Path(
-    os.getenv(
-        "LAYOUT_TRANSFORMER_CHECKPOINT",
-        "layout_transformer/checkpoints/layout_transformer_structural.pt",
-    )
+LAYOUT_TRANSFORMER_PARENT_CHECKPOINT = Path(
+    os.getenv("LAYOUT_TRANSFORMER_PARENT_CHECKPOINT", "layout_transformer_v2/checkpoints/parent.pt"),
+).resolve()
+LAYOUT_TRANSFORMER_CHILD_CHECKPOINT = Path(
+    os.getenv("LAYOUT_TRANSFORMER_CHILD_CHECKPOINT", "layout_transformer_v2/checkpoints/child.pt"),
+).resolve()
+LAYOUT_TRANSFORMER_FLOATING_CHECKPOINT = Path(
+    os.getenv("LAYOUT_TRANSFORMER_FLOATING_CHECKPOINT", "layout_transformer_v2/checkpoints/floating.pt"),
 ).resolve()
 LAYOUT_TRANSFORMER_DEVICE = os.getenv("LAYOUT_TRANSFORMER_DEVICE", "").strip() or None
 FRONTEND_DIR = Path(__file__).resolve().parent / "frontend"
@@ -319,7 +322,7 @@ class LayoutTransformerDebug(BaseModel):
 
 class LayoutTransformerResponse(BaseModel):
     final_json: dict[str, Any]
-    engine: Literal["layout_transformer_structural"] = "layout_transformer_structural"
+    engine: Literal["layout_transformer_v2_multi_model"] = "layout_transformer_v2_multi_model"
     debug: LayoutTransformerDebug
 
 
@@ -332,7 +335,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-layout_transformer_service: StructuralLayoutTransformerService | None = None
+layout_transformer_service: LayoutTransformerV2Service | None = None
 
 
 @app.on_event("startup")
@@ -340,10 +343,21 @@ def load_layout_transformer_service() -> None:
     global layout_transformer_service
     if layout_transformer_service is not None:
         return
-    if not LAYOUT_TRANSFORMER_CHECKPOINT.exists():
-        raise RuntimeError(f"Layout Transformer checkpoint not found: {LAYOUT_TRANSFORMER_CHECKPOINT}")
-    layout_transformer_service = StructuralLayoutTransformerService(
-        LAYOUT_TRANSFORMER_CHECKPOINT,
+    missing = [
+        str(path)
+        for path in (
+            LAYOUT_TRANSFORMER_PARENT_CHECKPOINT,
+            LAYOUT_TRANSFORMER_CHILD_CHECKPOINT,
+            LAYOUT_TRANSFORMER_FLOATING_CHECKPOINT,
+        )
+        if not path.exists()
+    ]
+    if missing:
+        raise RuntimeError(f"Layout Transformer V2 checkpoint(s) not found: {missing}")
+    layout_transformer_service = LayoutTransformerV2Service(
+        parent_checkpoint=LAYOUT_TRANSFORMER_PARENT_CHECKPOINT,
+        child_checkpoint=LAYOUT_TRANSFORMER_CHILD_CHECKPOINT,
+        floating_checkpoint=LAYOUT_TRANSFORMER_FLOATING_CHECKPOINT,
         device=LAYOUT_TRANSFORMER_DEVICE,
     )
 
@@ -515,9 +529,15 @@ def _persist_layout_transformer_run_input(
         "run_id": run_id,
         "run_dir": str(run_dir),
         "endpoint": "/api/layout-transformer",
+        "engine": "layout_transformer_v2_multi_model",
         "started_at_utc": datetime.now(timezone.utc).isoformat(),
         "target_width": request.target_width,
         "target_height": request.target_height,
+        "checkpoints": {
+            "parent": str(LAYOUT_TRANSFORMER_PARENT_CHECKPOINT),
+            "child": str(LAYOUT_TRANSFORMER_CHILD_CHECKPOINT),
+            "floating": str(LAYOUT_TRANSFORMER_FLOATING_CHECKPOINT),
+        },
         "input_files": {
             "input.json": {"bytes": (run_dir / "input.json").stat().st_size},
         },
@@ -726,9 +746,14 @@ def health() -> dict[str, Any]:
         "model_service_url": MODEL_SERVICE_URL,
         "model": model_health,
         "layout_transformer": {
-            "checkpoint": str(LAYOUT_TRANSFORMER_CHECKPOINT),
+            "engine": "layout_transformer_v2_multi_model",
+            "checkpoints": {
+                "parent": str(LAYOUT_TRANSFORMER_PARENT_CHECKPOINT),
+                "child": str(LAYOUT_TRANSFORMER_CHILD_CHECKPOINT),
+                "floating": str(LAYOUT_TRANSFORMER_FLOATING_CHECKPOINT),
+            },
             "loaded": layout_transformer_service is not None,
-            "roles": (layout_transformer_service.model_roles if layout_transformer_service else TRAIN_ROLES),
+            "roles": (layout_transformer_service.model_roles if layout_transformer_service else LAYOUT_TRANSFORMER_V2_ROLES),
         },
     }
 
@@ -1004,7 +1029,7 @@ def layout_engine_convert(request: LayoutEngineConvertRequest) -> LayoutEngineCo
 def layout_transformer_predict(request: LayoutTransformerRequest) -> LayoutTransformerResponse:
     """
     Predict a target clean semantic JSON from a source clean semantic JSON and target size.
-    Uses the structural Layout Transformer; no family id is accepted or required.
+    Uses the V2 multi-model rich Layout Transformer; no family id or template id is accepted or required.
     """
     run_id = _new_figma_semantic_run_id()
     run_dir = FIGMA_LAYOUT_TRANSFORMER_RUNS_DIR / run_id
@@ -1096,13 +1121,14 @@ def layout_transformer_predict(request: LayoutTransformerRequest) -> LayoutTrans
 
     response = LayoutTransformerResponse(
         final_json=final_json,
+        engine="layout_transformer_v2_multi_model",
         debug=LayoutTransformerDebug(
             target_width=request.target_width,
             target_height=request.target_height,
             model_roles=layout_transformer_service.model_roles,
             postprocess_mode=layout_transformer_service.last_report.get("postprocess_mode"),
-            prototype_id=layout_transformer_service.last_report.get("prototype_id"),
-            prototype_match_score=layout_transformer_service.last_report.get("prototype_match_score"),
+            prototype_id=None,
+            prototype_match_score=None,
             postprocess_report=layout_transformer_service.last_report,
         ),
     )
