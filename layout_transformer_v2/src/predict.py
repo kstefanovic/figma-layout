@@ -13,6 +13,7 @@ import torch
 from .models.child_model import ChildLayoutTransformer
 from .models.floating_model import FloatingLayoutTransformer
 from .models.parent_model import ParentLayoutTransformer
+from .prototypes import TEXT_STYLE_FIELDS, load_or_build_prototypes, select_prototype
 from .rich_utils import (
     apply_relative_bbox,
     bounds_of,
@@ -27,6 +28,7 @@ from .rich_utils import (
     node_flags,
     normalized_bbox,
     relative_bbox,
+    safe_float,
     set_bounds,
     walk_nodes,
 )
@@ -69,6 +71,7 @@ class LayoutTransformerV2Service:
         self.parent_model, self.parent_meta = load_model(self.parent_checkpoint, "parent", self.device)
         self.child_model, self.child_meta = load_model(self.child_checkpoint, "child", self.device)
         self.floating_model, self.floating_meta = load_model(self.floating_checkpoint, "floating", self.device)
+        self.prototypes = load_or_build_prototypes()
         self.model_roles = list(PARENT_ROLES) + list(CHILD_ROLES) + list(FLOATING_ROLES)
         self.last_report: dict[str, Any] = {}
 
@@ -83,6 +86,7 @@ class LayoutTransformerV2Service:
             child_meta=self.child_meta,
             floating_model=self.floating_model,
             floating_meta=self.floating_meta,
+            prototypes=self.prototypes,
             device=self.device,
             return_report=True,
         )
@@ -167,6 +171,7 @@ def predict_with_loaded_models(
     child_meta: dict[str, Any],
     floating_model: torch.nn.Module,
     floating_meta: dict[str, Any],
+    prototypes: list[dict[str, Any]] | None = None,
     device: str,
     return_report: bool = False,
 ) -> dict[str, Any] | tuple[dict[str, Any], dict[str, Any]]:
@@ -182,6 +187,18 @@ def predict_with_loaded_models(
     out_nodes = flatten_role_nodes(output)
     predicted_bounds: dict[str, dict[str, float]] = {}
     predicted_roles: list[str] = []
+    prototype = select_prototype(
+        prototypes or [],
+        source_json=source_json,
+        target_width=target_w,
+        target_height=target_h,
+    )
+    corrections = {
+        "background_shape": False,
+        "text_style_from_prototype": False,
+        "floating_from_prototype": False,
+        "child_relative_from_prototype": False,
+    }
 
     for role in PARENT_ROLES:
         if role not in source_nodes or role not in out_nodes:
@@ -194,6 +211,14 @@ def predict_with_loaded_models(
         predicted_roles.append(role)
         out_nodes[role]["visible"] = bool(torch.sigmoid(pred["visibility"]).item() >= 0.5)
 
+    if prototype is not None and target_h > target_w * 1.05:
+        proto_bbox = _prototype_bbox(prototype, "background_shape")
+        if proto_bbox is not None and "background_shape" in out_nodes:
+            abs_bounds = denormalize_bbox(proto_bbox, target_w, target_h)
+            set_bounds(out_nodes["background_shape"], abs_bounds)
+            predicted_bounds["background_shape"] = abs_bounds
+            corrections["background_shape"] = True
+
     for role in CHILD_ROLES:
         if role not in source_nodes or role not in out_nodes:
             continue
@@ -203,7 +228,12 @@ def predict_with_loaded_models(
         if parent_bounds is None and parent_role in out_nodes:
             parent_bounds = bounds_of(out_nodes[parent_role])
         if parent_bounds and parent_bounds["width"] > 0 and parent_bounds["height"] > 0:
-            rel = clamp_relative_bbox(pred["relative_bbox"].tolist())
+            proto_rel = _prototype_relative_bbox(prototype, role)
+            if proto_rel is not None and role in {"headline", "subheadline_delivery_time"}:
+                rel = clamp_relative_bbox(proto_rel)
+                corrections["child_relative_from_prototype"] = True
+            else:
+                rel = clamp_relative_bbox(pred["relative_bbox"].tolist())
             abs_bounds = apply_relative_bbox(parent_bounds, rel)
             set_bounds(out_nodes[role], abs_bounds)
             predicted_bounds[role] = abs_bounds
@@ -215,15 +245,24 @@ def predict_with_loaded_models(
             continue
         pred = predict_one(floating_model, floating_meta, role, source_nodes[role], source_nodes, source_w, source_h, target_w, target_h, device)
         bbox = clamp_canvas_bbox(pred["bbox"].tolist())
+        proto_bbox = _prototype_bbox(prototype, role)
+        if proto_bbox is not None:
+            bbox = proto_bbox
+            corrections["floating_from_prototype"] = True
         abs_bounds = denormalize_bbox(bbox, target_w, target_h)
         set_bounds(out_nodes[role], abs_bounds)
         predicted_bounds[role] = abs_bounds
         predicted_roles.append(role)
         out_nodes[role]["visible"] = bool(torch.sigmoid(pred["visibility"]).item() >= 0.5)
 
+    if prototype is not None:
+        corrections["text_style_from_prototype"] = apply_prototype_text_styles(output, prototype)
     apply_deterministic_rules(output, target_w, target_h)
     report = {
         "predicted_roles": predicted_roles,
+        "prototype_id": prototype.get("prototype_id") if prototype else None,
+        "prototype_match_score": prototype.get("match_score") if prototype else None,
+        "corrections_applied": corrections,
         "source_canvas": {"width": source_w, "height": source_h, "aspect": source_w / source_h},
         "target_canvas": {"width": target_w, "height": target_h, "aspect": target_w / target_h},
         "parent_roles": list(PARENT_ROLES),
@@ -233,6 +272,48 @@ def predict_with_loaded_models(
     if return_report:
         return output, report
     return output
+
+
+def _prototype_bbox(prototype: dict[str, Any] | None, role: str) -> list[float] | None:
+    if prototype is None:
+        return None
+    bbox = (prototype.get("role_bboxes") or {}).get(role)
+    if not isinstance(bbox, list) or len(bbox) != 4:
+        return None
+    return [float(value) for value in bbox]
+
+
+def _prototype_relative_bbox(prototype: dict[str, Any] | None, role: str) -> list[float] | None:
+    if prototype is None:
+        return None
+    bbox = (prototype.get("child_relative_bboxes") or {}).get(role)
+    if not isinstance(bbox, list) or len(bbox) != 4:
+        return None
+    return [float(value) for value in bbox]
+
+
+def blend_bbox(prototype_bbox: list[float], model_bbox: list[float], *, prototype_weight: float) -> list[float]:
+    model_weight = 1.0 - prototype_weight
+    return [
+        prototype_weight * float(proto_value) + model_weight * float(model_value)
+        for proto_value, model_value in zip(prototype_bbox, model_bbox)
+    ]
+
+
+def apply_prototype_text_styles(output: dict[str, Any], prototype: dict[str, Any]) -> bool:
+    nodes = flatten_role_nodes(output)
+    styles = prototype.get("text_styles") or {}
+    applied = False
+    for role in ("headline", "subheadline_delivery_time", "legal_text", "age_badge"):
+        node = nodes.get(role)
+        style = styles.get(role)
+        if not node or not isinstance(style, dict):
+            continue
+        for field in TEXT_STYLE_FIELDS:
+            if field in style:
+                node[field] = json.loads(json.dumps(style[field], ensure_ascii=False))
+                applied = True
+    return applied
 
 
 def load_model(checkpoint: Path, dataset_type: str, device: str) -> tuple[torch.nn.Module, dict[str, Any]]:

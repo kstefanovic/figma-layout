@@ -92,6 +92,14 @@
         background: #6d28d9;
       }
 
+      #layout-transformer-v2-btn {
+        background: #2563eb;
+      }
+
+      #layout-transformer-v2-btn:hover {
+        background: #1d4ed8;
+      }
+
       #copy-html-btn,
       #copy-semantic-btn {
         background: #475569;
@@ -184,6 +192,12 @@
       </button>
     </div>
 
+    <div class="row">
+      <button id="layout-transformer-v2-btn" type="button">
+        Layout Transformer V2 — 3-model rich semantic JSON → clone beside frame (1+ frames)
+      </button>
+    </div>
+
     <div id="semantic-json-section">
       <div class="row">
         <label for="semantic-max-tokens">Semantic JSON — max new tokens (256–8192; names-only output is small)</label>
@@ -237,6 +251,7 @@ Select one or more frames, then click “JSON to HTML/CSS Exporter”. Each fram
       const statusEl = document.getElementById("status");
       const pipelineBtn = document.getElementById("pipeline-btn");
       const layoutTransformerBtn = document.getElementById("layout-transformer-btn");
+      const layoutTransformerV2Btn = document.getElementById("layout-transformer-v2-btn");
       const semanticJsonBtn = document.getElementById("semantic-json-btn");
       const semanticMaxTokensEl = document.getElementById("semantic-max-tokens");
       const semanticJsonResultEl = document.getElementById("semantic-json-result");
@@ -259,6 +274,7 @@ Select one or more frames, then click “JSON to HTML/CSS Exporter”. Each fram
         if (pipelineOverlayEl) pipelineOverlayEl.hidden = !busy;
         if (pipelineBtn) pipelineBtn.disabled = busy;
         if (layoutTransformerBtn) layoutTransformerBtn.disabled = busy;
+        if (layoutTransformerV2Btn) layoutTransformerV2Btn.disabled = busy;
       }
 
       function setSelectedFrameInfo(info) {
@@ -421,6 +437,24 @@ Select one or more frames, then click “JSON to HTML/CSS Exporter”. Each fram
           {
             pluginMessage: {
               type: "layout-transformer-convert-selected-frame",
+              backendUrl,
+              targetSize,
+            },
+          },
+          "*",
+        );
+      };
+
+      layoutTransformerV2Btn.onclick = () => {
+        const backendUrl = document.getElementById("backend-url").value.trim();
+        const targetSize = normalizeTargetSizeText(document.getElementById("target-size").value);
+        document.getElementById("target-size").value = targetSize;
+        setStatus("Calling Layout Transformer V2 on rich semantic JSON…");
+        setPipelineLoading(true);
+        parent.postMessage(
+          {
+            pluginMessage: {
+              type: "layout-transformer-v2-convert-selected-frame",
               backendUrl,
               targetSize,
             },

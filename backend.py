@@ -12,7 +12,7 @@ from typing import Annotated, Any, Literal
 import requests
 from PIL import Image
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -317,6 +317,7 @@ class LayoutTransformerDebug(BaseModel):
     postprocess_mode: str | None = None
     prototype_id: str | None = None
     prototype_match_score: float | None = None
+    corrections_applied: dict[str, bool] | None = None
     postprocess_report: dict[str, Any] | None = None
 
 
@@ -517,6 +518,7 @@ def _persist_layout_transformer_run_input(
     *,
     run_id: str,
     request: LayoutTransformerRequest,
+    endpoint: str = "/api/layout-transformer",
 ) -> dict[str, Any]:
     """Write the Layout Transformer plugin request under ``run_dir`` and return base metadata."""
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -528,7 +530,7 @@ def _persist_layout_transformer_run_input(
     return {
         "run_id": run_id,
         "run_dir": str(run_dir),
-        "endpoint": "/api/layout-transformer",
+        "endpoint": endpoint,
         "engine": "layout_transformer_v2_multi_model",
         "started_at_utc": datetime.now(timezone.utc).isoformat(),
         "target_width": request.target_width,
@@ -1026,13 +1028,18 @@ def layout_engine_convert(request: LayoutEngineConvertRequest) -> LayoutEngineCo
 
 
 @app.post("/api/layout-transformer", response_model=LayoutTransformerResponse)
-def layout_transformer_predict(request: LayoutTransformerRequest) -> LayoutTransformerResponse:
+@app.post("/api/layout-transformer-v2", response_model=LayoutTransformerResponse)
+def layout_transformer_predict(
+    request: LayoutTransformerRequest,
+    fastapi_request: Request,
+) -> LayoutTransformerResponse:
     """
     Predict a target clean semantic JSON from a source clean semantic JSON and target size.
     Uses the V2 multi-model rich Layout Transformer; no family id or template id is accepted or required.
     """
     run_id = _new_figma_semantic_run_id()
     run_dir = FIGMA_LAYOUT_TRANSFORMER_RUNS_DIR / run_id
+    endpoint = fastapi_request.url.path
     meta_base: dict[str, Any] | None = None
     if FIGMA_LAYOUT_TRANSFORMER_PERSIST_RUNS:
         try:
@@ -1040,6 +1047,7 @@ def layout_transformer_predict(request: LayoutTransformerRequest) -> LayoutTrans
                 run_dir,
                 run_id=run_id,
                 request=request,
+                endpoint=endpoint,
             )
         except OSError:
             meta_base = None
@@ -1127,8 +1135,9 @@ def layout_transformer_predict(request: LayoutTransformerRequest) -> LayoutTrans
             target_height=request.target_height,
             model_roles=layout_transformer_service.model_roles,
             postprocess_mode=layout_transformer_service.last_report.get("postprocess_mode"),
-            prototype_id=None,
-            prototype_match_score=None,
+            prototype_id=layout_transformer_service.last_report.get("prototype_id"),
+            prototype_match_score=layout_transformer_service.last_report.get("prototype_match_score"),
+            corrections_applied=layout_transformer_service.last_report.get("corrections_applied"),
             postprocess_report=layout_transformer_service.last_report,
         ),
     )

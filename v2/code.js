@@ -1,7 +1,7 @@
 /**
  * Figma plugin main thread. Flows:
  * - ``POST …/pipeline/banner-raw-to-target-json-json`` — banner + raw JSON + target size → classify into class 1..6, retrieve best template in that class, return target JSON; plugin draws clone beside the source.
- * - ``POST …/api/layout-transformer`` — selected semantic JSON + target size → structural Layout Transformer output; plugin clones beside the original and applies returned ``final_json``.
+ * - ``POST …/api/layout-transformer-v2`` — selected rich semantic JSON + target size → V2 Layout Transformer output; plugin clones beside the original and applies returned ``final_json``.
  * - ``POST …/figma/convert-semantic-json`` — banner + grid PNG + raw JSON → Qwen (multipart sent from the plugin UI iframe with ``FormData``, same as ``frontend/figma.html``); server merges ``{names:{id:…}}`` into full semantic JSON; main thread clones beside the original, reparents to match JSON hierarchy, then renames from that JSON.
  * - HTML/CSS export from serialized JSON + assets (local).
  */
@@ -1921,10 +1921,11 @@ async function callBannerRawTargetPipeline(backendUrl, bannerPngBase64, rawJson,
   return data;
 }
 
-async function callLayoutTransformer(backendUrl, rawJson, targetResolution) {
+async function callLayoutTransformer(backendUrl, rawJson, targetResolution, endpointPath) {
   const url = String(backendUrl || "").trim().replace(/\/+$/, "");
   if (!url) throw new Error("Backend URL is empty.");
-  const response = await fetch(url + "/api/layout-transformer", {
+  const endpoint = endpointPath || "/api/layout-transformer";
+  const response = await fetch(url + endpoint, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -2035,6 +2036,43 @@ function applyJsonTextStyle(node, item) {
   return applied;
 }
 
+async function applyFinalJsonTextStyle(node, item, parentJsonNode) {
+  if (!node || !item || !("characters" in node)) return 0;
+  const role = semanticRoleName(item);
+  const fontName = await loadJsonFontName(item.fontName);
+  await figma.loadFontAsync(fontName);
+  node.fontName = fontName;
+  node.characters = String(item.characters || "");
+  if ("textAutoResize" in node) node.textAutoResize = "NONE";
+
+  const b = item.bounds && typeof item.bounds === "object" ? item.bounds : null;
+  const pb = parentJsonNode && parentJsonNode.bounds && typeof parentJsonNode.bounds === "object" ? parentJsonNode.bounds : null;
+  if (b && typeof b.width === "number" && typeof b.height === "number") {
+    resizeNodeIfPossible(node, b.width, b.height);
+  }
+  if (b) {
+    if (typeof b.x === "number") node.x = b.x - (pb && typeof pb.x === "number" ? pb.x : 0);
+    if (typeof b.y === "number") node.y = b.y - (pb && typeof pb.y === "number" ? pb.y : 0);
+  }
+
+  if (typeof item.fontSize === "number" && Number.isFinite(item.fontSize)) {
+    node.fontSize = Math.max(1, item.fontSize);
+  }
+  if (item.textAlignHorizontal) node.textAlignHorizontal = item.textAlignHorizontal;
+  if (item.textAlignVertical) node.textAlignVertical = item.textAlignVertical;
+  applyJsonPropertyIfPresent(node, item, "lineHeight");
+  applyJsonPropertyIfPresent(node, item, "letterSpacing");
+  applyJsonPropertyIfPresent(node, item, "fills");
+  applyJsonPropertyIfPresent(node, item, "opacity");
+  applyJsonPropertyIfPresent(node, item, "textCase");
+  applyJsonPropertyIfPresent(node, item, "textDecoration");
+  applyJsonPropertyIfPresent(node, item, "paragraphSpacing");
+  applyJsonPropertyIfPresent(node, item, "paragraphIndent");
+
+  console.log("[TEXT_STYLE_APPLIED]", role, node.fontSize, node.fontName, node.textAlignHorizontal);
+  return 1;
+}
+
 function shouldDisableClippingForJsonItem(item) {
   const name = String(item && item.name ? item.name : "").trim();
   return name === "brand_group" || name === "headline_group" || name === "offer_group";
@@ -2123,10 +2161,7 @@ async function createNodeFromJsonItem(item, parent, parentBounds, isRoot) {
   applyJsonClippingBehavior(node, item);
   applyBoundsFromAbsoluteJson(node, item, isRoot ? null : { bounds: parentBounds });
   if (figmaType === "TEXT") {
-    if (typeof item.fontSize === "number" && Number.isFinite(item.fontSize)) node.fontSize = Math.max(1, item.fontSize);
-    if (item.textAlignHorizontal) node.textAlignHorizontal = item.textAlignHorizontal;
-    if (item.textAlignVertical) node.textAlignVertical = item.textAlignVertical;
-    if (applyJsonTextStyle(node, item) === 0 && !item.fills) {
+    if ((await applyFinalJsonTextStyle(node, item, { bounds: parentBounds })) === 0 && !item.fills) {
       node.fills = [{ type: "SOLID", color: { r: 0.05, g: 0.06, b: 0.08 } }];
     }
   } else {
@@ -2370,7 +2405,6 @@ async function cloneSourceTextIntoJsonParent(item, parentJsonNode, convertedFram
       : parentNode.children.length;
 
   const node = sourceText.clone();
-  await loadUniformTextFont(node, role);
   try {
     node.setPluginData("originalNodeId", String(item.id || ""));
     node.setPluginData("semanticName", role);
@@ -2392,32 +2426,7 @@ async function cloneSourceTextIntoJsonParent(item, parentJsonNode, convertedFram
     }
   }
 
-  if ("textAutoResize" in node) node.textAutoResize = "NONE";
-  node.characters = String(item.characters || "");
-  const b = item.bounds && typeof item.bounds === "object" ? item.bounds : null;
-  const pb = parentJsonNode && parentJsonNode.bounds && typeof parentJsonNode.bounds === "object" ? parentJsonNode.bounds : null;
-  if (b && typeof b.width === "number" && typeof b.height === "number") {
-    resizeNodeIfPossible(node, b.width, b.height);
-    node.x = typeof b.x === "number" ? b.x - (pb && typeof pb.x === "number" ? pb.x : 0) : node.x;
-    node.y = typeof b.y === "number" ? b.y - (pb && typeof pb.y === "number" ? pb.y : 0) : node.y;
-  }
-  if (typeof item.fontSize === "number" && Number.isFinite(item.fontSize)) {
-    node.fontSize = Math.max(1, item.fontSize);
-  }
-  if (item.textAlignHorizontal) node.textAlignHorizontal = item.textAlignHorizontal;
-  if (item.textAlignVertical) node.textAlignVertical = item.textAlignVertical;
-
-  console.log("[TEXT_APPLIED]", role, {
-    fontSize: node.fontSize,
-    fontName: node.fontName,
-    textAutoResize: node.textAutoResize,
-    alignH: node.textAlignHorizontal,
-    alignV: node.textAlignVertical,
-    width: node.width,
-    height: node.height,
-    x: node.x,
-    y: node.y,
-  });
+  await applyFinalJsonTextStyle(node, item, parentJsonNode);
   return node;
 }
 
@@ -2485,25 +2494,7 @@ async function applyFinalJsonContentToClone(finalJson, convertedFrame, sourceFra
 
     if (isJsonTextNode) {
       try {
-        const fontName = await loadJsonFontName(item.fontName);
-        node.fontName = fontName;
-        node.characters = String(item.characters || "");
-        if ("textAutoResize" in node) node.textAutoResize = "NONE";
-        const b = item.bounds && typeof item.bounds === "object" ? item.bounds : null;
-        if (b && typeof b.width === "number" && typeof b.height === "number") {
-          resizeNodeIfPossible(node, b.width, b.height);
-        }
-        if (typeof item.fontSize === "number" && Number.isFinite(item.fontSize)) {
-          node.fontSize = Math.max(1, item.fontSize);
-        }
-        if (item.textAlignHorizontal) {
-          node.textAlignHorizontal = item.textAlignHorizontal;
-        }
-        if (item.textAlignVertical) {
-          node.textAlignVertical = item.textAlignVertical;
-        }
-        applied += applyJsonTextStyle(node, item);
-        applied++;
+        applied += await applyFinalJsonTextStyle(node, item, parentJsonNode);
       } catch (e) {
         console.warn("applyFinalJsonContentToClone: text content apply failed", node && node.name, e);
       }
@@ -3421,12 +3412,15 @@ figma.ui.onmessage = async (msg) => {
     return;
   }
 
-  if (msg.type === "layout-transformer-convert-selected-frame") {
+  if (msg.type === "layout-transformer-convert-selected-frame" || msg.type === "layout-transformer-v2-convert-selected-frame") {
+    const isTransformerV2 = msg.type === "layout-transformer-v2-convert-selected-frame";
+    const transformerLabel = isTransformerV2 ? "Layout Transformer V2" : "Layout Transformer";
+    const transformerEndpoint = isTransformerV2 ? "/api/layout-transformer-v2" : "/api/layout-transformer";
     const selection = figma.currentPage.selection;
     const frames = collectFrameNodesFromSelection(selection);
     if (frames.length === 0) {
       figma.ui.postMessage({ type: "pipeline-busy", busy: false });
-      postError("Select one or more clean semantic frames (only FRAME nodes run layout transformer).");
+      postError(`Select one or more clean semantic frames (only FRAME nodes run ${transformerLabel}).`);
       sendSelectionInfo();
       return;
     }
@@ -3449,21 +3443,21 @@ figma.ui.onmessage = async (msg) => {
         try {
           figma.currentPage.selection = [selectedFrame];
           const targetResolution = parseTargetSize(msg.targetSize, selectedFrame);
-          postStatus(`Layout Transformer (${li + 1}/${frames.length}): stamping… ${selectedFrame.name}`);
+          postStatus(`${transformerLabel} (${li + 1}/${frames.length}): stamping… ${selectedFrame.name}`);
           stampOriginalNodeIds(selectedFrame);
 
-          postStatus("Layout Transformer: serializing selected semantic JSON…");
+          postStatus(`${transformerLabel}: serializing selected semantic JSON…`);
           const origin = getOrigin(selectedFrame);
           const rawJson = serializeNode(selectedFrame, origin, "");
-          rawJson.templateId = "figma_plugin_layout_transformer";
+          rawJson.templateId = isTransformerV2 ? "figma_plugin_layout_transformer_v2" : "figma_plugin_layout_transformer";
 
           postStatus(
-            `Layout Transformer (${li + 1}/${frames.length}): calling backend ${targetResolution.width}×${targetResolution.height}…`,
+            `${transformerLabel} (${li + 1}/${frames.length}): calling backend ${targetResolution.width}×${targetResolution.height}…`,
           );
-          const result = await callLayoutTransformer(backendUrl, rawJson, targetResolution);
+          const result = await callLayoutTransformer(backendUrl, rawJson, targetResolution, transformerEndpoint);
           const finalJson = result.final_json;
 
-          postStatus("Layout Transformer: cloning predicted frame beside selection…");
+          postStatus(`${transformerLabel}: cloning predicted frame beside selection…`);
           const layoutClone = cloneFrameBesideSource(selectedFrame);
           applyJsonTreeNamesByPath(finalJson, layoutClone);
           const recon = applyFinalJsonCloneReconstruction(finalJson, layoutClone);
@@ -3480,7 +3474,7 @@ figma.ui.onmessage = async (msg) => {
 
           if (frames.length === 1) {
             figma.notify(
-              `Layout Transformer clone ready.\n` +
+              `${transformerLabel} clone ready.\n` +
                 `Sync: ${recon.hierarchyReport.reparentMoves} · Prune: ${recon.pruneReport.removed} · Stray: ${recon.strayReport.removed}\n` +
                 `Reorder: ${recon.reorderAfterPrune.moves}+${recon.reorderAfterStray.moves} · Stamp: ${recon.stampReport.stamped}` +
                 (recon.stampReport.mismatchWarn ? ` (${recon.stampReport.mismatchWarn} mismatches)` : "") +
@@ -3489,16 +3483,16 @@ figma.ui.onmessage = async (msg) => {
               { timeout: 6 },
             );
           } else {
-            figma.notify(`Layout Transformer ${li + 1}/${frames.length}: done for "${selectedFrame.name}".`, {
+            figma.notify(`${transformerLabel} ${li + 1}/${frames.length}: done for "${selectedFrame.name}".`, {
               timeout: 4,
             });
           }
           ok++;
         } catch (err) {
           fail++;
-          console.error("Layout transformer convert failed:", err);
+          console.error(`${transformerLabel} convert failed:`, err);
           const shortMsg = String(err && err.message ? err.message : err);
-          postStatus(`Layout Transformer (${li + 1}/${frames.length}) skipped: ${selectedFrame.name} — ${shortMsg}`);
+          postStatus(`${transformerLabel} (${li + 1}/${frames.length}) skipped: ${selectedFrame.name} — ${shortMsg}`);
           if (err && err.message === "Failed to fetch") {
             postStatus(
               "Figma only allows requests to origins listed in manifest.json networkAccess.devAllowedDomains. Match Backend URL, then reload the plugin.",
@@ -3511,15 +3505,15 @@ figma.ui.onmessage = async (msg) => {
       sendSelectionInfo();
       figma.ui.postMessage({ type: "done" });
       if (frames.length > 1) {
-        figma.notify(`Layout Transformer batch: ${ok} ok, ${fail} failed.`, { timeout: 5 });
+        figma.notify(`${transformerLabel} batch: ${ok} ok, ${fail} failed.`, { timeout: 5 });
       }
       if (fail > 0 && ok === 0) {
-        postError("Every frame in the layout transformer batch failed. See status above.");
+        postError(`Every frame in the ${transformerLabel} batch failed. See status above.`);
       } else if (fail > 0) {
-        postError(`Layout Transformer finished with ${fail} failure(s); ${ok} succeeded.`);
+        postError(`${transformerLabel} finished with ${fail} failure(s); ${ok} succeeded.`);
       }
     } catch (err) {
-      console.error("Layout transformer batch failed:", err);
+      console.error(`${transformerLabel} batch failed:`, err);
       let errMsg =
         err && err.stack ? err.message + "\n\n" + err.stack : String(err && err.message ? err.message : err);
       if (err && err.message === "Failed to fetch") {
