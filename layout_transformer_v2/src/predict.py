@@ -19,8 +19,10 @@ from .rich_utils import (
     bounds_of,
     clamp_canvas_bbox,
     clamp_relative_bbox,
+    clamp_text_bounds_to_canvas,
     clone_frame,
     denormalize_bbox,
+    fit_all_text_fonts,
     flatten_role_nodes,
     get_canvas_size,
     is_text_node,
@@ -198,6 +200,8 @@ def predict_with_loaded_models(
         "text_style_from_prototype": False,
         "floating_from_prototype": False,
         "child_relative_from_prototype": False,
+        "text_font_fitted": 0,
+        "text_bounds_clamped": 0,
     }
 
     for role in PARENT_ROLES:
@@ -224,9 +228,17 @@ def predict_with_loaded_models(
             continue
         pred = predict_one(child_model, child_meta, role, source_nodes[role], source_nodes, source_w, source_h, target_w, target_h, device)
         parent_role = CHILD_PARENT.get(role)
-        parent_bounds = predicted_bounds.get(parent_role)
-        if parent_bounds is None and parent_role in out_nodes:
-            parent_bounds = bounds_of(out_nodes[parent_role])
+        parent_bounds = _resolve_child_parent_bounds(
+            parent_role,
+            predicted_bounds=predicted_bounds,
+            out_nodes=out_nodes,
+            source_nodes=source_nodes,
+            prototype=prototype,
+            source_w=source_w,
+            source_h=source_h,
+            target_w=target_w,
+            target_h=target_h,
+        )
         if parent_bounds and parent_bounds["width"] > 0 and parent_bounds["height"] > 0:
             proto_rel = _prototype_relative_bbox(prototype, role)
             if proto_rel is not None and role in {"headline", "subheadline_delivery_time"}:
@@ -256,8 +268,15 @@ def predict_with_loaded_models(
         out_nodes[role]["visible"] = bool(torch.sigmoid(pred["visibility"]).item() >= 0.5)
 
     if prototype is not None:
-        corrections["text_style_from_prototype"] = apply_prototype_text_styles(output, prototype)
+        corrections["text_style_from_prototype"] = apply_prototype_text_styles(
+            output,
+            prototype,
+            target_w=target_w,
+            target_h=target_h,
+        )
     apply_deterministic_rules(output, target_w, target_h)
+    corrections["text_bounds_clamped"] = clamp_text_bounds_to_canvas(output, target_w, target_h)
+    corrections["text_font_fitted"] = fit_all_text_fonts(output)
     report = {
         "predicted_roles": predicted_roles,
         "prototype_id": prototype.get("prototype_id") if prototype else None,
@@ -300,9 +319,57 @@ def blend_bbox(prototype_bbox: list[float], model_bbox: list[float], *, prototyp
     ]
 
 
-def apply_prototype_text_styles(output: dict[str, Any], prototype: dict[str, Any]) -> bool:
+def _resolve_child_parent_bounds(
+    parent_role: str | None,
+    *,
+    predicted_bounds: dict[str, dict[str, float]],
+    out_nodes: dict[str, dict[str, Any]],
+    source_nodes: dict[str, dict[str, Any]],
+    prototype: dict[str, Any] | None,
+    source_w: float,
+    source_h: float,
+    target_w: float,
+    target_h: float,
+) -> dict[str, float] | None:
+    if not parent_role:
+        return None
+
+    parent_bounds = predicted_bounds.get(parent_role)
+    if parent_bounds and parent_bounds.get("width", 0) > 0 and parent_bounds.get("height", 0) > 0:
+        return parent_bounds
+
+    if parent_role in out_nodes:
+        parent_bounds = bounds_of(out_nodes[parent_role])
+        if parent_bounds["width"] > 0 and parent_bounds["height"] > 0:
+            return parent_bounds
+
+    proto_bbox = _prototype_bbox(prototype, parent_role)
+    if proto_bbox is not None:
+        return denormalize_bbox(proto_bbox, target_w, target_h)
+
+    # Orphan headline/subheadline when source has no headline_group: scale source text box to target canvas.
+    if parent_role == "headline_group" and "headline" in source_nodes:
+        return denormalize_bbox(normalized_bbox(source_nodes["headline"], source_w, source_h), target_w, target_h)
+
+    return None
+
+
+def apply_prototype_text_styles(
+    output: dict[str, Any],
+    prototype: dict[str, Any],
+    *,
+    target_w: float,
+    target_h: float,
+) -> bool:
     nodes = flatten_role_nodes(output)
     styles = prototype.get("text_styles") or {}
+    proto_w = safe_float(prototype.get("width"), 0.0)
+    proto_h = safe_float(prototype.get("height"), 0.0)
+    font_scale = (
+        math.sqrt((target_w * target_h) / max(proto_w * proto_h, 1.0))
+        if proto_w > 0 and proto_h > 0
+        else 1.0
+    )
     applied = False
     for role in ("headline", "subheadline_delivery_time", "legal_text", "age_badge"):
         node = nodes.get(role)
@@ -310,9 +377,13 @@ def apply_prototype_text_styles(output: dict[str, Any], prototype: dict[str, Any
         if not node or not isinstance(style, dict):
             continue
         for field in TEXT_STYLE_FIELDS:
-            if field in style:
-                node[field] = json.loads(json.dumps(style[field], ensure_ascii=False))
-                applied = True
+            if field not in style:
+                continue
+            value = json.loads(json.dumps(style[field], ensure_ascii=False))
+            if field == "fontSize" and isinstance(value, (int, float)):
+                value = float(value) * font_scale
+            node[field] = value
+            applied = True
     return applied
 
 

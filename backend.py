@@ -1,6 +1,7 @@
 import base64
 import binascii
 import json
+import math
 import os
 import re
 import uuid
@@ -41,13 +42,14 @@ from json_embedding import (
     parse_aspect_ratio,
     parse_resolution,
     rerank_candidates_by_raw_similarity,
-    resize_figma_json_to_resolution,
     resize_source_json_using_guide,
     search_index,
     select_frame,
 )
 from layout_engine.convert import convert_banner
 from layout_transformer_v2.src.predict import LayoutTransformerV2Service
+from layout_transformer_v2.src.prototypes import load_prototypes, select_prototype
+from layout_transformer_v2.src.rich_utils import load_frames
 from layout_transformer_v2.src.schema import ALL_ROLES as LAYOUT_TRANSFORMER_V2_ROLES
 
 
@@ -74,6 +76,9 @@ FIGMA_SEMANTIC_RUNS_DIR = Path(
 FIGMA_LAYOUT_TRANSFORMER_RUNS_DIR = Path(
     os.getenv("FIGMA_LAYOUT_TRANSFORMER_RUNS_DIR", "runs/layout_transformer"),
 ).resolve()
+FIGMA_BANNER_PIPELINE_RUNS_DIR = Path(
+    os.getenv("FIGMA_BANNER_PIPELINE_RUNS_DIR", "runs/banner_pipeline"),
+).resolve()
 # Max long edge (px) for images sent to Qwen on /figma/convert-semantic-json (0 = disable).
 FIGMA_SEMANTIC_BANNER_MAX_EDGE = int(os.getenv("FIGMA_SEMANTIC_BANNER_MAX_EDGE", "1024"))
 FIGMA_SEMANTIC_GRID_MAX_EDGE = int(os.getenv("FIGMA_SEMANTIC_GRID_MAX_EDGE", "1024"))
@@ -85,6 +90,12 @@ FIGMA_SEMANTIC_PERSIST_RUNS = os.getenv("FIGMA_SEMANTIC_PERSIST_RUNS", "1").stri
     "off",
 )
 FIGMA_LAYOUT_TRANSFORMER_PERSIST_RUNS = os.getenv("FIGMA_LAYOUT_TRANSFORMER_PERSIST_RUNS", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+FIGMA_BANNER_PIPELINE_PERSIST_RUNS = os.getenv("FIGMA_BANNER_PIPELINE_PERSIST_RUNS", "1").strip().lower() not in (
     "0",
     "false",
     "no",
@@ -108,9 +119,23 @@ LAYOUT_TRANSFORMER_CHILD_CHECKPOINT = Path(
 LAYOUT_TRANSFORMER_FLOATING_CHECKPOINT = Path(
     os.getenv("LAYOUT_TRANSFORMER_FLOATING_CHECKPOINT", "layout_transformer_v2/checkpoints/floating.pt"),
 ).resolve()
+LAYOUT_TRANSFORMER_PROTOTYPES_PATH = Path(
+    os.getenv("LAYOUT_TRANSFORMER_PROTOTYPES_PATH", "layout_transformer_v2/data/prototypes/layout_prototypes.json"),
+).resolve()
+LAYOUT_TRANSFORMER_RICH_FAMILIES_DIR = Path(
+    os.getenv("LAYOUT_TRANSFORMER_RICH_FAMILIES_DIR", "layout_transformer/data/clean_families_rich"),
+).resolve()
 LAYOUT_TRANSFORMER_DEVICE = os.getenv("LAYOUT_TRANSFORMER_DEVICE", "").strip() or None
 FRONTEND_DIR = Path(__file__).resolve().parent / "frontend"
 UNSUPPORTED_CLASS_NUMBER = -1
+CLASS_TO_PROTOTYPE_FAMILY = {
+    1: 2,  # Пряники прямо на ёлку
+    2: 3,  # Пряничный ровер
+    3: 1,  # Мегапорция оливье для гостей
+    4: 4,  # Праздничная вишня в шоколаде
+    5: 6,  # Имбирный пряничный латте
+    6: 5,  # Еловый лимонад с малиной
+}
 
 BANNER_VLM_CATEGORY_PROMPT = """You classify one retail / food banner image into exactly ONE of six campaigns.
 
@@ -269,6 +294,8 @@ class BannerRawToTargetJsonResponse(BaseModel):
     top_k: int
     supported: bool = True
     message: str = ""
+    run_id: str | None = None
+    run_dir: str | None = None
     selected_candidate: JsonEmbeddingCandidate | None = None
     candidates: list[JsonEmbeddingCandidate]
     final_json: dict[str, Any] | None = None
@@ -563,6 +590,68 @@ def _write_layout_transformer_run_response(
     return {filename: {"bytes": path.stat().st_size}}
 
 
+def _persist_banner_pipeline_run_input(
+    run_dir: Path,
+    *,
+    run_id: str,
+    endpoint: str,
+    banner_body: bytes,
+    banner_content_type: str | None,
+    raw_json_payload: Any,
+    target_resolution: str,
+    raw_frame_index: int,
+    top_k: int,
+    max_new_tokens: int,
+) -> dict[str, Any]:
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "input_banner.png").write_bytes(banner_body)
+    input_payload = {
+        "raw_json": raw_json_payload,
+        "target_resolution": target_resolution,
+        "raw_frame_index": raw_frame_index,
+        "top_k": top_k,
+        "max_new_tokens": max_new_tokens,
+    }
+    (run_dir / "input.json").write_text(
+        json.dumps(input_payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return {
+        "run_id": run_id,
+        "run_dir": str(run_dir),
+        "endpoint": endpoint,
+        "engine": "banner_classify_layout_transformer_v2_prototype_retrieval",
+        "started_at_utc": datetime.now(timezone.utc).isoformat(),
+        "target_resolution": target_resolution,
+        "raw_frame_index": raw_frame_index,
+        "top_k": top_k,
+        "max_new_tokens": max_new_tokens,
+        "prototypes_path": str(LAYOUT_TRANSFORMER_PROTOTYPES_PATH),
+        "rich_families_dir": str(LAYOUT_TRANSFORMER_RICH_FAMILIES_DIR),
+        "input_files": {
+            "input_banner.png": {"bytes": len(banner_body), "content_type": banner_content_type or ""},
+            "input.json": {"bytes": (run_dir / "input.json").stat().st_size},
+        },
+    }
+
+
+def _write_banner_pipeline_run_meta(run_dir: Path, meta: dict[str, Any]) -> None:
+    payload = dict(meta)
+    payload["finished_at_utc"] = datetime.now(timezone.utc).isoformat()
+    (run_dir / "meta.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _write_banner_pipeline_run_response(
+    run_dir: Path,
+    *,
+    response: BannerRawToTargetJsonResponse | dict[str, Any],
+) -> dict[str, Any]:
+    payload = response.model_dump(mode="json") if isinstance(response, BaseModel) else response
+    path = run_dir / "response.json"
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"response.json": {"bytes": path.stat().st_size}}
+
+
 def _decode_base64_bytes(value: str, field_name: str) -> bytes:
     try:
         return base64.b64decode(value, validate=True)
@@ -663,6 +752,193 @@ def _classify_banner_bytes(body: bytes, content_type: str | None, max_new_tokens
     return category, raw
 
 
+def _prototype_class_number(proto: dict[str, Any]) -> int | None:
+    for value in (proto.get("prototype_id"), proto.get("source_file")):
+        text = str(value or "").strip()
+        match = re.match(r"^(\d+)(?::|[_-])", text)
+        if match:
+            number = int(match.group(1))
+            if number in VALID_CLASSES:
+                return number
+    return None
+
+
+def _load_prototype_guide_frame(proto: dict[str, Any]) -> tuple[dict[str, Any], Path, int]:
+    source_file = str(proto.get("source_file") or "").strip()
+    if not source_file:
+        raise ValueError("selected prototype is missing source_file")
+    source_path = Path(source_file)
+    if not source_path.is_absolute():
+        source_path = LAYOUT_TRANSFORMER_RICH_FAMILIES_DIR / source_path
+    if not source_path.exists():
+        raise FileNotFoundError(f"prototype source JSON not found: {source_path}")
+
+    frame_index = 0
+    proto_id = str(proto.get("prototype_id") or "").strip()
+    match = re.match(r"^\d+:(\d+)$", proto_id)
+    if match:
+        frame_index = int(match.group(1))
+
+    frames = load_frames(source_path)
+    if frame_index < 0 or frame_index >= len(frames):
+        raise ValueError(f"prototype frame index {frame_index} is out of range for {source_path}")
+    return frames[frame_index], source_path, frame_index
+
+
+def _node_count(node: Any) -> int:
+    if not isinstance(node, dict):
+        return 0
+    return 1 + sum(_node_count(child) for child in node.get("children") or [])
+
+
+def _leaf_count(node: Any) -> int:
+    if not isinstance(node, dict):
+        return 0
+    children = [child for child in node.get("children") or [] if isinstance(child, dict)]
+    if not children:
+        return 1
+    return sum(_leaf_count(child) for child in children)
+
+
+def _candidate_from_prototype(
+    proto: dict[str, Any],
+    guide_frame: dict[str, Any],
+    source_path: Path,
+    frame_index: int,
+    class_number: int,
+) -> dict[str, Any]:
+    bounds = guide_frame.get("bounds") if isinstance(guide_frame.get("bounds"), dict) else {}
+    width = bounds.get("width") if isinstance(bounds, dict) else None
+    height = bounds.get("height") if isinstance(bounds, dict) else None
+    aspect_ratio = (
+        float(width) / float(height)
+        if isinstance(width, int | float) and isinstance(height, int | float) and height
+        else proto.get("aspect")
+    )
+    score = float(proto.get("match_score") or 0.0)
+    return {
+        "class_number": class_number,
+        "source_file": str(source_path),
+        "frame_index": frame_index,
+        "id": guide_frame.get("id"),
+        "name": guide_frame.get("name") or proto.get("frame_name"),
+        "type": guide_frame.get("type"),
+        "bounds": bounds if isinstance(bounds, dict) else None,
+        "aspect_ratio": aspect_ratio,
+        "node_count": _node_count(guide_frame),
+        "leaf_count": _leaf_count(guide_frame),
+        "score": score,
+        "embedding_score": score,
+        "aspect_error": abs(float(proto.get("aspect") or 1.0) - float(aspect_ratio or 1.0)),
+        "resolution_error": None,
+        "raw_similarity": None,
+        "selection_score": score,
+        "full_json": guide_frame,
+    }
+
+
+def _select_layout_transformer_prototype_candidate(
+    *,
+    class_number: int,
+    uploaded_frame: dict[str, Any],
+    target_width: float,
+    target_height: float,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    prototypes = load_prototypes(LAYOUT_TRANSFORMER_PROTOTYPES_PATH)
+    prototype_family = CLASS_TO_PROTOTYPE_FAMILY.get(class_number, class_number)
+    class_prototypes = [
+        proto for proto in prototypes
+        if _prototype_class_number(proto) == prototype_family
+    ]
+    if not class_prototypes:
+        raise FileNotFoundError(
+            f"No layout transformer prototypes found for class {class_number} "
+            f"(prototype family {prototype_family}) in {LAYOUT_TRANSFORMER_PROTOTYPES_PATH}"
+        )
+
+    selected_proto = _select_banner_pipeline_prototype(
+        class_prototypes,
+        source_json=uploaded_frame,
+        target_width=target_width,
+        target_height=target_height,
+    )
+    if selected_proto is None:
+        raise FileNotFoundError(f"No matching prototype found for class {class_number}")
+
+    guide_frame, source_path, frame_index = _load_prototype_guide_frame(selected_proto)
+    candidate = _candidate_from_prototype(
+        selected_proto,
+        guide_frame,
+        source_path,
+        frame_index,
+        class_number,
+    )
+    return selected_proto, candidate
+
+
+def _select_banner_pipeline_prototype(
+    prototypes: list[dict[str, Any]],
+    *,
+    source_json: dict[str, Any],
+    target_width: float,
+    target_height: float,
+) -> dict[str, Any] | None:
+    if not prototypes:
+        return None
+
+    structural = select_prototype(
+        prototypes,
+        source_json=source_json,
+        target_width=target_width,
+        target_height=target_height,
+    )
+    structural_id = structural.get("prototype_id") if structural else None
+    target_aspect = target_width / max(target_height, 1.0)
+
+    def score(proto: dict[str, Any]) -> float:
+        width = float(proto.get("width") or 0.0)
+        height = float(proto.get("height") or 0.0)
+        aspect = float(proto.get("aspect") or (width / height if height else 1.0))
+        aspect_error = abs(math.log(max(aspect, 1e-6) / max(target_aspect, 1e-6)))
+        if width > 0 and height > 0:
+            resolution_error = math.sqrt(
+                math.log(width / target_width) ** 2 + math.log(height / target_height) ** 2
+            )
+        else:
+            resolution_error = 10.0
+        exact = abs(width - target_width) <= 0.5 and abs(height - target_height) <= 0.5
+        orientation_match = (height > width * 1.05) == (target_height > target_width * 1.05)
+        structural_bonus = 1.0 if structural_id and proto.get("prototype_id") == structural_id else 0.0
+        return (
+            (10000.0 if exact else 0.0)
+            + (250.0 if orientation_match else 0.0)
+            - 500.0 * aspect_error
+            - 25.0 * resolution_error
+            + structural_bonus
+        )
+
+    best = max(prototypes, key=score)
+    selected = dict(best)
+    selected["match_score"] = float(score(best))
+    selected["structural_prototype_id"] = structural_id
+    return selected
+
+
+def _banner_pipeline_layout_transformer_fallback(
+    uploaded_frame: dict[str, Any],
+    target_width: float,
+    target_height: float,
+) -> dict[str, Any] | None:
+    """When VLM returns -1, still produce a target layout via the loaded V2 models."""
+    if layout_transformer_service is None:
+        return None
+    try:
+        return layout_transformer_service.predict(uploaded_frame, target_width, target_height)
+    except Exception as exc:
+        print(f"[banner_pipeline] layout_transformer_v2 fallback failed: {exc}")
+        return None
+
+
 def _run_banner_raw_to_target_pipeline(
     *,
     banner_body: bytes,
@@ -672,16 +948,44 @@ def _run_banner_raw_to_target_pipeline(
     raw_frame_index: int,
     top_k: int,
     max_new_tokens: int,
+    run_id: str | None = None,
+    run_dir: Path | None = None,
 ) -> BannerRawToTargetJsonResponse:
     category, raw_model_text = _classify_banner_bytes(
         banner_body, banner_content_type, max_new_tokens=max_new_tokens
     )
+    try:
+        uploaded_frame = select_frame(uploaded_raw, raw_frame_index)
+        target_width, target_height = parse_resolution(target_resolution)
+        parsed_aspect = target_width / target_height
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     if category == UNSUPPORTED_CLASS_NUMBER:
-        try:
-            target_width, target_height = parse_resolution(target_resolution)
-            parsed_aspect = target_width / target_height
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        fallback_json = _banner_pipeline_layout_transformer_fallback(
+            uploaded_frame,
+            target_width,
+            target_height,
+        )
+        if fallback_json is not None:
+            return BannerRawToTargetJsonResponse(
+                category=category,
+                raw_model_text=raw_model_text[:2000],
+                target_width=target_width,
+                target_height=target_height,
+                aspect_ratio=parsed_aspect,
+                top_k=top_k,
+                supported=True,
+                message=(
+                    "VLM class -1 (not in 6 campaigns); used layout_transformer_v2 "
+                    "direct prediction fallback."
+                ),
+                run_id=run_id,
+                run_dir=str(run_dir) if run_dir is not None else None,
+                selected_candidate=None,
+                candidates=[],
+                final_json=fallback_json,
+            )
         return BannerRawToTargetJsonResponse(
             category=category,
             raw_model_text=raw_model_text[:2000],
@@ -691,25 +995,23 @@ def _run_banner_raw_to_target_pipeline(
             top_k=top_k,
             supported=False,
             message="This banner is not supported by the current 6-class retrieval pipeline.",
+            run_id=run_id,
+            run_dir=str(run_dir) if run_dir is not None else None,
             selected_candidate=None,
             candidates=[],
             final_json=None,
         )
 
     try:
-        uploaded_frame = select_frame(uploaded_raw, raw_frame_index)
-        target_width, target_height = parse_resolution(target_resolution)
-        parsed_aspect = target_width / target_height
-        retrieved = attach_full_json(search_index(category, target_resolution, top_k=top_k))
+        selected_proto, selected = _select_layout_transformer_prototype_candidate(
+            class_number=category,
+            uploaded_frame=uploaded_frame,
+            target_width=target_width,
+            target_height=target_height,
+        )
     except (ValueError, FileNotFoundError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    if not retrieved:
-        raise HTTPException(status_code=404, detail="No retrievable candidates found.")
-
-    reranked = rerank_candidates_by_raw_similarity(uploaded_frame, retrieved)
-    selected_pool = reranked or retrieved
-    selected = selected_pool[0]
     selected_json = selected.get("full_json")
     if not isinstance(selected_json, dict):
         raise HTTPException(status_code=500, detail="Selected candidate does not include full_json.")
@@ -729,9 +1031,11 @@ def _run_banner_raw_to_target_pipeline(
         aspect_ratio=parsed_aspect,
         top_k=top_k,
         supported=True,
-        message="",
+        message=f"Selected layout_transformer_v2 prototype {selected_proto.get('prototype_id')}",
+        run_id=run_id,
+        run_dir=str(run_dir) if run_dir is not None else None,
         selected_candidate=JsonEmbeddingCandidate(**selected),
-        candidates=[JsonEmbeddingCandidate(**row) for row in selected_pool],
+        candidates=[JsonEmbeddingCandidate(**selected)],
         final_json=final_json,
     )
 
@@ -933,15 +1237,67 @@ async def banner_raw_to_target_json(
         uploaded_raw = json.loads(raw_bytes.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return _run_banner_raw_to_target_pipeline(
-        banner_body=banner_body,
-        banner_content_type=file.content_type,
-        uploaded_raw=uploaded_raw,
-        target_resolution=target_resolution,
-        raw_frame_index=raw_frame_index,
-        top_k=top_k,
-        max_new_tokens=max_new_tokens,
+
+    run_id = _new_figma_semantic_run_id()
+    run_dir = FIGMA_BANNER_PIPELINE_RUNS_DIR / run_id
+    meta_base: dict[str, Any] | None = None
+    if FIGMA_BANNER_PIPELINE_PERSIST_RUNS:
+        try:
+            meta_base = _persist_banner_pipeline_run_input(
+                run_dir,
+                run_id=run_id,
+                endpoint="/pipeline/banner-raw-to-target-json",
+                banner_body=banner_body,
+                banner_content_type=file.content_type,
+                raw_json_payload=uploaded_raw,
+                target_resolution=target_resolution,
+                raw_frame_index=raw_frame_index,
+                top_k=top_k,
+                max_new_tokens=max_new_tokens,
+            )
+        except OSError as exc:
+            print(f"[banner_pipeline] failed to persist input run_id={run_id}: {exc}")
+            meta_base = None
+
+    try:
+        response = _run_banner_raw_to_target_pipeline(
+            banner_body=banner_body,
+            banner_content_type=file.content_type,
+            uploaded_raw=uploaded_raw,
+            target_resolution=target_resolution,
+            raw_frame_index=raw_frame_index,
+            top_k=top_k,
+            max_new_tokens=max_new_tokens,
+            run_id=run_id if meta_base else None,
+            run_dir=run_dir if meta_base else None,
+        )
+    except HTTPException as exc:
+        if meta_base:
+            _write_banner_pipeline_run_response(run_dir, response={"error": exc.detail, "status_code": exc.status_code})
+            _write_banner_pipeline_run_meta(run_dir, {**meta_base, "status": "error", "error": exc.detail})
+        print(f"[banner_pipeline] error run_id={run_id}: {exc.detail}")
+        raise
+
+    if meta_base:
+        output_files = _write_banner_pipeline_run_response(run_dir, response=response)
+        selected = response.selected_candidate
+        _write_banner_pipeline_run_meta(
+            run_dir,
+            {
+                **meta_base,
+                "status": "ok",
+                "category": response.category,
+                "raw_model_text": response.raw_model_text,
+                "message": response.message,
+                "selected_candidate": selected.model_dump(mode="json") if selected else None,
+                "output_files": output_files,
+            },
+        )
+    print(
+        f"[banner_pipeline] ok run_id={run_id} category={response.category} "
+        f"selected={response.selected_candidate.name if response.selected_candidate else None}"
     )
+    return response
 
 
 @app.post("/pipeline/banner-raw-to-target-json-json", response_model=BannerRawToTargetJsonResponse)
@@ -955,15 +1311,66 @@ def banner_raw_to_target_json_json(request: BannerRawToTargetJsonJsonRequest) ->
             )
         target_resolution = f"{request.target_width}x{request.target_height}"
     banner_body = _decode_base64_bytes(request.banner_png_base64, "banner_png_base64")
-    return _run_banner_raw_to_target_pipeline(
-        banner_body=banner_body,
-        banner_content_type="image/png",
-        uploaded_raw=request.raw_json,
-        target_resolution=target_resolution,
-        raw_frame_index=request.raw_frame_index,
-        top_k=request.top_k,
-        max_new_tokens=request.max_new_tokens,
+    run_id = _new_figma_semantic_run_id()
+    run_dir = FIGMA_BANNER_PIPELINE_RUNS_DIR / run_id
+    meta_base: dict[str, Any] | None = None
+    if FIGMA_BANNER_PIPELINE_PERSIST_RUNS:
+        try:
+            meta_base = _persist_banner_pipeline_run_input(
+                run_dir,
+                run_id=run_id,
+                endpoint="/pipeline/banner-raw-to-target-json-json",
+                banner_body=banner_body,
+                banner_content_type="image/png",
+                raw_json_payload=request.raw_json,
+                target_resolution=target_resolution,
+                raw_frame_index=request.raw_frame_index,
+                top_k=request.top_k,
+                max_new_tokens=request.max_new_tokens,
+            )
+        except OSError as exc:
+            print(f"[banner_pipeline] failed to persist input run_id={run_id}: {exc}")
+            meta_base = None
+
+    try:
+        response = _run_banner_raw_to_target_pipeline(
+            banner_body=banner_body,
+            banner_content_type="image/png",
+            uploaded_raw=request.raw_json,
+            target_resolution=target_resolution,
+            raw_frame_index=request.raw_frame_index,
+            top_k=request.top_k,
+            max_new_tokens=request.max_new_tokens,
+            run_id=run_id if meta_base else None,
+            run_dir=run_dir if meta_base else None,
+        )
+    except HTTPException as exc:
+        if meta_base:
+            _write_banner_pipeline_run_response(run_dir, response={"error": exc.detail, "status_code": exc.status_code})
+            _write_banner_pipeline_run_meta(run_dir, {**meta_base, "status": "error", "error": exc.detail})
+        print(f"[banner_pipeline] error run_id={run_id}: {exc.detail}")
+        raise
+
+    if meta_base:
+        output_files = _write_banner_pipeline_run_response(run_dir, response=response)
+        selected = response.selected_candidate
+        _write_banner_pipeline_run_meta(
+            run_dir,
+            {
+                **meta_base,
+                "status": "ok",
+                "category": response.category,
+                "raw_model_text": response.raw_model_text,
+                "message": response.message,
+                "selected_candidate": selected.model_dump(mode="json") if selected else None,
+                "output_files": output_files,
+            },
+        )
+    print(
+        f"[banner_pipeline] ok run_id={run_id} category={response.category} "
+        f"selected={response.selected_candidate.name if response.selected_candidate else None}"
     )
+    return response
 
 
 @app.post("/layout-engine/convert", response_model=LayoutEngineConvertResponse)

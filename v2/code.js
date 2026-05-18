@@ -711,12 +711,17 @@ function stampOriginalNodeIds(root) {
 function collectClonedNodesByOriginalId(root) {
   const map = new Map();
   let mapped = 0;
+  let duplicates = 0;
 
   function walk(node) {
     try {
       const originalId = node.getPluginData("originalNodeId");
       if (originalId) {
-        map.set(originalId, node);
+        if (map.has(originalId)) {
+          duplicates++;
+        } else {
+          map.set(originalId, node);
+        }
         mapped++;
       }
     } catch (e) {
@@ -731,7 +736,10 @@ function collectClonedNodesByOriginalId(root) {
   }
 
   walk(root);
-  return { map, mapped };
+  if (duplicates > 0) {
+    console.warn("[original-id-duplicates]", duplicates);
+  }
+  return { map, mapped, duplicates };
 }
 
 function asArray(value) {
@@ -789,7 +797,753 @@ function semanticRoleName(item) {
 }
 
 function shouldCloneSourceTextForRole(item) {
-  return SOURCE_STYLE_TEXT_ROLES.has(semanticRoleName(item));
+  return false;
+}
+
+function hasImageFill(node) {
+  const fills = node && Array.isArray(node.fills) ? node.fills : [];
+  return fills.some((fill) => fill && fill.type === "IMAGE");
+}
+
+function collectSourceContentMap(sourceFrame) {
+  const textByRole = new Map();
+  const textById = new Map();
+  const textByPath = new Map();
+  const imageFillsByRole = new Map();
+  const imageFillsById = new Map();
+  const imageFillsByPath = new Map();
+  const visualNodeByRole = new Map();
+  const visualNodeById = new Map();
+  const visualNodeByPath = new Map();
+
+  function setIfPresent(map, key, value) {
+    const normalizedKey = String(key || "").trim();
+    if (normalizedKey) map.set(normalizedKey, value);
+  }
+
+  function pluginData(node, key) {
+    try {
+      return typeof node.getPluginData === "function" ? node.getPluginData(key) : "";
+    } catch (_e) {
+      return "";
+    }
+  }
+
+  function walk(node, path) {
+    if (!node) return;
+    const role =
+      String(node.name || "").trim() ||
+      pluginData(node, "semanticName") ||
+      pluginData(node, "semanticRole");
+    if ("characters" in node) {
+      const characters = node.characters;
+      setIfPresent(textByRole, role, characters);
+      setIfPresent(textById, node.id, characters);
+      setIfPresent(textById, pluginData(node, "originalNodeId"), characters);
+      setIfPresent(textByPath, path, characters);
+    }
+    if (hasImageFill(node)) {
+      const imageFills = jsonSafeValue(node.fills);
+      setIfPresent(imageFillsByRole, role, imageFills);
+      setIfPresent(imageFillsById, node.id, imageFills);
+      setIfPresent(imageFillsById, pluginData(node, "originalNodeId"), imageFills);
+      setIfPresent(imageFillsByPath, path, imageFills);
+    }
+    const hasChildren = "children" in node && Array.isArray(node.children) && node.children.length > 0;
+    const isVisualContentNode = !("characters" in node) && ("fills" in node || hasChildren);
+    const type = String(node.type || "").toUpperCase();
+    const cloneableVisual =
+      isVisualContentNode &&
+      node !== sourceFrame &&
+      (
+        type === "VECTOR" ||
+        type === "STAR" ||
+        type === "BOOLEAN_OPERATION" ||
+        type === "RECTANGLE" ||
+        hasImageFill(node) ||
+        role === "logo"
+      );
+    if (cloneableVisual) {
+      setIfPresent(visualNodeByRole, role, node);
+      setIfPresent(visualNodeById, node.id, node);
+      setIfPresent(visualNodeById, pluginData(node, "originalNodeId"), node);
+      setIfPresent(visualNodeByPath, path, node);
+    }
+    if ("children" in node && Array.isArray(node.children)) {
+      node.children.forEach((child, index) => {
+        walk(child, path ? `${path}/${index}` : String(index));
+      });
+    }
+  }
+
+  walk(sourceFrame, "");
+  return {
+    textByRole,
+    textById,
+    textByPath,
+    imageFillsByRole,
+    imageFillsById,
+    imageFillsByPath,
+    visualNodeByRole,
+    visualNodeById,
+    visualNodeByPath,
+  };
+}
+
+function collectSourceTextContentMap(sourceFrame) {
+  const sourceContentMap = collectSourceContentMap(sourceFrame);
+  return {
+    byRole: sourceContentMap.textByRole,
+    byId: sourceContentMap.textById,
+    byPath: sourceContentMap.textByPath,
+  };
+}
+
+const LOGO_PART_ROLES = new Set(["logo_back", "logo_fore"]);
+
+/**
+ * Index ids and semantic roles present on the selected source frame (authoritative allow-list).
+ */
+function collectSourceElementIndex(sourceFrame) {
+  const ids = new Set();
+  const roles = new Set();
+
+  function pluginData(node, key) {
+    try {
+      return typeof node.getPluginData === "function" ? node.getPluginData(key) : "";
+    } catch (_e) {
+      return "";
+    }
+  }
+
+  function walk(node) {
+    if (!node) return;
+    const id = String(node.id || "").trim();
+    if (id) ids.add(id);
+    const storedId = String(pluginData(node, "originalNodeId") || "").trim();
+    if (storedId) ids.add(storedId);
+    const role =
+      String(node.name || "").trim() ||
+      String(pluginData(node, "semanticName") || "").trim() ||
+      String(pluginData(node, "semanticRole") || "").trim();
+    if (role) roles.add(role);
+    if ("children" in node && Array.isArray(node.children)) {
+      for (const child of node.children) walk(child);
+    }
+  }
+
+  walk(sourceFrame);
+  return { ids, roles };
+}
+
+function jsonItemAllowedInSource(item, sourceIndex) {
+  if (!item || !sourceIndex) return false;
+  const id = String(item.id || "").trim();
+  if (id && sourceIndex.ids.has(id)) return true;
+  const role = semanticRoleName(item);
+  if (!role) return false;
+  if (sourceIndex.roles.has(role)) return true;
+  if (LOGO_PART_ROLES.has(role) && sourceIndex.roles.has("logo")) return true;
+  return false;
+}
+
+function isSyntheticGroupRole(role) {
+  return /_group$/.test(String(role || ""));
+}
+
+function reindexFinalJsonPaths(item, path) {
+  if (!item || typeof item !== "object") return;
+  item.path = path;
+  const children = Array.isArray(item.children) ? item.children : [];
+  for (let i = 0; i < children.length; i++) {
+    const childPath = path ? `${path}/${i}` : String(i);
+    reindexFinalJsonPaths(children[i], childPath);
+  }
+}
+
+/**
+ * Drop backend-only layers so the generated banner never contains elements absent from the source.
+ */
+function filterFinalJsonToSourceElements(finalJson, sourceFrame) {
+  const sourceIndex = collectSourceElementIndex(sourceFrame);
+  const removedRoles = [];
+
+  function filterChildren(children) {
+    const kept = [];
+    for (const child of Array.isArray(children) ? children : []) {
+      const filtered = filterNode(child);
+      if (!filtered) {
+        removedRoles.push(semanticRoleName(child) || String(child.id || "unknown"));
+        continue;
+      }
+      const role = semanticRoleName(child);
+      if (
+        isSyntheticGroupRole(role) &&
+        !sourceIndex.roles.has(role) &&
+        Array.isArray(filtered.children) &&
+        filtered.children.length
+      ) {
+        removedRoles.push(role);
+        for (const grandchild of filtered.children) kept.push(grandchild);
+      } else {
+        kept.push(filtered);
+      }
+    }
+    return kept;
+  }
+
+  function filterNode(item) {
+    if (!item || typeof item !== "object") return null;
+    if (!jsonItemAllowedInSource(item, sourceIndex)) return null;
+    const copy = {};
+    for (const key of Object.keys(item)) {
+      if (key !== "children") copy[key] = item[key];
+    }
+    copy.children = filterChildren(item.children);
+    const role = semanticRoleName(item);
+    if (isSyntheticGroupRole(role) && !sourceIndex.roles.has(role) && copy.children.length === 0) {
+      return null;
+    }
+    return copy;
+  }
+
+  const filteredRoot = filterNode(finalJson);
+  const json =
+    filteredRoot ||
+    Object.assign({}, finalJson, {
+      children: filterChildren(finalJson.children),
+    });
+  reindexFinalJsonPaths(json, "");
+  const report = {
+    json,
+    removedRoles,
+    removedCount: removedRoles.length,
+    sourceRoleCount: sourceIndex.roles.size,
+    sourceIdCount: sourceIndex.ids.size,
+  };
+  console.log("[SOURCE_ELEMENT_FILTER]", report);
+  return report;
+}
+
+function indexFinalJsonByRole(jsonTree) {
+  const byRole = new Map();
+  function walk(node) {
+    if (!node || typeof node !== "object") return;
+    const role = semanticRoleName(node);
+    if (role && !byRole.has(role)) byRole.set(role, node);
+    const kids = Array.isArray(node.children) ? node.children : [];
+    for (const child of kids) walk(child);
+  }
+  walk(jsonTree);
+  return byRole;
+}
+
+function countTextLines(characters) {
+  if (characters == null) return 1;
+  const parts = String(characters).split(/\r\n|\n|\u2028|\u2029|\u000b|\u000c|\u0085/);
+  return Math.max(1, parts.length);
+}
+
+function getSourceTextFontSize(sourceFrame, role) {
+  const node = findTextNodeBySemanticRole(sourceFrame, role);
+  if (!node) return null;
+  try {
+    return typeof node.fontSize === "number" && Number.isFinite(node.fontSize) ? node.fontSize : null;
+  } catch (_e) {
+    return null;
+  }
+}
+
+function lineHeightMultiplier(item) {
+  const lh = item && item.lineHeight;
+  if (lh && typeof lh === "object" && lh.unit === "PERCENT" && typeof lh.value === "number") {
+    return lh.value / 100;
+  }
+  return 0.9;
+}
+
+function childBoundsLookCanvasAbsolute(parent, child) {
+  if (!parent || !child || !parent.bounds || !child.bounds) return false;
+  const pb = parent.bounds;
+  const cb = child.bounds;
+  if (typeof cb.y !== "number" || typeof pb.y !== "number") return false;
+  const relY = cb.y - pb.y;
+  return relY > (pb.height || 0) + 1;
+}
+
+function normalizeAbsoluteChildBoundsInJson(root) {
+  let fixed = 0;
+  function walk(node) {
+    if (!node || typeof node !== "object") return;
+    const kids = Array.isArray(node.children) ? node.children : [];
+    for (const child of kids) {
+      if (childBoundsLookCanvasAbsolute(node, child) && child.bounds) {
+        const pb = node.bounds;
+        const cb = child.bounds;
+        child.bounds = {
+          x: (cb.x || 0) - (pb.x || 0),
+          y: (cb.y || 0) - (pb.y || 0),
+          width: cb.width,
+          height: cb.height,
+        };
+        fixed++;
+      }
+      walk(child);
+    }
+  }
+  walk(root);
+  return { fixed };
+}
+
+function estimateHeadlineFontSize(headlineItem, boxWidth, boxHeight, lineCount, maxFont) {
+  const lines = Math.max(1, lineCount);
+  const lh = lineHeightMultiplier(headlineItem);
+  const byHeight = ((boxHeight || 200) / lines) * lh * 0.98;
+  const chars = String((headlineItem && headlineItem.characters) || "");
+  const longest = chars
+    .split(/\r\n|\n|\u2028|\u2029/)
+    .reduce((max, line) => Math.max(max, line.length), 0);
+  const byWidth = longest > 0 ? (boxWidth / longest) * 1.55 : maxFont;
+  return Math.max(12, Math.min(maxFont, byHeight, byWidth));
+}
+
+/**
+ * Portrait-only JSON pass: stack brand → headline → subheadline, cap headline size from source scale,
+ * parent-relative text bounds, TOP vertical alignment (avoids BOTTOM bleed into brand).
+ */
+function polishPortraitTypographyInJson(finalJson, sourceFrame, targetResolution) {
+  const targetW = Number(targetResolution && targetResolution.width);
+  const targetH = Number(targetResolution && targetResolution.height);
+  if (!finalJson || !targetW || !targetH || targetW >= targetH) {
+    return { applied: false, reason: "not_portrait" };
+  }
+
+  const normalizeReport = normalizeAbsoluteChildBoundsInJson(finalJson);
+  const byRole = indexFinalJsonByRole(finalJson);
+  const brand = byRole.get("brand_group");
+  const headlineGroup = byRole.get("headline_group");
+  const headline = byRole.get("headline");
+  const sub = byRole.get("subheadline_delivery_time");
+  if (!headline || !headline.bounds) {
+    return { applied: false, reason: "no_headline", normalized: normalizeReport.fixed };
+  }
+
+  const sourceW = sourceFrame && sourceFrame.width ? sourceFrame.width : targetW;
+  const widthScale = targetW / sourceW;
+  const sourceHeadlineFont = getSourceTextFontSize(sourceFrame, "headline");
+  const jsonFont = typeof headline.fontSize === "number" ? headline.fontSize : 72;
+  const scaledFromSource =
+    sourceHeadlineFont && Number.isFinite(sourceHeadlineFont)
+      ? sourceHeadlineFont * widthScale * 0.95
+      : jsonFont * widthScale;
+  const maxFont = Math.min(jsonFont, scaledFromSource, targetW * 0.078, targetH * 0.068);
+
+  const marginX = Math.round(targetW * 0.05);
+  const contentTop = Math.round(targetH * 0.52);
+  const stackGap = Math.round(targetH * 0.022);
+  const innerPad = Math.round(targetH * 0.012);
+
+  if (brand && brand.bounds) {
+    brand.bounds.x = marginX;
+    brand.bounds.width = Math.max(1, targetW - 2 * marginX);
+    if (typeof brand.bounds.y !== "number" || brand.bounds.y < contentTop - 4) {
+      brand.bounds.y = contentTop;
+    }
+  }
+
+  const brandBottom =
+    brand && brand.bounds && typeof brand.bounds.y === "number" && typeof brand.bounds.height === "number"
+      ? brand.bounds.y + brand.bounds.height
+      : contentTop + Math.round(targetH * 0.08);
+
+  const boxW = Math.max(1, targetW - 2 * marginX);
+  const headlineLines = countTextLines(headline.characters || "");
+  const maxHeadlineHeight = Math.round(targetH * 0.22);
+  let fontSize = estimateHeadlineFontSize(
+    headline,
+    boxW - innerPad * 2,
+    maxHeadlineHeight,
+    headlineLines,
+    maxFont,
+  );
+  fontSize = Math.round(fontSize * 10) / 10;
+
+  const lhMul = lineHeightMultiplier(headline);
+  const headlineBoxH = Math.ceil(fontSize * lhMul * headlineLines * 1.06);
+  const groupY = brandBottom + stackGap;
+
+  if (headlineGroup && headlineGroup.bounds) {
+    headlineGroup.bounds.x = marginX;
+    headlineGroup.bounds.y = groupY;
+    headlineGroup.bounds.width = boxW;
+  }
+
+  headline.fontSize = fontSize;
+  headline.textAlignHorizontal = "CENTER";
+  headline.textAlignVertical = "TOP";
+  headline.textAutoResize = "NONE";
+  headline.bounds = {
+    x: innerPad,
+    y: innerPad,
+    width: Math.max(1, boxW - innerPad * 2),
+    height: headlineBoxH,
+  };
+
+  let subBoxH = 0;
+  let subGap = 0;
+  if (sub && sub.bounds) {
+    subGap = Math.round(targetH * 0.014);
+    const subFontCap = Math.min(
+      typeof sub.fontSize === "number" ? sub.fontSize : 40,
+      fontSize * 0.58,
+      targetW * 0.052,
+    );
+    sub.fontSize = Math.round(subFontCap * 10) / 10;
+    sub.textAlignHorizontal = "CENTER";
+    sub.textAlignVertical = "TOP";
+    sub.textAutoResize = "NONE";
+    subBoxH = Math.ceil(sub.fontSize * lineHeightMultiplier(sub) * 1.25);
+    sub.bounds = {
+      x: innerPad,
+      y: innerPad + headlineBoxH + subGap,
+      width: Math.max(1, boxW - innerPad * 2),
+      height: subBoxH,
+    };
+  }
+
+  const groupH = innerPad + headlineBoxH + (sub ? subGap + subBoxH : 0) + innerPad;
+  if (headlineGroup && headlineGroup.bounds) {
+    headlineGroup.bounds.height = groupH;
+  }
+
+  const bottomMargin = Math.round(targetH * 0.04);
+  const groupBottom = groupY + groupH;
+  if (groupBottom > targetH - bottomMargin && headlineGroup && headlineGroup.bounds) {
+    const shift = groupBottom - (targetH - bottomMargin);
+    headlineGroup.bounds.y = Math.max(contentTop, groupY - shift);
+    if (brand && brand.bounds) brand.bounds.y = Math.max(contentTop, (brand.bounds.y || contentTop) - shift);
+  }
+
+  console.log("[PORTRAIT_TYPO_POLISH]", {
+    fontSize,
+    maxFont,
+    scaledFromSource,
+    headlineLines,
+    groupY: headlineGroup && headlineGroup.bounds ? headlineGroup.bounds.y : null,
+    groupH,
+    normalized: normalizeReport.fixed,
+  });
+
+  return {
+    applied: true,
+    fontSize,
+    normalized: normalizeReport.fixed,
+    groupY: headlineGroup && headlineGroup.bounds ? headlineGroup.bounds.y : null,
+  };
+}
+
+async function fitFigmaTextNodeToBox(node, maxWidth, maxHeight, opts) {
+  if (!node || !("characters" in node)) return { fitted: false };
+  const role = opts && opts.role ? opts.role : node.name;
+  const minFont = opts && typeof opts.minFont === "number" ? opts.minFont : 12;
+  let steps = 0;
+  const maxSteps = 48;
+  try {
+    if ("textAutoResize" in node) node.textAutoResize = "NONE";
+  } catch (_e) {
+    /* best-effort */
+  }
+  if (typeof maxWidth === "number" && typeof maxHeight === "number") {
+    resizeNodeIfPossible(node, maxWidth, maxHeight);
+  }
+  await loadAllFontsForTextNode(node, role);
+  if (opts && opts.alignVertical === "TOP") {
+    try {
+      node.textAlignVertical = "TOP";
+    } catch (_e) {
+      /* best-effort */
+    }
+  }
+  let targetFont =
+    opts && typeof opts.maxFont === "number" ? opts.maxFont : typeof node.fontSize === "number" ? node.fontSize : 80;
+  try {
+    node.fontSize = Math.max(minFont, targetFont);
+    applyUniformTextRangeValue(node, "setRangeFontSize", "FONT_SIZE", Math.max(minFont, targetFont), role);
+  } catch (_e) {
+    /* best-effort */
+  }
+  while (steps < maxSteps && node.fontSize > minFont) {
+    const overflowW = typeof maxWidth === "number" && node.width > maxWidth + 0.5;
+    const overflowH = typeof maxHeight === "number" && node.height > maxHeight + 0.5;
+    if (!overflowW && !overflowH) break;
+    targetFont = Math.max(minFont, node.fontSize - 1);
+    try {
+      node.fontSize = targetFont;
+      applyUniformTextRangeValue(node, "setRangeFontSize", "FONT_SIZE", targetFont, role);
+    } catch (e) {
+      console.warn("[TEXT_FIT_FONT_FAILED]", role, e);
+      break;
+    }
+    steps++;
+  }
+  return { fitted: steps > 0, fontSize: node.fontSize, steps };
+}
+
+async function polishPortraitTypographyOnFrame(convertedFrame, finalJson, targetResolution, sourceContentMap) {
+  const targetW = Number(targetResolution && targetResolution.width);
+  const targetH = Number(targetResolution && targetResolution.height);
+  if (!convertedFrame || !targetW || !targetH || targetW >= targetH) {
+    return { applied: false, reason: "not_portrait" };
+  }
+
+  const byRole = indexFinalJsonByRole(finalJson);
+  const headlineItem = byRole.get("headline");
+  const headlineNode = findTextNodeBySemanticRole(convertedFrame, "headline");
+  if (!headlineItem || !headlineNode) {
+    return { applied: false, reason: "no_headline_node" };
+  }
+
+  const b = headlineItem.bounds;
+  if (b) {
+    headlineNode.x = typeof b.x === "number" ? b.x : headlineNode.x;
+    headlineNode.y = typeof b.y === "number" ? b.y : headlineNode.y;
+    if (typeof b.width === "number" && typeof b.height === "number") {
+      resizeNodeIfPossible(headlineNode, b.width, b.height);
+    }
+  }
+
+  const maxFont =
+    typeof headlineItem.fontSize === "number" ? headlineItem.fontSize : headlineNode.fontSize || 72;
+  const fitReport = await fitFigmaTextNodeToBox(
+    headlineNode,
+    b && b.width,
+    b && b.height,
+    { role: "headline", maxFont, minFont: 12, alignVertical: "TOP" },
+  );
+  try {
+    headlineNode.textAlignVertical = "TOP";
+    headlineNode.textAlignHorizontal = textAlignHorizontalForTarget(headlineItem, sourceContentMap) || "CENTER";
+  } catch (_e) {
+    /* best-effort */
+  }
+
+  const subItem = byRole.get("subheadline_delivery_time");
+  const subNode = findTextNodeBySemanticRole(convertedFrame, "subheadline_delivery_time");
+  if (subItem && subNode && subItem.bounds) {
+    const sb = subItem.bounds;
+    subNode.x = typeof sb.x === "number" ? sb.x : subNode.x;
+    subNode.y = typeof sb.y === "number" ? sb.y : subNode.y;
+    if (typeof sb.width === "number" && typeof sb.height === "number") {
+      resizeNodeIfPossible(subNode, sb.width, sb.height);
+    }
+    await fitFigmaTextNodeToBox(subNode, sb.width, sb.height, {
+      role: "subheadline_delivery_time",
+      maxFont: subItem.fontSize || subNode.fontSize,
+      alignVertical: "TOP",
+    });
+    try {
+      subNode.textAlignVertical = "TOP";
+      subNode.textAlignHorizontal = textAlignHorizontalForTarget(subItem, sourceContentMap) || "CENTER";
+    } catch (_e) {
+      /* best-effort */
+    }
+  }
+
+  return { applied: true, headline: fitReport };
+}
+
+function figmaNodeAllowedInSource(node, sourceIndex, cloneRoot) {
+  if (!node || !sourceIndex || (cloneRoot && node.id === cloneRoot.id)) return true;
+  let storedId = "";
+  let semanticName = "";
+  try {
+    storedId = String(node.getPluginData("originalNodeId") || "").trim();
+    semanticName = String(node.getPluginData("semanticName") || node.getPluginData("semanticRole") || "").trim();
+  } catch (_e) {
+    storedId = "";
+    semanticName = "";
+  }
+  const nodeId = String(node.id || "").trim();
+  const role = String(node.name || "").trim() || semanticName;
+  if ((storedId && sourceIndex.ids.has(storedId)) || (nodeId && sourceIndex.ids.has(nodeId))) return true;
+  if (role && sourceIndex.roles.has(role)) return true;
+  if (LOGO_PART_ROLES.has(role) && sourceIndex.roles.has("logo")) return true;
+  return false;
+}
+
+/**
+ * Final safety pass: remove any Figma node that was not present on the source banner.
+ */
+function pruneFigmaNodesNotInSource(sourceFrame, cloneRoot) {
+  const sourceIndex = collectSourceElementIndex(sourceFrame);
+  let removed = 0;
+
+  function visitPost(node) {
+    if (!node || node === cloneRoot || !("children" in node) || !Array.isArray(node.children)) return;
+    const kids = [...node.children];
+    for (const child of kids) visitPost(child);
+    const kids2 = [...node.children];
+    for (const child of kids2) {
+      if (figmaNodeAllowedInSource(child, sourceIndex, cloneRoot)) continue;
+      try {
+        child.remove();
+        removed++;
+        console.log("[SOURCE_ELEMENT_PRUNE]", child.name, child.id);
+      } catch (e) {
+        console.warn("[SOURCE_ELEMENT_PRUNE_FAILED]", child && child.name, e);
+      }
+    }
+  }
+
+  visitPost(cloneRoot);
+  return { removed };
+}
+
+function attachTargetOrientationToSourceContentMap(sourceContentMap, targetResolution) {
+  if (!sourceContentMap || !targetResolution) return sourceContentMap;
+  sourceContentMap.targetIsLandscape = Number(targetResolution.width) > Number(targetResolution.height);
+  return sourceContentMap;
+}
+
+function textAlignHorizontalForTarget(item, sourceContentMap) {
+  if (sourceContentMap && typeof sourceContentMap.targetIsLandscape === "boolean") {
+    return sourceContentMap.targetIsLandscape ? "LEFT" : "CENTER";
+  }
+  return item && item.textAlignHorizontal ? item.textAlignHorizontal : null;
+}
+
+function textAlignVerticalForTarget(item, sourceContentMap) {
+  if (
+    sourceContentMap &&
+    sourceContentMap.targetIsLandscape === false &&
+    semanticRoleName(item) === "headline"
+  ) {
+    return "TOP";
+  }
+  return item && item.textAlignVertical ? item.textAlignVertical : null;
+}
+
+function sourceContentLookupKeys(item) {
+  return [
+    item && item.id,
+    item && item.source_figma_id,
+    item && item.sourceFigmaId,
+    item && item.figma_node_id,
+    item && item.node_id,
+  ];
+}
+
+function resolveSourceCharactersForJsonText(item, sourceContentMap) {
+  if (!item || !sourceContentMap) return item && "characters" in item ? item.characters : undefined;
+  const ids = [
+    ...sourceContentLookupKeys(item),
+  ];
+  for (const id of ids) {
+    const key = String(id || "").trim();
+    if (key && sourceContentMap.textById && sourceContentMap.textById.has(key)) return sourceContentMap.textById.get(key);
+    if (key && sourceContentMap.byId && sourceContentMap.byId.has(key)) return sourceContentMap.byId.get(key);
+  }
+  const path = String(item.path || "").trim();
+  if (path && sourceContentMap.textByPath && sourceContentMap.textByPath.has(path)) return sourceContentMap.textByPath.get(path);
+  if (path && sourceContentMap.byPath && sourceContentMap.byPath.has(path)) return sourceContentMap.byPath.get(path);
+
+  const roleKeys = [item.name, item.role, item.semantic_name, item.semanticName];
+  for (const role of roleKeys) {
+    const key = String(role || "").trim();
+    if (key && sourceContentMap.textByRole && sourceContentMap.textByRole.has(key)) return sourceContentMap.textByRole.get(key);
+    if (key && sourceContentMap.byRole && sourceContentMap.byRole.has(key)) return sourceContentMap.byRole.get(key);
+  }
+  return "characters" in item ? item.characters : undefined;
+}
+
+function resolveSourceImageFillsForJsonNode(item, sourceContentMap) {
+  if (!item || !sourceContentMap) return null;
+  for (const id of sourceContentLookupKeys(item)) {
+    const key = String(id || "").trim();
+    if (key && sourceContentMap.imageFillsById && sourceContentMap.imageFillsById.has(key)) {
+      return sourceContentMap.imageFillsById.get(key);
+    }
+  }
+  const path = String(item.path || "").trim();
+  if (path && sourceContentMap.imageFillsByPath && sourceContentMap.imageFillsByPath.has(path)) {
+    return sourceContentMap.imageFillsByPath.get(path);
+  }
+  const roleKeys = [item.name, item.role, item.semantic_name, item.semanticName];
+  for (const role of roleKeys) {
+    const key = String(role || "").trim();
+    if (key && sourceContentMap.imageFillsByRole && sourceContentMap.imageFillsByRole.has(key)) {
+      return sourceContentMap.imageFillsByRole.get(key);
+    }
+  }
+  return null;
+}
+
+function applySourceImageContent(node, item, sourceContentMap) {
+  if (!node || !item || "characters" in node) return 0;
+  const sourceImageFills = resolveSourceImageFillsForJsonNode(item, sourceContentMap);
+  if (!sourceImageFills || !("fills" in node)) return 0;
+  try {
+    node.fills = sourceImageFills;
+    return 1;
+  } catch (e) {
+    console.warn("[IMAGE_CONTENT_APPLY_FAILED]", item && (item.name || item.id || item.path), e);
+    return 0;
+  }
+}
+
+function resolveSourceVisualNodeForJsonNode(item, sourceContentMap) {
+  if (!item || !sourceContentMap) return null;
+  for (const id of sourceContentLookupKeys(item)) {
+    const key = String(id || "").trim();
+    if (key && sourceContentMap.visualNodeById && sourceContentMap.visualNodeById.has(key)) {
+      return sourceContentMap.visualNodeById.get(key);
+    }
+  }
+  const path = String(item.path || "").trim();
+  if (path && sourceContentMap.visualNodeByPath && sourceContentMap.visualNodeByPath.has(path)) {
+    return sourceContentMap.visualNodeByPath.get(path);
+  }
+  const roleKeys = [item.name, item.role, item.semantic_name, item.semanticName];
+  for (const role of roleKeys) {
+    const key = String(role || "").trim();
+    if (key && sourceContentMap.visualNodeByRole && sourceContentMap.visualNodeByRole.has(key)) {
+      return sourceContentMap.visualNodeByRole.get(key);
+    }
+  }
+  return null;
+}
+
+function shouldCloneSourceVisualForJsonItem(item, isRoot) {
+  if (!item || typeof item !== "object" || isRoot || "characters" in item) return false;
+  const type = normalizeType(item.type || "");
+  const name = semanticRoleName(item);
+  return (
+    type === "vector" ||
+    type === "star" ||
+    type === "boolean operation" ||
+    type === "boolean_operation" ||
+    name === "logo" ||
+    /^brand_name_/.test(name)
+  );
+}
+
+function cloneSourceVisualIntoJson(parent, item, parentBounds, sourceContentMap) {
+  if (!parent || typeof parent.appendChild !== "function") return null;
+  const sourceNode = resolveSourceVisualNodeForJsonNode(item, sourceContentMap);
+  if (!sourceNode || typeof sourceNode.clone !== "function") return null;
+  const node = sourceNode.clone();
+  node.name = String(item.name || sourceNode.name || "visual_content");
+  try {
+    if (item.id) node.setPluginData("originalNodeId", String(item.id));
+    node.setPluginData("semanticName", String(item.name || ""));
+  } catch (_e) {
+    /* plugin data best-effort */
+  }
+  parent.appendChild(node);
+  applyJsonClippingBehavior(node, item);
+  applyBoundsFromAbsoluteJson(node, item, { bounds: parentBounds });
+  applyJsonVisualStyle(node, item);
+  return node;
 }
 
 function sanitizeLayerName(name) {
@@ -942,8 +1696,20 @@ function stampCloneSubtreeOriginalIdsFromJson(jRoot, fRoot) {
     const jid = String(jNode.id || "").trim();
     if (jid) {
       try {
-        fNode.setPluginData("originalNodeId", jid);
-        stamped++;
+        const existing = String(fNode.getPluginData("originalNodeId") || "").trim();
+        if (!existing) {
+          fNode.setPluginData("originalNodeId", jid);
+          stamped++;
+        } else if (existing !== jid) {
+          mismatchWarn++;
+          console.warn("stampCloneIds: preserve existing originalNodeId", {
+            figmaId: fNode.id,
+            existing,
+            wanted: jid,
+            jsonName: jNode.name,
+            figmaName: fNode.name,
+          });
+        }
       } catch (e) {
         console.warn("stampCloneIds: setPluginData failed", jid, e);
       }
@@ -1113,24 +1879,10 @@ function removeStrayFigmaChildrenNotInJson(jsonTree, cloneRoot) {
       } catch (_e) {
         oid = "";
       }
-      if (oid && !wanted.has(oid)) toRemove.push(c);
+      if (!oid || !wanted.has(oid)) toRemove.push(c);
     }
     for (let r = 0; r < toRemove.length; r++) {
       const c = toRemove[r];
-      const p = c.parent;
-      if (p && typeof p.insertChild === "function" && "children" in c && Array.isArray(c.children)) {
-        let insertIdx = p.children.indexOf(c);
-        if (insertIdx < 0) insertIdx = p.children.length;
-        const lift = [...c.children];
-        for (let k = 0; k < lift.length; k++) {
-          try {
-            p.insertChild(insertIdx, lift[k]);
-            insertIdx++;
-          } catch (e) {
-            console.warn("removeStray: lift failed", lift[k] && lift[k].id, e);
-          }
-        }
-      }
       try {
         c.remove();
         removed++;
@@ -1173,6 +1925,14 @@ function jsonBannerPointToDocument(bannerRootFrame, bx, by) {
  */
 function forceAbsolutePosition(node, bannerRootFrame, jsonBounds, jsonLabel) {
   if (!node || !jsonBounds || typeof jsonBounds.x !== "number" || typeof jsonBounds.y !== "number") return;
+  if (typeof jsonBounds.width === "number" && typeof jsonBounds.height === "number" && "resizeWithoutConstraints" in node) {
+    try {
+      node.resizeWithoutConstraints(Math.max(0.01, jsonBounds.width), Math.max(0.01, jsonBounds.height));
+    } catch (_e) {
+      /* text / vector-like nodes may reject direct resize */
+    }
+  }
+
   const wantDoc = jsonBannerPointToDocument(bannerRootFrame, jsonBounds.x, jsonBounds.y);
   const beforeAbs = getAbsXY(node);
   const dDocX = wantDoc.x - beforeAbs.x;
@@ -1184,6 +1944,7 @@ function forceAbsolutePosition(node, bannerRootFrame, jsonBounds, jsonLabel) {
       target: { x: jsonBounds.x, y: jsonBounds.y, width: jsonBounds.width, height: jsonBounds.height },
       before: beforeAbs,
       after: getAbsXY(node),
+      size: "applied",
     });
     return;
   }
@@ -1208,14 +1969,6 @@ function forceAbsolutePosition(node, bannerRootFrame, jsonBounds, jsonLabel) {
   } else {
     node.x += dDocX;
     node.y += dDocY;
-  }
-
-  if (typeof jsonBounds.width === "number" && typeof jsonBounds.height === "number" && "resizeWithoutConstraints" in node) {
-    try {
-      node.resizeWithoutConstraints(Math.max(0.01, jsonBounds.width), Math.max(0.01, jsonBounds.height));
-    } catch (_e) {
-      /* text / etc. */
-    }
   }
 
   console.log("[bounds-fix]", label, {
@@ -1397,20 +2150,6 @@ function pruneClonedNodesMissingFromFinalJson(jsonTree, cloneRoot) {
         oid = "";
       }
       if (!oid || allowed.has(oid)) continue;
-      const p = c.parent;
-      if (p && typeof p.insertChild === "function" && "children" in c && Array.isArray(c.children)) {
-        let insertIdx = p.children.indexOf(c);
-        if (insertIdx < 0) insertIdx = p.children.length;
-        const lift = [...c.children];
-        for (let k = 0; k < lift.length; k++) {
-          try {
-            p.insertChild(insertIdx, lift[k]);
-            insertIdx++;
-          } catch (e) {
-            console.warn("prune: failed to lift child before removing orphan wrapper", lift[k] && lift[k].id, e);
-          }
-        }
-      }
       try {
         c.remove();
         removed++;
@@ -1627,8 +2366,19 @@ function applyJsonTreeNamesByPath(jsonTree, cloneRoot) {
     const jid = String(jsonNode && jsonNode.id || "").trim();
     if (!jid || !figmaNode) return;
     try {
-      figmaNode.setPluginData("originalNodeId", jid);
-      stamped++;
+      const existing = String(figmaNode.getPluginData("originalNodeId") || "").trim();
+      if (!existing) {
+        figmaNode.setPluginData("originalNodeId", jid);
+        stamped++;
+      } else if (existing !== jid) {
+        console.warn("applyJsonTreeNamesByPath: preserve existing originalNodeId", {
+          figmaId: figmaNode.id,
+          existing,
+          wanted: jid,
+          jsonName: jsonNode && jsonNode.name,
+          figmaName: figmaNode.name,
+        });
+      }
     } catch (e) {
       console.warn("applyJsonTreeNamesByPath: set originalNodeId failed", jid, e);
     }
@@ -1986,14 +2736,17 @@ async function loadJsonFontName(fontName) {
       await figma.loadFontAsync(wanted);
       return wanted;
     } catch (e) {
-      console.error("loadJsonFontName: JSON font could not be loaded; not falling back silently", wanted, e);
-      throw new Error(
-        `JSON font unavailable in Figma: ${wanted.family} ${wanted.style}. Install/enable the font or update backend fontName.`,
-      );
+      console.warn("loadJsonFontName: JSON font unavailable; using Inter for node creation", wanted, e);
     }
   }
-  console.error("loadJsonFontName: JSON text node is missing a valid fontName", fontName);
-  throw new Error("JSON text node is missing a valid fontName; refusing silent font fallback.");
+  const fallback = { family: "Inter", style: "Regular" };
+  try {
+    await figma.loadFontAsync(fallback);
+    return fallback;
+  } catch (fallbackError) {
+    console.warn("loadJsonFontName: Inter fallback unavailable; using default text font", fallbackError);
+    return null;
+  }
 }
 
 function applyJsonPropertyIfPresent(node, item, key) {
@@ -2036,14 +2789,84 @@ function applyJsonTextStyle(node, item) {
   return applied;
 }
 
-async function applyFinalJsonTextStyle(node, item, parentJsonNode) {
+function applyUniformTextRangeValue(node, rangeSetterName, propertyName, value, role) {
+  if (!node || !("characters" in node)) return false;
+  const length = String(node.characters || "").length;
+  if (length <= 0) return false;
+  try {
+    if (typeof node[rangeSetterName] === "function") {
+      node[rangeSetterName](0, length, jsonSafeValue(value));
+      return true;
+    }
+  } catch (e) {
+    console.warn(`[TEXT_RANGE_${propertyName}_APPLY_FAILED]`, role, e);
+  }
+  return false;
+}
+
+async function loadAllFontsForTextNode(node, role) {
+  if (!node || !("characters" in node)) return;
+  const fonts = [];
+  try {
+    if (typeof node.getRangeAllFontNames === "function") {
+      const rangeFonts = node.getRangeAllFontNames(0, node.characters.length);
+      if (Array.isArray(rangeFonts)) fonts.push(...rangeFonts);
+    }
+  } catch (e) {
+    console.warn("[TEXT_RANGE_FONT_SCAN_FAILED]", role, e);
+  }
+  const fontName = node.fontName;
+  if (fontName && typeof fontName === "object" && fontName.family && fontName.style) {
+    fonts.push(fontName);
+  }
+  const seen = new Set();
+  for (const font of fonts) {
+    if (!font || typeof font !== "object" || !font.family || !font.style) continue;
+    const key = `${font.family}\n${font.style}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    try {
+      await figma.loadFontAsync({ family: String(font.family), style: String(font.style) });
+    } catch (e) {
+      console.warn("[TEXT_EXISTING_FONT_LOAD_FAILED]", role, font, e);
+    }
+  }
+}
+
+async function applyFinalJsonTextStyle(node, item, parentJsonNode, sourceContentMap) {
   if (!node || !item || !("characters" in node)) return 0;
   const role = semanticRoleName(item);
-  const fontName = await loadJsonFontName(item.fontName);
-  await figma.loadFontAsync(fontName);
-  node.fontName = fontName;
-  node.characters = String(item.characters || "");
-  if ("textAutoResize" in node) node.textAutoResize = "NONE";
+  const sourceChars = resolveSourceCharactersForJsonText(item, sourceContentMap);
+  const requestedAutoResize = typeof item.textAutoResize === "string" ? item.textAutoResize : null;
+  let loadedJsonFontName = null;
+  await loadAllFontsForTextNode(node, role);
+  if (item.fontName && typeof item.fontName === "object" && item.fontName.family && item.fontName.style) {
+    const fontName = { family: String(item.fontName.family), style: String(item.fontName.style) };
+    try {
+      await figma.loadFontAsync(fontName);
+      node.fontName = fontName;
+      loadedJsonFontName = fontName;
+    } catch (e) {
+      console.warn("[TEXT_JSON_FONT_LOAD_FAILED]", role, fontName, e);
+    }
+  }
+
+  const finalCharacters = String(sourceChars != null ? sourceChars : item.characters || "");
+  try {
+    node.characters = finalCharacters;
+  } catch (e) {
+    console.warn("[TEXT_CHARACTERS_APPLY_FAILED]", role, e);
+  }
+  if ("textAutoResize" in node) {
+    try {
+      node.textAutoResize = "NONE";
+    } catch (_e) {
+      /* fixed sizing is best-effort before bounds placement */
+    }
+  }
+  if (loadedJsonFontName) {
+    applyUniformTextRangeValue(node, "setRangeFontName", "FONT_NAME", loadedJsonFontName, role);
+  }
 
   const b = item.bounds && typeof item.bounds === "object" ? item.bounds : null;
   const pb = parentJsonNode && parentJsonNode.bounds && typeof parentJsonNode.bounds === "object" ? parentJsonNode.bounds : null;
@@ -2056,20 +2879,65 @@ async function applyFinalJsonTextStyle(node, item, parentJsonNode) {
   }
 
   if (typeof item.fontSize === "number" && Number.isFinite(item.fontSize)) {
-    node.fontSize = Math.max(1, item.fontSize);
+    try {
+      node.fontSize = Math.max(1, item.fontSize);
+    } catch (e) {
+      console.warn("[TEXT_FONT_SIZE_APPLY_FAILED]", role, item.fontSize, e);
+    }
+    applyUniformTextRangeValue(node, "setRangeFontSize", "FONT_SIZE", Math.max(1, item.fontSize), role);
   }
-  if (item.textAlignHorizontal) node.textAlignHorizontal = item.textAlignHorizontal;
-  if (item.textAlignVertical) node.textAlignVertical = item.textAlignVertical;
-  applyJsonPropertyIfPresent(node, item, "lineHeight");
-  applyJsonPropertyIfPresent(node, item, "letterSpacing");
-  applyJsonPropertyIfPresent(node, item, "fills");
+  const targetTextAlignHorizontal = textAlignHorizontalForTarget(item, sourceContentMap);
+  if (targetTextAlignHorizontal) {
+    try {
+      node.textAlignHorizontal = targetTextAlignHorizontal;
+    } catch (e) {
+      console.warn("[TEXT_ALIGN_H_APPLY_FAILED]", role, targetTextAlignHorizontal, e);
+    }
+  }
+  const targetTextAlignVertical = textAlignVerticalForTarget(item, sourceContentMap);
+  if (targetTextAlignVertical) {
+    try {
+      node.textAlignVertical = targetTextAlignVertical;
+    } catch (e) {
+      console.warn("[TEXT_ALIGN_V_APPLY_FAILED]", role, targetTextAlignVertical, e);
+    }
+  }
+  if (applyJsonPropertyIfPresent(node, item, "lineHeight")) {
+    applyUniformTextRangeValue(node, "setRangeLineHeight", "LINE_HEIGHT", item.lineHeight, role);
+  }
+  if (applyJsonPropertyIfPresent(node, item, "letterSpacing")) {
+    applyUniformTextRangeValue(node, "setRangeLetterSpacing", "LETTER_SPACING", item.letterSpacing, role);
+  }
+  if (applyJsonPropertyIfPresent(node, item, "fills")) {
+    applyUniformTextRangeValue(node, "setRangeFills", "FILLS", item.fills, role);
+  }
   applyJsonPropertyIfPresent(node, item, "opacity");
   applyJsonPropertyIfPresent(node, item, "textCase");
   applyJsonPropertyIfPresent(node, item, "textDecoration");
   applyJsonPropertyIfPresent(node, item, "paragraphSpacing");
   applyJsonPropertyIfPresent(node, item, "paragraphIndent");
+  if ("textAutoResize" in node && requestedAutoResize) {
+    try {
+      node.textAutoResize = requestedAutoResize;
+    } catch (_e) {
+      /* textAutoResize is best-effort across text node variants */
+    }
+  }
 
-  console.log("[TEXT_STYLE_APPLIED]", role, node.fontSize, node.fontName, node.textAlignHorizontal);
+  console.log("[TEXT_CONTENT_POLICY]", item.name, {
+    finalJsonCharacters: item.characters,
+    sourceCharacters: sourceChars,
+    usedCharacters: node.characters,
+    x: node.x,
+    y: node.y,
+    w: node.width,
+    h: node.height,
+    fontSize: node.fontSize,
+    fontName: node.fontName,
+    alignH: node.textAlignHorizontal,
+    alignV: node.textAlignVertical,
+    autoResize: node.textAutoResize,
+  });
   return 1;
 }
 
@@ -2128,19 +2996,25 @@ function figmaNodeTypeFromJson(item, isRoot) {
   const hasChildren = Array.isArray(item && item.children) && item.children.length > 0;
   if (isRoot || hasChildren || type === "frame" || type === "group") return "FRAME";
   if (type === "text") return "TEXT";
+  if (type === "star") return "STAR";
   return "RECTANGLE";
 }
 
-async function createNodeFromJsonItem(item, parent, parentBounds, isRoot) {
+async function createNodeFromJsonItem(item, parent, parentBounds, isRoot, sourceContentMap) {
   if (!item || typeof item !== "object") return null;
   const bounds = jsonBounds(item);
+  const clonedVisual = shouldCloneSourceVisualForJsonItem(item, isRoot)
+    ? cloneSourceVisualIntoJson(parent, item, parentBounds, sourceContentMap)
+    : null;
+  if (clonedVisual) return clonedVisual;
+
   const figmaType = figmaNodeTypeFromJson(item, isRoot);
   let node;
 
   if (figmaType === "TEXT") {
     const fontName = await loadJsonFontName(item.fontName);
     node = figma.createText();
-    node.fontName = fontName;
+    if (fontName) node.fontName = fontName;
     node.characters = String(item.characters || item.name || "Text");
     if ("textAutoResize" in node) node.textAutoResize = "NONE";
   } else if (figmaType === "FRAME") {
@@ -2148,6 +3022,11 @@ async function createNodeFromJsonItem(item, parent, parentBounds, isRoot) {
     node.layoutMode = "NONE";
     node.clipsContent = false;
     node.fills = isRoot ? [{ type: "SOLID", color: { r: 1, g: 1, b: 1 } }] : [];
+  } else if (figmaType === "STAR" && typeof figma.createStar === "function") {
+    node = figma.createStar();
+    if (applyJsonVisualStyle(node, item) === 0) {
+      node.fills = [{ type: "SOLID", color: { r: 1, g: 1, b: 1 } }];
+    }
   } else {
     node = figma.createRectangle();
     if (applyJsonVisualStyle(node, item) === 0) {
@@ -2158,10 +3037,16 @@ async function createNodeFromJsonItem(item, parent, parentBounds, isRoot) {
   }
 
   node.name = String(item.name || item.type || "json_node");
+  try {
+    if (item.id) node.setPluginData("originalNodeId", String(item.id));
+    node.setPluginData("semanticName", String(item.name || ""));
+  } catch (_e) {
+    /* plugin data best-effort */
+  }
   applyJsonClippingBehavior(node, item);
   applyBoundsFromAbsoluteJson(node, item, isRoot ? null : { bounds: parentBounds });
   if (figmaType === "TEXT") {
-    if ((await applyFinalJsonTextStyle(node, item, { bounds: parentBounds })) === 0 && !item.fills) {
+    if ((await applyFinalJsonTextStyle(node, item, { bounds: parentBounds }, sourceContentMap)) === 0 && !item.fills) {
       node.fills = [{ type: "SOLID", color: { r: 0.05, g: 0.06, b: 0.08 } }];
     }
   } else {
@@ -2171,12 +3056,12 @@ async function createNodeFromJsonItem(item, parent, parentBounds, isRoot) {
 
   const children = Array.isArray(item.children) ? item.children : [];
   for (const child of children) {
-    await createNodeFromJsonItem(child, node, bounds, false);
+    await createNodeFromJsonItem(child, node, bounds, false, sourceContentMap);
   }
   return node;
 }
 
-async function drawJsonTreeBesideSelection(finalJson, sourceFrame, targetResolution) {
+async function drawJsonTreeBesideSelection(finalJson, sourceFrame, targetResolution, sourceContentMap) {
   if (!finalJson || typeof finalJson !== "object") {
     throw new Error("final_json must be an object.");
   }
@@ -2189,11 +3074,12 @@ async function drawJsonTreeBesideSelection(finalJson, sourceFrame, targetResolut
   root.clipsContent = true;
   root.fills = [{ type: "SOLID", color: { r: 1, g: 1, b: 1 } }];
   resizeNodeIfPossible(root, rootBounds.width, rootBounds.height);
+  applyJsonVisualStyle(root, finalJson);
   figma.currentPage.appendChild(root);
 
   const children = Array.isArray(finalJson.children) ? finalJson.children : [];
   for (const child of children) {
-    await createNodeFromJsonItem(child, root, rootBounds, false);
+    await createNodeFromJsonItem(child, root, rootBounds, false, sourceContentMap);
   }
   return root;
 }
@@ -2426,11 +3312,11 @@ async function cloneSourceTextIntoJsonParent(item, parentJsonNode, convertedFram
     }
   }
 
-  await applyFinalJsonTextStyle(node, item, parentJsonNode);
+  await applyFinalJsonTextStyle(node, item, parentJsonNode, null);
   return node;
 }
 
-async function applyFinalJsonContentToClone(finalJson, convertedFrame, sourceFrame) {
+async function applyFinalJsonContentToClone(finalJson, convertedFrame, sourceFrame, sourceContentMap) {
   const { map: nodeByOriginalId } = collectClonedNodesByOriginalId(convertedFrame);
   const { map: sourceNodeByOriginalId } = sourceFrame ? collectClonedNodesByOriginalId(sourceFrame) : { map: new Map() };
   const pathNodeMap = buildPathNodeMap(convertedFrame);
@@ -2490,11 +3376,12 @@ async function applyFinalJsonContentToClone(finalJson, convertedFrame, sourceFra
     const isJsonTextNode = "characters" in item && "characters" in node;
     if (!isJsonTextNode) {
       applied += applyJsonVisualStyle(node, item);
+      applied += applySourceImageContent(node, item, sourceContentMap);
     }
 
     if (isJsonTextNode) {
       try {
-        applied += await applyFinalJsonTextStyle(node, item, parentJsonNode);
+        applied += await applyFinalJsonTextStyle(node, item, parentJsonNode, sourceContentMap);
       } catch (e) {
         console.warn("applyFinalJsonContentToClone: text content apply failed", node && node.name, e);
       }
@@ -2508,6 +3395,320 @@ async function applyFinalJsonContentToClone(finalJson, convertedFrame, sourceFra
 
   await walk(finalJson, null, true);
   return { applied, missing };
+}
+
+async function applyAllFinalJsonTextStyles(finalJson, convertedFrame, sourceContentMap) {
+  const { map: nodeByOriginalId } = collectClonedNodesByOriginalId(convertedFrame);
+  const pathNodeMap = buildPathNodeMap(convertedFrame);
+  let applied = 0;
+  const missing = [];
+
+  function addTextCandidate(out, seen, node) {
+    if (!node || !("characters" in node) || seen.has(node.id)) return;
+    seen.add(node.id);
+    out.push(node);
+  }
+
+  function resolveTextNodes(item, isRoot) {
+    const out = [];
+    const seen = new Set();
+    if (!item || typeof item !== "object" || isRoot) return out;
+    const id = String(item.id || "").trim();
+    const path = String(item.path || "").trim();
+    if (id && nodeByOriginalId.has(id)) {
+      const node = nodeByOriginalId.get(id);
+      addTextCandidate(out, seen, node);
+    }
+    if (path && pathNodeMap.has(path)) {
+      const node = pathNodeMap.get(path);
+      addTextCandidate(out, seen, node);
+    }
+    if (convertedFrame && typeof convertedFrame.findAll === "function") {
+      const role = semanticRoleName(item);
+      const matches = convertedFrame.findAll((node) => {
+        if (!node || !("characters" in node)) return false;
+        const nodeName = String(node.name || "").trim();
+        let semanticName = "";
+        let semanticRole = "";
+        let originalId = "";
+        try {
+          semanticName = String(node.getPluginData("semanticName") || "").trim();
+          semanticRole = String(node.getPluginData("semanticRole") || "").trim();
+          originalId = String(node.getPluginData("originalNodeId") || "").trim();
+        } catch (_e) {
+          semanticName = "";
+          semanticRole = "";
+          originalId = "";
+        }
+        return (
+          (id && originalId === id) ||
+          (role && (nodeName === role || semanticName === role || semanticRole === role)) ||
+          (item.name && nodeName === String(item.name).trim())
+        );
+      });
+      for (const node of matches) addTextCandidate(out, seen, node);
+    }
+    return out;
+  }
+
+  async function walk(item, parentJsonNode, isRoot) {
+    if (!item || typeof item !== "object") return;
+    if ("characters" in item) {
+      const nodes = resolveTextNodes(item, isRoot);
+      if (nodes.length > 0) {
+        for (const node of nodes) {
+          try {
+            applied += await applyFinalJsonTextStyle(node, item, parentJsonNode, sourceContentMap);
+          } catch (e) {
+            console.warn("[TEXT_JSON_APPLY_FAILED]", item && (item.name || item.id || item.path), e);
+          }
+        }
+      } else if (!isRoot) {
+        missing.push(String(item.name || item.id || item.path || "text"));
+      }
+    }
+    const children = Array.isArray(item.children) ? item.children : [];
+    for (const child of children) {
+      await walk(child, item, false);
+    }
+  }
+
+  await walk(finalJson, null, true);
+  return { applied, missing };
+}
+
+async function pruneDuplicateFinalTextNodes(finalJson, convertedFrame) {
+  let removed = 0;
+  const kept = new Set();
+  const missing = [];
+
+  function candidatesFor(item) {
+    if (!convertedFrame || typeof convertedFrame.findAll !== "function") return [];
+    const role = semanticRoleName(item);
+    const id = String(item && item.id ? item.id : "").trim();
+    const matches = convertedFrame.findAll((node) => {
+      if (!node || !("characters" in node)) return false;
+      const nodeName = String(node.name || "").trim();
+      let semanticName = "";
+      let semanticRole = "";
+      let originalId = "";
+      try {
+        semanticName = String(node.getPluginData("semanticName") || "").trim();
+        semanticRole = String(node.getPluginData("semanticRole") || "").trim();
+        originalId = String(node.getPluginData("originalNodeId") || "").trim();
+      } catch (_e) {
+        semanticName = "";
+        semanticRole = "";
+        originalId = "";
+      }
+      return (
+        (id && originalId === id) ||
+        (role && (nodeName === role || semanticName === role || semanticRole === role))
+      );
+    });
+    matches.sort((a, b) => {
+      const aTagged = _textNodeMatchesOriginalId(a, id) ? 0 : 1;
+      const bTagged = _textNodeMatchesOriginalId(b, id) ? 0 : 1;
+      if (aTagged !== bTagged) return aTagged - bTagged;
+      return String(a.id).localeCompare(String(b.id));
+    });
+    return matches;
+  }
+
+  function walk(item, isRoot) {
+    if (!item || typeof item !== "object") return;
+    if (!isRoot && "characters" in item) {
+      const matches = candidatesFor(item).filter((node) => !kept.has(node.id));
+      if (matches.length === 0) {
+        missing.push(String(item.name || item.id || item.path || "text"));
+      } else {
+        const keeper = matches[0];
+        kept.add(keeper.id);
+        for (let i = 1; i < matches.length; i++) {
+          const node = matches[i];
+          try {
+            node.remove();
+            removed++;
+          } catch (e) {
+            try {
+              node.visible = false;
+              removed++;
+            } catch (_hideError) {
+              console.warn("[TEXT_DUPLICATE_REMOVE_FAILED]", item && item.name, node && node.id, e);
+            }
+          }
+        }
+      }
+      return;
+    }
+    const children = Array.isArray(item.children) ? item.children : [];
+    for (const child of children) walk(child, false);
+  }
+
+  walk(finalJson, true);
+  return { removed, missing };
+}
+
+function _textNodeMatchesOriginalId(node, originalId) {
+  if (!node || !originalId) return false;
+  try {
+    return String(node.getPluginData("originalNodeId") || "").trim() === String(originalId).trim();
+  } catch (_e) {
+    return false;
+  }
+}
+
+async function replaceAllFinalJsonTextNodes(finalJson, convertedFrame, sourceContentMap) {
+  let replaced = 0;
+  const missing = [];
+
+  function rebuildIndexes() {
+    return {
+      byId: collectClonedNodesByOriginalId(convertedFrame).map,
+      byPath: buildPathNodeMap(convertedFrame),
+    };
+  }
+
+  function resolveAnyNode(item, isRoot, indexes) {
+    if (!item || typeof item !== "object") return null;
+    if (isRoot) return convertedFrame;
+    const id = String(item.id || "").trim();
+    const path = String(item.path || "").trim();
+    if (id && indexes.byId.has(id)) return indexes.byId.get(id);
+    if (path && indexes.byPath.has(path)) return indexes.byPath.get(path);
+    const role = semanticRoleName(item);
+    if (role) {
+      const matches = convertedFrame.findAll((node) => String(node.name || "").trim() === role);
+      if (matches.length > 0) return matches[0];
+    }
+    return null;
+  }
+
+  function removeStaleTextNodesForJsonItem(item, keepNode) {
+    if (!convertedFrame || typeof convertedFrame.findAll !== "function") return 0;
+    const role = semanticRoleName(item);
+    const originalId = String(item && item.id ? item.id : "").trim();
+    let removed = 0;
+    const staleNodes = convertedFrame.findAll((node) => {
+      if (!node || node.id === keepNode.id || !("characters" in node)) return false;
+      let semanticName = "";
+      let storedOriginalId = "";
+      try {
+        semanticName = String(node.getPluginData("semanticName") || node.getPluginData("semanticRole") || "").trim();
+        storedOriginalId = String(node.getPluginData("originalNodeId") || "").trim();
+      } catch (_e) {
+        semanticName = "";
+        storedOriginalId = "";
+      }
+      const nodeName = String(node.name || "").trim();
+      return (role && (nodeName === role || semanticName === role)) || (originalId && storedOriginalId === originalId);
+    });
+    for (const node of staleNodes) {
+      try {
+        node.remove();
+        removed++;
+      } catch (e) {
+        try {
+          node.visible = false;
+          removed++;
+          console.warn("[TEXT_STALE_HIDE_USED]", role, node.id, e);
+        } catch (hideError) {
+          console.warn("[TEXT_STALE_REMOVE_FAILED]", role, node && node.id, hideError);
+        }
+      }
+    }
+    return removed;
+  }
+
+  async function replaceTextNode(item, parentJsonNode, indexes) {
+    const existing = resolveAnyNode(item, false, indexes);
+    const parentNode = parentJsonNode ? resolveAnyNode(parentJsonNode, false, indexes) : convertedFrame;
+    if (!parentNode || typeof parentNode.appendChild !== "function") {
+      missing.push(`${item.name || item.path || item.id}:parent`);
+      return;
+    }
+
+    const role = semanticRoleName(item);
+    const jsonFontName = item.fontName && typeof item.fontName === "object" && item.fontName.family && item.fontName.style
+      ? { family: String(item.fontName.family), style: String(item.fontName.style) }
+      : { family: "Inter", style: "Regular" };
+    let creationFontName = jsonFontName;
+    try {
+      await figma.loadFontAsync(jsonFontName);
+    } catch (e) {
+      console.warn("[TEXT_REPLACE_JSON_FONT_LOAD_FAILED]", role, jsonFontName, e);
+      const existingFont = existing && existing.fontName && typeof existing.fontName === "object" && existing.fontName.family && existing.fontName.style
+        ? { family: String(existing.fontName.family), style: String(existing.fontName.style) }
+        : { family: "Inter", style: "Regular" };
+      creationFontName = existingFont;
+      try {
+        await figma.loadFontAsync(creationFontName);
+      } catch (fallbackError) {
+        console.warn("[TEXT_REPLACE_FALLBACK_FONT_LOAD_FAILED]", role, creationFontName, fallbackError);
+        missing.push(`${role || item.path || item.id}:font`);
+        return;
+      }
+    }
+
+    const newNode = figma.createText();
+    newNode.name = role || String(item.name || "text");
+    try {
+      newNode.setPluginData("originalNodeId", String(item.id || ""));
+      newNode.setPluginData("semanticName", role || "");
+    } catch (_e) {
+      /* plugin data best-effort */
+    }
+    newNode.fontName = creationFontName;
+    const sourceCharacters = resolveSourceCharactersForJsonText(item, sourceContentMap);
+    newNode.characters = String(sourceCharacters != null ? sourceCharacters : (item.characters || ""));
+    if ("textAutoResize" in newNode) newNode.textAutoResize = "NONE";
+
+    let insertIndex = -1;
+    if (existing && existing.parent && existing.parent.id === parentNode.id && "children" in parentNode) {
+      insertIndex = parentNode.children.indexOf(existing);
+    }
+    if (insertIndex >= 0 && typeof parentNode.insertChild === "function") {
+      parentNode.insertChild(insertIndex, newNode);
+    } else {
+      parentNode.appendChild(newNode);
+    }
+
+    await applyFinalJsonTextStyle(newNode, item, parentJsonNode, sourceContentMap);
+    let staleRemoved = 0;
+    if (existing && existing.id !== newNode.id) {
+      try {
+        existing.remove();
+        staleRemoved++;
+      } catch (e) {
+        console.warn("[TEXT_REPLACE_REMOVE_OLD_FAILED]", role, e);
+      }
+    }
+    staleRemoved += removeStaleTextNodesForJsonItem(item, newNode);
+    console.log("[TEXT_NODE_REPLACED_FROM_JSON]", role, {
+      oldId: existing && existing.id,
+      newId: newNode.id,
+      fontSize: newNode.fontSize,
+      fontName: newNode.fontName,
+      alignH: newNode.textAlignHorizontal,
+      staleRemoved,
+    });
+    replaced++;
+  }
+
+  async function walk(item, parentJsonNode, isRoot) {
+    if (!item || typeof item !== "object") return;
+    if (!isRoot && "characters" in item) {
+      await replaceTextNode(item, parentJsonNode, rebuildIndexes());
+      return;
+    }
+    const children = Array.isArray(item.children) ? item.children : [];
+    for (const child of children) {
+      await walk(child, item, false);
+    }
+  }
+
+  await walk(finalJson, null, true);
+  return { replaced, missing };
 }
 
 function buildPathNodeMap(root) {
@@ -3271,6 +4472,10 @@ figma.ui.onmessage = async (msg) => {
           const origin = getOrigin(selectedFrame);
           const rawJson = serializeNode(selectedFrame, origin, "");
           rawJson.templateId = "figma_plugin_pipeline_source";
+          const sourceContentMap = attachTargetOrientationToSourceContentMap(
+            collectSourceContentMap(selectedFrame),
+            targetResolution,
+          );
 
           postStatus("Pipeline: exporting banner PNG for Qwen classification...");
           const pngBytes = await exportFramePngBytes(selectedFrame);
@@ -3289,51 +4494,57 @@ figma.ui.onmessage = async (msg) => {
           if (result && result.supported === false && Number(result.category) === -1) {
             const unsupportedMsg =
               String(result.message || "").trim() || "This banner is not supported now in the plugin.";
-            postStatus(`Pipeline (${pi + 1}/${frames.length}): ${unsupportedMsg}`);
+            const runHint = result.run_id ? `\nRun: ${result.run_id}` : "";
+            postStatus(`Pipeline (${pi + 1}/${frames.length}): ${unsupportedMsg}${runHint}`);
             figma.notify(
-              `Not supported now in the plugin.\n${selectedFrame.name}`,
-              { timeout: 4 },
+              `No result created — banner not in the 6 supported campaigns (Qwen class -1).\n` +
+                `${selectedFrame.name}\n` +
+                `Target: ${targetResolution.width}×${targetResolution.height}` +
+                runHint +
+                `\nTry "Layout Transformer V2" for a direct model prediction.`,
+              { timeout: 8 },
             );
             pipelineFail++;
             continue;
           }
 
-          const selectedGuide = result.selected_candidate || {};
-          postStatus(`Pipeline: locating retrieved guide "${selectedGuide.name || "unknown"}" in the current page...`);
-          const lookup = findCandidateFrameInCurrentPage(selectedGuide, result.final_json, selectedFrame);
+          const usedLtFallback =
+            Number(result.category) === -1 &&
+            String(result.message || "").indexOf("layout_transformer_v2") !== -1;
+
+          const sourceFilterReport = filterFinalJsonToSourceElements(result.final_json, selectedFrame);
+          const layoutJson = sourceFilterReport.json;
+          const portraitTypoJsonReport = polishPortraitTypographyInJson(layoutJson, selectedFrame, targetResolution);
+
           let convertedFrame;
           let drawMode;
           let applySummary = null;
-          if (lookup.frame) {
-            postStatus(`Pipeline: cloning retrieved guide frame (${lookup.reason}) and scaling to target size...`);
-            stampOriginalNodeIds(lookup.frame);
-            const cloned = cloneCandidateFrameBesideSelection(
-              lookup.frame,
-              selectedFrame,
-              result.final_json,
-              targetResolution,
-            );
-            convertedFrame = cloned.clone;
-            applyJsonTreeNamesByPath(result.final_json, convertedFrame);
-            removeEmptyZeroSizeNodes(convertedFrame);
-            applySummary = cloned.summary;
-            drawMode = "clone_matched_candidate_frame_scaled";
-          } else {
-            postStatus("Pipeline: guide frame not found locally; drawing backend target JSON fallback...");
-            convertedFrame = await drawJsonTreeBesideSelection(result.final_json, selectedFrame, targetResolution);
-            applyJsonTreeNamesByPath(result.final_json, convertedFrame);
-            removeEmptyZeroSizeNodes(convertedFrame);
-            drawMode = "create_from_returned_json_fallback";
-          }
+          postStatus("Pipeline: drawing backend target JSON beside selection...");
+          convertedFrame = await drawJsonTreeBesideSelection(layoutJson, selectedFrame, targetResolution, sourceContentMap);
+          applyJsonTreeNamesByPath(layoutJson, convertedFrame);
+          removeEmptyZeroSizeNodes(convertedFrame);
+          drawMode = "create_from_backend_final_json";
 
-          const recon = applyFinalJsonCloneReconstruction(result.final_json, convertedFrame);
+          const recon = applyFinalJsonCloneReconstruction(layoutJson, convertedFrame);
           removeEmptyZeroSizeNodes(convertedFrame);
-          applyJsonTreeNamesByPath(result.final_json, convertedFrame);
+          applyJsonTreeNamesByPath(layoutJson, convertedFrame);
           removeEmptyZeroSizeNodes(convertedFrame);
-          const contentReport = await applyFinalJsonContentToClone(result.final_json, convertedFrame, selectedFrame);
-          const namingReport = finalizeSemanticLayerNamesFromJson(result.final_json, convertedFrame);
-          const exactNameReport = applyExactNodeNamesFromJson(result.final_json, convertedFrame);
+          const contentReport = await applyFinalJsonContentToClone(layoutJson, convertedFrame, selectedFrame, sourceContentMap);
+          const namingReport = finalizeSemanticLayerNamesFromJson(layoutJson, convertedFrame);
+          const exactNameReport = applyExactNodeNamesFromJson(layoutJson, convertedFrame);
           removeEmptyZeroSizeNodes(convertedFrame);
+          applyFinalAbsoluteBoundsCorrection(layoutJson, convertedFrame);
+          const finalTextReport = await replaceAllFinalJsonTextNodes(layoutJson, convertedFrame, sourceContentMap);
+          applyFinalAbsoluteBoundsCorrection(layoutJson, convertedFrame);
+          const finalTextStyleReport = await applyAllFinalJsonTextStyles(layoutJson, convertedFrame, sourceContentMap);
+          const portraitTypoFrameReport = await polishPortraitTypographyOnFrame(
+            convertedFrame,
+            layoutJson,
+            targetResolution,
+            sourceContentMap,
+          );
+          const duplicateTextReport = await pruneDuplicateFinalTextNodes(layoutJson, convertedFrame);
+          const sourcePruneReport = pruneFigmaNodesNotInSource(selectedFrame, convertedFrame);
           convertedFrame.name = targetSizeName(targetResolution);
 
           figma.currentPage.selection = [convertedFrame];
@@ -3342,9 +4553,9 @@ figma.ui.onmessage = async (msg) => {
           if (frames.length === 1) {
             figma.notify(
               `Target clone created.\n` +
-                `Qwen class: ${result.category}\n` +
-                `Guide: ${selectedGuide.name || "unknown"}\n` +
-                `Mode: ${drawMode}\n` +
+                `Qwen class: ${result.category}${usedLtFallback ? " (LT v2 fallback)" : ""}\n` +
+                `${usedLtFallback ? "Mode: layout_transformer_v2 direct\n" : `Guide: ${(result.selected_candidate && result.selected_candidate.name) || "unknown"}\n`}` +
+                `Draw: ${drawMode}\n` +
                 `Hierarchy sync: ${recon.hierarchyReport.reparentMoves} · Pruned: ${recon.pruneReport.removed}\n` +
                 `Reorder: ${recon.reorderAfterPrune.moves} + ${recon.reorderAfterStray.moves} · Stamp: ${recon.stampReport.stamped}` +
                 (recon.stampReport.mismatchWarn ? ` (${recon.stampReport.mismatchWarn} count mismatches)` : "") +
@@ -3352,7 +4563,8 @@ figma.ui.onmessage = async (msg) => {
                 `Layout (abs→rel): ${recon.layoutReport.applied} (skipped ${recon.layoutReport.skipped || 0}, json ids ${recon.layoutReport.indexIds}, map ${recon.layoutReport.mapSize})\n` +
                 `Bounds doc-fix: corrected ${recon.boundsFixReport.corrected}, child skips ${recon.boundsFixReport.skippedChildren}\n` +
                 `Empty frames removed: ${recon.emptyReport.removed}\n` +
-                `Content applied: ${contentReport.applied}\n` +
+                `Content applied: ${contentReport.applied} · Final text replaced: ${finalTextReport.replaced} · Final styles: ${finalTextStyleReport.applied} · Text dupes: ${duplicateTextReport.removed}\n` +
+                `Source-only JSON drops: ${sourceFilterReport.removedCount} · Source-only Figma pruned: ${sourcePruneReport.removed}\n` +
                 `Semantic names: ${namingReport.renamed} (id map ${namingReport.mapped}) · Exact final rename: ${exactNameReport.renamed}\n` +
                 `Selected stamped nodes: ${stampedNodeCount}\n` +
                 (applySummary
@@ -3363,7 +4575,7 @@ figma.ui.onmessage = async (msg) => {
           } else {
             figma.notify(
               `Pipeline ${pi + 1}/${frames.length}: clone ready for "${selectedFrame.name}".\n` +
-                `Qwen class: ${result.category} · Mode: ${drawMode} · Content: ${contentReport.applied}`,
+                `Qwen class: ${result.category} · Mode: ${drawMode} · Content: ${contentReport.applied} · Source drops: ${sourceFilterReport.removedCount}`,
               { timeout: 4 },
             );
           }
@@ -3450,23 +4662,40 @@ figma.ui.onmessage = async (msg) => {
           const origin = getOrigin(selectedFrame);
           const rawJson = serializeNode(selectedFrame, origin, "");
           rawJson.templateId = isTransformerV2 ? "figma_plugin_layout_transformer_v2" : "figma_plugin_layout_transformer";
+          const sourceContentMap = attachTargetOrientationToSourceContentMap(
+            collectSourceContentMap(selectedFrame),
+            targetResolution,
+          );
 
           postStatus(
             `${transformerLabel} (${li + 1}/${frames.length}): calling backend ${targetResolution.width}×${targetResolution.height}…`,
           );
           const result = await callLayoutTransformer(backendUrl, rawJson, targetResolution, transformerEndpoint);
-          const finalJson = result.final_json;
+          const sourceFilterReport = filterFinalJsonToSourceElements(result.final_json, selectedFrame);
+          const layoutJson = sourceFilterReport.json;
+          polishPortraitTypographyInJson(layoutJson, selectedFrame, targetResolution);
 
           postStatus(`${transformerLabel}: cloning predicted frame beside selection…`);
           const layoutClone = cloneFrameBesideSource(selectedFrame);
-          applyJsonTreeNamesByPath(finalJson, layoutClone);
-          const recon = applyFinalJsonCloneReconstruction(finalJson, layoutClone);
-          applyJsonTreeNamesByPath(finalJson, layoutClone);
-          const contentReport = await applyFinalJsonContentToClone(finalJson, layoutClone, selectedFrame);
-          applyFinalAbsoluteBoundsCorrection(finalJson, layoutClone);
-          const namingReport = finalizeSemanticLayerNamesFromJson(finalJson, layoutClone);
-          applyExactNodeNamesFromJson(finalJson, layoutClone);
-          applyFinalAbsoluteBoundsCorrection(finalJson, layoutClone);
+          applyJsonTreeNamesByPath(layoutJson, layoutClone);
+          const recon = applyFinalJsonCloneReconstruction(layoutJson, layoutClone);
+          applyJsonTreeNamesByPath(layoutJson, layoutClone);
+          const contentReport = await applyFinalJsonContentToClone(layoutJson, layoutClone, selectedFrame, sourceContentMap);
+          applyFinalAbsoluteBoundsCorrection(layoutJson, layoutClone);
+          const namingReport = finalizeSemanticLayerNamesFromJson(layoutJson, layoutClone);
+          applyExactNodeNamesFromJson(layoutJson, layoutClone);
+          applyFinalAbsoluteBoundsCorrection(layoutJson, layoutClone);
+          const finalTextReport = await replaceAllFinalJsonTextNodes(layoutJson, layoutClone, sourceContentMap);
+          applyFinalAbsoluteBoundsCorrection(layoutJson, layoutClone);
+          const finalTextStyleReport = await applyAllFinalJsonTextStyles(layoutJson, layoutClone, sourceContentMap);
+          const portraitTypoFrameReport = await polishPortraitTypographyOnFrame(
+            layoutClone,
+            layoutJson,
+            targetResolution,
+            sourceContentMap,
+          );
+          const duplicateTextReport = await pruneDuplicateFinalTextNodes(layoutJson, layoutClone);
+          const sourcePruneReport = pruneFigmaNodesNotInSource(selectedFrame, layoutClone);
           layoutClone.name = targetSizeName(targetResolution);
 
           figma.currentPage.selection = [layoutClone];
@@ -3479,7 +4708,8 @@ figma.ui.onmessage = async (msg) => {
                 `Reorder: ${recon.reorderAfterPrune.moves}+${recon.reorderAfterStray.moves} · Stamp: ${recon.stampReport.stamped}` +
                 (recon.stampReport.mismatchWarn ? ` (${recon.stampReport.mismatchWarn} mismatches)` : "") +
                 `\nLayout: ${recon.layoutReport.applied} · Bounds fix: ${recon.boundsFixReport.corrected} · Empty removed: ${recon.emptyReport.removed}\n` +
-                `Text/content: ${contentReport.applied} · Layers renamed: ${namingReport.renamed} (id map ${namingReport.mapped}).`,
+                `Text/content: ${contentReport.applied} · Final text replaced: ${finalTextReport.replaced} · Final styles: ${finalTextStyleReport.applied} · Text dupes: ${duplicateTextReport.removed}\n` +
+                `Source-only JSON drops: ${sourceFilterReport.removedCount} · Source-only Figma pruned: ${sourcePruneReport.removed} · Layers renamed: ${namingReport.renamed} (id map ${namingReport.mapped}).`,
               { timeout: 6 },
             );
           } else {

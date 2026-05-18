@@ -18,6 +18,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+from layout_transformer_v2.src.schema import ALL_ROLES
+
 
 RAW_JSON_DIR = Path("raw_jsons")
 EMBEDDING_DIR = Path("json_embeddings")
@@ -387,6 +389,8 @@ def resize_figma_json_to_resolution(node: dict[str, Any], target_width: float, t
     sx = target_width / source_width if source_width else 1.0
     sy = target_height / source_height if source_height else 1.0
 
+    font_scale = math.sqrt(max(sx * sy, 1e-9))
+
     def scale(n: Any) -> None:
         if not isinstance(n, dict):
             return
@@ -396,6 +400,9 @@ def resize_figma_json_to_resolution(node: dict[str, Any], target_width: float, t
                 val = bounds.get(key)
                 if isinstance(val, int | float):
                     bounds[key] = val * factor
+        if "fontSize" in n and isinstance(n.get("fontSize"), (int, float)):
+            n["fontSize"] = max(1.0, float(n["fontSize"]) * font_scale)
+            n["textAutoResize"] = "NONE"
         for child in n.get("children") or []:
             scale(child)
 
@@ -423,6 +430,28 @@ def _path_map(root: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return mapping
 
 
+def _role_map(root: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    mapping: dict[str, dict[str, Any]] = {}
+    allowed = set(ALL_ROLES)
+
+    for node in _walk(root):
+        if not isinstance(node, dict):
+            continue
+        name = node.get("name")
+        if name not in allowed:
+            continue
+        current = mapping.get(name)
+        if current is None:
+            mapping[name] = node
+            continue
+        current_area = _bounds(current).get("width", 0.0) * _bounds(current).get("height", 0.0)
+        node_area = _bounds(node).get("width", 0.0) * _bounds(node).get("height", 0.0)
+        if node_area > current_area:
+            mapping[name] = node
+
+    return mapping
+
+
 def resize_source_json_using_guide(
     source_frame: dict[str, Any],
     guide_frame: dict[str, Any],
@@ -431,32 +460,46 @@ def resize_source_json_using_guide(
 ) -> dict[str, Any]:
     """
     Return a target JSON whose geometry is proportional to the selected best
-    candidate. Source ids/path/text are overlaid by matching tree position so a
-    Figma plugin clone of the source frame can still resolve nodes by id/path.
+    candidate. Source ids/path/text are overlaid by semantic role first so a
+    Figma plugin clone of the source frame can still resolve nodes by id even
+    when the selected prototype's tree order differs from the source.
     """
     out = resize_figma_json_to_resolution(guide_frame, target_width, target_height)
+    source_by_role = _role_map(source_frame)
+    guide_by_role = _role_map(out)
     source_by_path = _path_map(source_frame)
+    semantic_roles = set(ALL_ROLES)
 
     def walk(node: Any, path: str) -> None:
         if not isinstance(node, dict):
             return
-        source_node = source_by_path.get(path)
+        # Always regenerate paths from the emitted tree. Prototypes can contain
+        # lifted wrappers or hand-authored paths that no longer match child
+        # order; the plugin treats path as a tree address.
+        node["path"] = path
+        role = node.get("name")
+        source_node = (
+            source_by_role.get(role)
+            if role in semantic_roles and guide_by_role.get(role) is node
+            else None
+        )
+        if source_node is None:
+            path_candidate = source_by_path.get(path)
+            if (
+                isinstance(path_candidate, dict)
+                and path_candidate.get("name") == node.get("name")
+                and path_candidate.get("type") == node.get("type")
+            ):
+                source_node = path_candidate
         if isinstance(source_node, dict):
-            # Keep candidate-proportional geometry/name, but make ids/paths/text
+            # Keep candidate-proportional geometry/name/path, but make ids/text
             # correspond to the selected source frame for plugin application.
+            # Path must stay candidate-aligned because plugin fallback passes use
+            # it as a tree address.
             if "id" in source_node:
                 node["id"] = source_node["id"]
-            if "path" in source_node:
-                node["path"] = source_node["path"]
-            elif path:
-                node["path"] = path
             if "characters" in source_node:
                 node["characters"] = source_node["characters"]
-            for key in ("fontSize", "fontName", "textAlignHorizontal", "textAlignVertical"):
-                if key in source_node:
-                    node[key] = source_node[key]
-        elif path:
-            node["path"] = path
         for index, child in enumerate(node.get("children") or []):
             child_path = f"{path}/{index}" if path else str(index)
             walk(child, child_path)

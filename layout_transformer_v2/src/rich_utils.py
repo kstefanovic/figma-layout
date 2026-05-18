@@ -196,3 +196,98 @@ def safe_float(value: Any, default: float = 0.0) -> float:
         return default
     return number if math.isfinite(number) else default
 
+
+def _text_line_count(node: dict[str, Any], bounds: dict[str, float]) -> int:
+    chars = str(node.get("characters") or "")
+    explicit_lines = [line for line in chars.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+    explicit_count = max(1, len(explicit_lines))
+    if "\n" in chars:
+        return explicit_count
+
+    compact = "".join(chars.split())
+    if not compact:
+        return 1
+    width = max(1.0, bounds["width"])
+    height = max(1.0, bounds["height"])
+    aspect = width / height
+    if len(compact) > 70 and aspect > 4.0:
+        return max(1, min(4, round(len(compact) / 55)))
+    if len(compact) > 24 and aspect < 3.0:
+        return max(1, min(4, round(len(compact) / 13)))
+    return explicit_count
+
+
+def _font_fit_factor(role: str | None) -> float:
+    if role == "headline":
+        return 0.72
+    if role == "subheadline_delivery_time":
+        return 0.66
+    if role == "legal_text":
+        return 0.46
+    return 0.70
+
+
+def fit_text_font_to_bounds(node: dict[str, Any], role: str | None = None) -> bool:
+    """Clamp fontSize so multi-line text fits inside its bounds box."""
+    if not is_text_node(node):
+        return False
+    bounds = bounds_of(node)
+    if bounds["width"] <= 0 or bounds["height"] <= 0:
+        return False
+
+    line_count = _text_line_count(node, bounds)
+    height_limited = bounds["height"] / max(1, line_count) * _font_fit_factor(role)
+    chars = str(node.get("characters") or "")
+    longest_line = max((len(line.strip()) for line in chars.splitlines()), default=len(chars.strip()))
+    if longest_line <= 0:
+        width_limited = height_limited
+    else:
+        width_limited = bounds["width"] / max(1, longest_line) * 1.75
+
+    fitted = max(1.0, min(height_limited, width_limited))
+    current = safe_float(node.get("fontSize"), 0.0)
+    if current <= 0:
+        node["fontSize"] = min(128.0, fitted)
+        changed = True
+    else:
+        max_allowed = max(1.0, fitted * 1.08)
+        changed = current > max_allowed
+        if changed:
+            node["fontSize"] = min(128.0, fitted)
+    if changed or node.get("textAutoResize") != "NONE":
+        node["textAutoResize"] = "NONE"
+    return changed
+
+
+def fit_all_text_fonts(frame: dict[str, Any]) -> int:
+    fitted = 0
+    for node in walk_nodes(frame):
+        role = str(node.get("name") or "")
+        if fit_text_font_to_bounds(node, role):
+            fitted += 1
+    return fitted
+
+
+def clamp_text_bounds_to_canvas(frame: dict[str, Any], canvas_w: float, canvas_h: float) -> int:
+    """Keep text boxes inside the banner root so plugin resize does not overflow."""
+    clamped = 0
+    for node in walk_nodes(frame):
+        if not is_text_node(node):
+            continue
+        bounds = bounds_of(node)
+        if bounds["width"] <= 0 or bounds["height"] <= 0:
+            continue
+        x = max(0.0, min(bounds["x"], canvas_w - 1.0))
+        y = max(0.0, min(bounds["y"], canvas_h - 1.0))
+        width = min(bounds["width"], max(1.0, canvas_w - x))
+        height = min(bounds["height"], max(1.0, canvas_h - y))
+        if (
+            abs(x - bounds["x"]) > 0.5
+            or abs(y - bounds["y"]) > 0.5
+            or abs(width - bounds["width"]) > 0.5
+            or abs(height - bounds["height"]) > 0.5
+        ):
+            set_bounds(node, {"x": x, "y": y, "width": width, "height": height})
+            clamped += 1
+    return clamped
+
