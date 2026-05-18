@@ -4763,6 +4763,7 @@ figma.ui.onmessage = async (msg) => {
     const selection = figma.currentPage.selection;
     const frames = collectFrameNodesFromSelection(selection);
     if (frames.length === 0) {
+      figma.ui.postMessage({ type: "pipeline-busy", busy: false });
       postError("Select one or more frames (only FRAME nodes run semantic JSON).");
       sendSelectionInfo();
       return;
@@ -4770,6 +4771,7 @@ figma.ui.onmessage = async (msg) => {
 
     const backendUrl = String(msg.backendUrl || "").trim().replace(/\/+$/, "");
     if (!backendUrl) {
+      figma.ui.postMessage({ type: "pipeline-busy", busy: false });
       postError("Backend URL is empty.");
       return;
     }
@@ -4779,6 +4781,12 @@ figma.ui.onmessage = async (msg) => {
     let semOk = 0;
     let semFail = 0;
 
+    try {
+      figma.ui.postMessage({
+        type: "pipeline-busy",
+        busy: true,
+        overlayMessage: "Building banner + grid + raw JSON and calling backend…",
+      });
     for (let si = 0; si < frames.length; si++) {
       const selectedFrame = frames[si];
       try {
@@ -4922,6 +4930,9 @@ figma.ui.onmessage = async (msg) => {
       postError("All semantic JSON runs failed. See status / JSON panel.");
     } else if (semFail > 0) {
       postError(`${semFail} frame(s) failed; ${semOk} succeeded.`);
+    }
+    } finally {
+      figma.ui.postMessage({ type: "pipeline-busy", busy: false });
     }
     return;
   }

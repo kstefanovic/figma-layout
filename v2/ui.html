@@ -186,14 +186,14 @@
         <button id="pipeline-btn">Banner classify + retrieve + draw beside (1+ frames)</button>
       </div>
 
-    <div class="row">
-      <button id="layout-transformer-btn" type="button">
+    <div class="row" hidden aria-hidden="true">
+      <button id="layout-transformer-btn" type="button" hidden tabindex="-1">
         Layout Transformer — semantic JSON + target size → clone beside frame (1+ frames)
       </button>
     </div>
 
-    <div class="row">
-      <button id="layout-transformer-v2-btn" type="button">
+    <div class="row" hidden aria-hidden="true">
+      <button id="layout-transformer-v2-btn" type="button" hidden tabindex="-1">
         Layout Transformer V2 — 3-model rich semantic JSON → clone beside frame (1+ frames)
       </button>
     </div>
@@ -269,12 +269,21 @@ Select one or more frames, then click “JSON to HTML/CSS Exporter”. Each fram
 
       const pipelineOverlayEl = document.getElementById("pipeline-overlay");
 
-      function setPipelineLoading(on) {
+      function setPipelineLoading(on, overlayMessage) {
         const busy = !!on;
         if (pipelineOverlayEl) pipelineOverlayEl.hidden = !busy;
+        const overlayTextEl = pipelineOverlayEl
+          ? pipelineOverlayEl.querySelector(".pipeline-overlay-text")
+          : null;
+        if (overlayTextEl) {
+          overlayTextEl.textContent =
+            overlayMessage || "Calling backend…";
+        }
         if (pipelineBtn) pipelineBtn.disabled = busy;
         if (layoutTransformerBtn) layoutTransformerBtn.disabled = busy;
         if (layoutTransformerV2Btn) layoutTransformerV2Btn.disabled = busy;
+        if (semanticJsonBtn) semanticJsonBtn.disabled = busy;
+        if (htmlExportBtn) htmlExportBtn.disabled = busy;
       }
 
       function setSelectedFrameInfo(info) {
@@ -364,6 +373,7 @@ Select one or more frames, then click “JSON to HTML/CSS Exporter”. Each fram
         );
         semanticMaxTokensEl.value = String(mt);
         setStatus("Building banner + grid + raw JSON and calling backend…");
+        setPipelineLoading(true, "Building banner + grid + raw JSON and calling backend…");
         semanticJsonResultEl.value = "…";
         parent.postMessage(
           {
@@ -413,7 +423,7 @@ Select one or more frames, then click “JSON to HTML/CSS Exporter”. Each fram
         document.getElementById("target-size").value = targetSize;
 
         setStatus("Preparing classify → retrieve → draw pipeline...");
-        setPipelineLoading(true);
+        setPipelineLoading(true, "Classifying banner and drawing layout…");
 
         parent.postMessage(
           {
@@ -562,12 +572,14 @@ Select one or more frames, then click “JSON to HTML/CSS Exporter”. Each fram
         }
 
         if (msg.type === "pipeline-busy") {
-          setPipelineLoading(!!msg.busy);
+          setPipelineLoading(!!msg.busy, msg.overlayMessage);
         } else if (msg.type === "status") {
           setStatus(msg.message);
         } else if (msg.type === "error") {
+          setPipelineLoading(false);
           setStatus("Error: " + msg.message);
         } else if (msg.type === "done") {
+          setPipelineLoading(false);
           setStatus("Done.");
         } else if (msg.type === "selection-info") {
           setSelectedFrameInfo(msg.selection);

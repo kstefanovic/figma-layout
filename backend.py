@@ -33,6 +33,22 @@ from figma_semantic import (
     parse_names_object,
     raw_fig_tree_to_mid_blocks,
 )
+from figma_semantic_strict import (
+    STRICT_QWEN_SYSTEM_PROMPT,
+    assert_rich_metadata_preserved,
+    build_qwen_ambiguous_payload,
+    build_qwen_ambiguous_user_text,
+    build_semantic_json_from_strict_names,
+    extract_node_features,
+    run_strict_semantic_naming,
+)
+from figma_semantic_strict import (
+    STRICT_QWEN_SYSTEM_PROMPT,
+    assert_rich_metadata_preserved,
+    build_qwen_ambiguous_user_text,
+    build_semantic_json_from_strict_names,
+    run_strict_semantic_naming,
+)
 from json_embedding import (
     MAX_CLASS_NUMBER,
     MIN_CLASS_NUMBER,
@@ -83,6 +99,12 @@ FIGMA_BANNER_PIPELINE_RUNS_DIR = Path(
 FIGMA_SEMANTIC_BANNER_MAX_EDGE = int(os.getenv("FIGMA_SEMANTIC_BANNER_MAX_EDGE", "1024"))
 FIGMA_SEMANTIC_GRID_MAX_EDGE = int(os.getenv("FIGMA_SEMANTIC_GRID_MAX_EDGE", "1024"))
 # When false (0/no/false), skip writing per-request run folders (faster I/O; no artifacts for debugging).
+FIGMA_SEMANTIC_STRICT_MODE = os.getenv("FIGMA_SEMANTIC_STRICT_MODE", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
 FIGMA_SEMANTIC_PERSIST_RUNS = os.getenv("FIGMA_SEMANTIC_PERSIST_RUNS", "1").strip().lower() not in (
     "0",
     "false",
@@ -204,6 +226,10 @@ class FigmaConvertSemanticResponse(BaseModel):
 
     semantic_json: Any
     warnings: list[str] = Field(default_factory=list)
+    semantic_debug: dict[str, Any] | None = Field(
+        default=None,
+        description="Strict namer debug: prelabel, qwen, conflicts, validator (when FIGMA_SEMANTIC_STRICT_MODE=1)",
+    )
 
 
 class BannerCategoryResponse(BaseModel):
@@ -2152,39 +2178,85 @@ async def figma_convert_semantic_json(
     banner_uri = _data_uri(banner_model_bytes, banner_mime)
     grid_uri = _data_uri(grid_model_bytes, grid_mime)
 
-    required_ids = sorted(collect_allowed_ids_from_mid(mid_blocks))
-    vlm_layout_payload = {"mid": mid_blocks, "required_node_ids": required_ids}
-    layout_text = json.dumps(vlm_layout_payload, ensure_ascii=False, separators=(",", ":"))
-    user_text = (
-        FIGMA_CONVERT_PROMPT
-        + "\n\nLayout JSON (mid + required_node_ids; no full raw tree):\n"
-        + layout_text
-    )
-
-    user_content: list[ContentItem] = [
-        ContentItem(type="image", image=banner_uri),
-        ContentItem(type="image", image=grid_uri),
-        ContentItem(type="text", text=user_text),
-    ]
-    semantic_messages = [
-        ChatMessage(role="system", content=FIGMA_CONVERT_SYSTEM_PROMPT),
-        ChatMessage(role="user", content=user_content),
-    ]
-    semantic_payload = {
-        "messages": [m.model_dump(exclude_none=True) for m in semantic_messages],
-        "max_new_tokens": max_new_tokens,
-    }
-
+    semantic_debug: dict[str, Any] | None = None
     response_text = ""
     semantic_json: Any = None
+
     try:
-        result = _call_model(
-            semantic_payload,
-            timeout=FIGMA_CONVERT_TIMEOUT,
-        )
-        response_text = result.get("response", "")
-        parsed = extract_first_json_value(response_text)
-        semantic_json = normalize_convert_semantic_output(parsed, mid_blocks, warnings)
+        if FIGMA_SEMANTIC_STRICT_MODE:
+            strict_pre = run_strict_semantic_naming(mid_blocks)
+            semantic_debug = strict_pre.semantic_debug
+            qwen_names: dict[str, str] = {}
+            ambiguous_ids = strict_pre.ambiguous_ids
+
+            if ambiguous_ids:
+                features = extract_node_features(mid_blocks)
+                ambiguous_nodes = build_qwen_ambiguous_payload(
+                    mid_blocks,
+                    features,
+                    strict_pre.semantic_debug["prelabel_roles"],
+                    ambiguous_ids,
+                )
+                user_text = build_qwen_ambiguous_user_text(ambiguous_nodes)
+                user_content: list[ContentItem] = [
+                    ContentItem(type="image", image=banner_uri),
+                    ContentItem(type="image", image=grid_uri),
+                    ContentItem(type="text", text=user_text),
+                ]
+                semantic_messages = [
+                    ChatMessage(role="system", content=STRICT_QWEN_SYSTEM_PROMPT),
+                    ChatMessage(role="user", content=user_content),
+                ]
+                semantic_payload = {
+                    "messages": [m.model_dump(exclude_none=True) for m in semantic_messages],
+                    "max_new_tokens": max_new_tokens,
+                }
+                result = _call_model(semantic_payload, timeout=FIGMA_CONVERT_TIMEOUT)
+                response_text = result.get("response", "")
+                qwen_names = parse_names_object(response_text)
+                warnings.append(f"strict_qwen_ambiguous:{len(ambiguous_ids)} nodes")
+
+            strict_final = run_strict_semantic_naming(mid_blocks, qwen_names=qwen_names or None)
+            semantic_debug = strict_final.semantic_debug
+            semantic_json = build_semantic_json_from_strict_names(
+                mid_blocks, strict_final.names, warnings
+            )
+            meta_warnings = assert_rich_metadata_preserved(mid_blocks, semantic_json)
+            warnings.extend(meta_warnings)
+            if strict_final.validation.errors:
+                warnings.append(
+                    "strict_validator_errors:" + json.dumps(strict_final.validation.errors, ensure_ascii=False)
+                )
+        else:
+            required_ids = sorted(collect_allowed_ids_from_mid(mid_blocks))
+            vlm_layout_payload = {"mid": mid_blocks, "required_node_ids": required_ids}
+            layout_text = json.dumps(vlm_layout_payload, ensure_ascii=False, separators=(",", ":"))
+            user_text = (
+                FIGMA_CONVERT_PROMPT
+                + "\n\nLayout JSON (mid + required_node_ids; no full raw tree):\n"
+                + layout_text
+            )
+
+            user_content = [
+                ContentItem(type="image", image=banner_uri),
+                ContentItem(type="image", image=grid_uri),
+                ContentItem(type="text", text=user_text),
+            ]
+            semantic_messages = [
+                ChatMessage(role="system", content=FIGMA_CONVERT_SYSTEM_PROMPT),
+                ChatMessage(role="user", content=user_content),
+            ]
+            semantic_payload = {
+                "messages": [m.model_dump(exclude_none=True) for m in semantic_messages],
+                "max_new_tokens": max_new_tokens,
+            }
+            result = _call_model(
+                semantic_payload,
+                timeout=FIGMA_CONVERT_TIMEOUT,
+            )
+            response_text = result.get("response", "")
+            parsed = extract_first_json_value(response_text)
+            semantic_json = normalize_convert_semantic_output(parsed, mid_blocks, warnings)
     except HTTPException as he:
         if meta_base is not None:
             try:
@@ -2244,7 +2316,11 @@ async def figma_convert_semantic_json(
         except OSError as exc:
             warnings.append(f"Run output not written to {run_dir}: {exc}")
 
-    return FigmaConvertSemanticResponse(semantic_json=semantic_json, warnings=warnings)
+    return FigmaConvertSemanticResponse(
+        semantic_json=semantic_json,
+        warnings=warnings,
+        semantic_debug=semantic_debug,
+    )
 
 
 if FRONTEND_DIR.is_dir():
