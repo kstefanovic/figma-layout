@@ -6,9 +6,9 @@
   "ui": "ui.html",
   "editorType": ["figma"],
   "networkAccess": {
-    "allowedDomains": ["https://theye-inference.onrender.com"],
+    "allowedDomains": ["https://ml.geex.agent"],
     "devAllowedDomains": [
-      "http://localhost:20401"
+      "http://localhost:20001"
     ]
   }
 }

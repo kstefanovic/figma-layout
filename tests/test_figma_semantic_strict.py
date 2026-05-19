@@ -168,11 +168,14 @@ class TestFigmaSemanticStrict(unittest.TestCase):
         features = extract_node_features(mid)
         names = {"root": "banner_root", "wrap": "decoration_group", "hero": "unassigned"}
         resolved, fixes = resolve_role_conflicts(mid, features, names)
-        self.assertEqual(resolved["wrap"], "hero_image")
-        self.assertEqual(resolved["hero"], "unassigned")
+        self.assertEqual(resolved["hero"], "hero_image")
+        self.assertNotEqual(resolved.get("wrap"), "hero_image")
         self.assertTrue(
-            any(f["reason"] in ("hero_wrapper_is_hero", "hero_inner_image_leaf", "promote_largest_hero") for f in fixes)
+            any(f["reason"] in ("hero_on_image_leaf", "promote_largest_hero") for f in fixes)
         )
+        final = run_strict_semantic_naming(mid)
+        self.assertEqual(final.names["hero"], "hero_image")
+        self.assertEqual(final.names["wrap"], "unassigned")
 
     def test_hero_mislabeled_unassigned_gets_fixed(self) -> None:
         root = _frame()
@@ -243,6 +246,33 @@ class TestFigmaSemanticStrict(unittest.TestCase):
         self.assertIsNotNone(hl_node)
         self.assertEqual(hl_node.get("fontSize"), 72)
         self.assertTrue(hl_node.get("characters"))
+
+    def test_hero_image_on_image_leaf_not_wrapper(self) -> None:
+        """Product photo group with grey plate + image rect → hero_image on image child only."""
+        root = _frame(1080, 450)
+        hero_grp = {
+            "id": "hgrp",
+            "type": "group",
+            "bounds": {"x": 601, "y": 0, "width": 479, "height": 450},
+            "fills": [],
+            "mid_parent_ids": ["root"],
+            "mid_child_ids": ["plate", "photo"],
+        }
+        plate = _rect("plate", 601, 0, 479, 450, [{"type": "SOLID", "color": {"r": 0.85, "g": 0.85, "b": 0.85}}], ["root", "hgrp"])
+        photo = _rect(
+            "photo",
+            460,
+            -400,
+            800,
+            970,
+            [{"type": "IMAGE", "imageHash": "abc", "scaleMode": "FILL"}],
+            ["root", "hgrp"],
+        )
+        root["mid_child_ids"] = ["hgrp"]
+        mid = [root, hero_grp, plate, photo]
+        result = run_strict_semantic_naming(mid)
+        self.assertEqual(result.names["photo"], "hero_image")
+        self.assertEqual(result.names["hgrp"], "unassigned")
 
     def test_brand_row_logo_and_wordmarks_by_position(self) -> None:
         """Lavka-style row: word parts left of logo; logo_back/logo_fore inside logo boolean."""

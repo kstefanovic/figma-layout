@@ -2749,6 +2749,26 @@ async function loadJsonFontName(fontName) {
   }
 }
 
+/** Generate pipeline: headline always uses the boldest available style for the JSON font family. */
+const HEADLINE_BOLD_STYLE_CANDIDATES = ["Black", "Bold", "Heavy", "Extra Bold", "Demi Bold", "Semi Bold"];
+
+async function loadHeadlineBoldFontName(fontName) {
+  const family =
+    fontName && typeof fontName === "object" && fontName.family
+      ? String(fontName.family)
+      : "YS Geo";
+  for (const style of HEADLINE_BOLD_STYLE_CANDIDATES) {
+    const candidate = { family, style };
+    try {
+      await figma.loadFontAsync(candidate);
+      return candidate;
+    } catch (_e) {
+      /* try next weight */
+    }
+  }
+  return loadJsonFontName(fontName || { family, style: "Bold" });
+}
+
 function applyJsonPropertyIfPresent(node, item, key) {
   if (!node || !item || !(key in item) || !(key in node)) return false;
   const value = jsonSafeValue(item[key]);
@@ -2841,13 +2861,29 @@ async function applyFinalJsonTextStyle(node, item, parentJsonNode, sourceContent
   let loadedJsonFontName = null;
   await loadAllFontsForTextNode(node, role);
   if (item.fontName && typeof item.fontName === "object" && item.fontName.family && item.fontName.style) {
-    const fontName = { family: String(item.fontName.family), style: String(item.fontName.style) };
-    try {
-      await figma.loadFontAsync(fontName);
-      node.fontName = fontName;
-      loadedJsonFontName = fontName;
-    } catch (e) {
-      console.warn("[TEXT_JSON_FONT_LOAD_FAILED]", role, fontName, e);
+    const fontName =
+      role === "headline"
+        ? await loadHeadlineBoldFontName(item.fontName)
+        : { family: String(item.fontName.family), style: String(item.fontName.style) };
+    if (fontName) {
+      try {
+        await figma.loadFontAsync(fontName);
+        node.fontName = fontName;
+        loadedJsonFontName = fontName;
+      } catch (e) {
+        console.warn("[TEXT_JSON_FONT_LOAD_FAILED]", role, fontName, e);
+      }
+    }
+  } else if (role === "headline") {
+    const fontName = await loadHeadlineBoldFontName(null);
+    if (fontName) {
+      try {
+        await figma.loadFontAsync(fontName);
+        node.fontName = fontName;
+        loadedJsonFontName = fontName;
+      } catch (e) {
+        console.warn("[TEXT_HEADLINE_BOLD_FONT_FAILED]", role, fontName, e);
+      }
     }
   }
 
@@ -2921,6 +2957,19 @@ async function applyFinalJsonTextStyle(node, item, parentJsonNode, sourceContent
       node.textAutoResize = requestedAutoResize;
     } catch (_e) {
       /* textAutoResize is best-effort across text node variants */
+    }
+  }
+
+  if (role === "headline") {
+    const boldFont = await loadHeadlineBoldFontName(loadedJsonFontName || item.fontName);
+    if (boldFont) {
+      try {
+        await figma.loadFontAsync(boldFont);
+        node.fontName = boldFont;
+        applyUniformTextRangeValue(node, "setRangeFontName", "FONT_NAME", boldFont, role);
+      } catch (e) {
+        console.warn("[TEXT_HEADLINE_BOLD_FONT_FAILED]", role, boldFont, e);
+      }
     }
   }
 
@@ -3629,10 +3678,13 @@ async function replaceAllFinalJsonTextNodes(finalJson, convertedFrame, sourceCon
     }
 
     const role = semanticRoleName(item);
-    const jsonFontName = item.fontName && typeof item.fontName === "object" && item.fontName.family && item.fontName.style
-      ? { family: String(item.fontName.family), style: String(item.fontName.style) }
-      : { family: "Inter", style: "Regular" };
-    let creationFontName = jsonFontName;
+    const jsonFontName =
+      role === "headline"
+        ? await loadHeadlineBoldFontName(item.fontName)
+        : item.fontName && typeof item.fontName === "object" && item.fontName.family && item.fontName.style
+          ? { family: String(item.fontName.family), style: String(item.fontName.style) }
+          : { family: "Inter", style: "Regular" };
+    let creationFontName = jsonFontName || { family: "Inter", style: "Regular" };
     try {
       await figma.loadFontAsync(jsonFontName);
     } catch (e) {
@@ -4785,7 +4837,7 @@ figma.ui.onmessage = async (msg) => {
       figma.ui.postMessage({
         type: "pipeline-busy",
         busy: true,
-        overlayMessage: "Building banner + grid + raw JSON and calling backend…",
+        overlayMessage: "Calling backend…",
       });
     for (let si = 0; si < frames.length; si++) {
       const selectedFrame = frames[si];

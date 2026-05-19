@@ -231,6 +231,35 @@ def _has_solid_fill(row: dict[str, Any]) -> bool:
     )
 
 
+def _is_hero_image_leaf(row: dict[str, Any], feat: dict[str, Any]) -> bool:
+    if feat.get("imageHash"):
+        return True
+    if feat.get("has_image_fill") and _norm_type(row) in ("rectangle", "vector"):
+        return True
+    return False
+
+
+def _find_hero_image_leaf_in_subtree(
+    root_id: str,
+    mid_by_id: dict[str, dict[str, Any]],
+    features: dict[str, dict[str, Any]],
+) -> str | None:
+    best_id: str | None = None
+    best_area = -1.0
+    for desc in _mid_descendant_ids(root_id, mid_by_id):
+        if desc == root_id:
+            continue
+        row = mid_by_id.get(desc)
+        feat = features.get(desc)
+        if not row or not feat or not _is_hero_image_leaf(row, feat):
+            continue
+        area = float(feat.get("area") or 0)
+        if area > best_area:
+            best_area = area
+            best_id = desc
+    return best_id
+
+
 def _mid_has_image_descendant(
     mid_by_id: dict[str, dict[str, Any]],
     features: dict[str, dict[str, Any]],
@@ -744,30 +773,6 @@ def resolve_role_conflicts(
         if img_nodes:
             _fix(img_nodes[0][1], "hero_image", "promote_largest_image_hash")
 
-    # Product photo wrapper (instance/frame/group) with one large image child → wrapper is hero_image
-    for sid, row in mid_by_id.items():
-        if sid not in mid_by_id:
-            continue
-        parent_role = out.get(sid, "")
-        if parent_role in ("banner_root", "brand_group", "headline_group", "offer_group"):
-            continue
-        typ = _norm_type(row)
-        if parent_role not in ("unassigned", "background_shape") and typ not in ("instance", "frame", "group"):
-            continue
-        child_ids = [str(c) for c in (features.get(sid, {}).get("mid_child_ids") or []) if str(c) in mid_by_id]
-        if len(child_ids) != 1:
-            continue
-        cid = child_ids[0]
-        cf = features.get(cid, {})
-        if not (cf.get("has_image_fill") or cf.get("imageHash")):
-            continue
-        if not cf.get("is_large") and not cf.get("imageHash"):
-            continue
-        if out.get(cid) == "hero_image" or parent_role in ("unassigned", "background_shape"):
-            _fix(sid, "hero_image", "hero_wrapper_is_hero")
-            if out.get(cid) == "hero_image":
-                _fix(cid, "unassigned", "hero_inner_image_leaf")
-
     # background_shape: best solid color plate (not hero instance wrappers or gradients)
     frame_w, _frame_h, _frame_area = _frame_metrics(mid_blocks)
     bg_candidates: list[tuple[float, str]] = []
@@ -876,18 +881,18 @@ def resolve_role_conflicts(
         if out.get(sid) == "background_shape":
             _fix(sid, "star_decoration_2", "tiny_not_background")
 
-    out, fixes = assign_hero_wrapper_roles(mid_blocks, features, out, fixes)
+    out, fixes = place_hero_image_on_leaves(mid_blocks, features, out, fixes)
 
     return out, fixes
 
 
-def assign_hero_wrapper_roles(
+def place_hero_image_on_leaves(
     mid_blocks: list[dict[str, Any]],
     features: dict[str, dict[str, Any]],
     names: dict[str, str],
     fixes: list[dict[str, str]],
 ) -> tuple[dict[str, str], list[dict[str, str]]]:
-    """Ensure hero photo wrappers are ``hero_image``, not ``unassigned`` parents of ``hero_image``."""
+    """Keep ``hero_image`` on the image-bearing leaf (imageHash / image fill), not group wrappers."""
     out = dict(names)
     mid_by_id = {str(b["id"]): b for b in mid_blocks if isinstance(b, dict) and b.get("id") is not None}
 
@@ -897,30 +902,19 @@ def assign_hero_wrapper_roles(
             out[sid] = new
             fixes.append({"id": sid, "old": old, "new": new, "reason": reason})
 
-    heroes = [sid for sid, role in out.items() if role == "hero_image"]
-    for hid in heroes:
-        parents = features.get(hid, {}).get("mid_parent_ids") or []
-        if not parents:
+    for sid, role in list(out.items()):
+        if role != "hero_image":
             continue
-        pid = str(parents[-1])
-        if pid not in mid_by_id or out.get(pid) == "banner_root":
+        row = mid_by_id.get(sid, {})
+        feat = features.get(sid, {})
+        if not row or not feat:
             continue
-        if out.get(pid) == "unassigned":
-            _fix(pid, "hero_image", "hero_parent_unassigned")
-            _fix(hid, "unassigned", "hero_inner_leaf")
-
-    for sid, row in mid_by_id.items():
-        if out.get(sid) == "banner_root":
+        if _is_hero_image_leaf(row, feat):
             continue
-        child_ids = [str(c) for c in (row.get("mid_child_ids") or []) if str(c) in mid_by_id]
-        if len(child_ids) != 1:
-            continue
-        cid = child_ids[0]
-        if out.get(cid) != "hero_image":
-            continue
-        if out.get(sid) in ("unassigned", "background_shape"):
-            _fix(sid, "hero_image", "hero_wrapper_is_hero")
-            _fix(cid, "unassigned", "hero_inner_leaf")
+        leaf = _find_hero_image_leaf_in_subtree(sid, mid_by_id, features)
+        if leaf:
+            _fix(sid, "unassigned", "hero_demote_wrapper")
+            _fix(leaf, "hero_image", "hero_on_image_leaf")
 
     return out, fixes
 
@@ -1264,14 +1258,17 @@ def validate_and_autofix_roles(
     for sid, role in list(out.items()):
         if role != "hero_image":
             continue
-        parents = features.get(sid, {}).get("mid_parent_ids") or []
-        if not parents:
+        row = mid_by_id.get(sid, {})
+        feat = features.get(sid, {})
+        if not row or not feat:
             continue
-        pid = str(parents[-1])
-        if out.get(pid) == "unassigned":
-            _autofix(pid, "hero_image", "validator_hero_wrapper_unassigned")
-            _autofix(sid, "unassigned", "validator_hero_inner_leaf")
-            result.warnings.append(f"validator:hero_inside_unassigned_autofixed:{pid}:{sid}")
+        if _is_hero_image_leaf(row, feat):
+            continue
+        leaf = _find_hero_image_leaf_in_subtree(sid, mid_by_id, features)
+        if leaf:
+            _autofix(sid, "unassigned", "validator_hero_demote_wrapper")
+            _autofix(leaf, "hero_image", "validator_hero_on_image_leaf")
+            result.warnings.append(f"validator:hero_moved_to_image_leaf:{sid}->{leaf}")
 
     return out, result
 
@@ -1358,7 +1355,7 @@ def run_strict_semantic_naming(
     final_names, validation = validate_and_autofix_roles(mid_blocks, features, resolved)
 
     debug = {
-        "brand_row_pass": "v2",
+        "brand_row_pass": "v3",
         "prelabel_roles": {k: prelabel[k] for k in sorted(prelabel)},
         "qwen_roles": qwen_applied,
         "normalized_roles": {k: normalized[k] for k in sorted(normalized)},

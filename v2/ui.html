@@ -166,15 +166,7 @@
 
     <div class="row">
       <label for="backend-url">Backend URL</label>
-      <input id="backend-url" value="http://localhost:20401" />
-      <p style="font-size: 11px; color: #666; margin: 6px 0 0; line-height: 1.4">
-        Figma only allows origins listed in <code>v2/manifest.json</code> →
-        <code>networkAccess.devAllowedDomains</code> (exact match: scheme, host, port). Use
-        <code>http://localhost:20401</code> here if that is what the manifest lists — typing
-        <code>127.0.0.1</code> instead will fail fetch. For a backend on another host, add that exact
-        <code>http://…</code> URL to the manifest (some patterns are rejected on plugin import).
-        Reload the development plugin after changing the manifest.
-      </p>
+      <input id="backend-url" value="http://localhost:20001" />
     </div>
 
     <div class="row">
@@ -183,7 +175,7 @@
     </div>
 
       <div class="row">
-        <button id="pipeline-btn">Banner classify + retrieve + draw beside (1+ frames)</button>
+        <button id="pipeline-btn">Generate</button>
       </div>
 
     <div class="row" hidden aria-hidden="true">
@@ -206,7 +198,7 @@
 
       <div class="row">
         <button id="semantic-json-btn" type="button">
-          Banner + grid PNG + raw JSON → semantic JSON (Qwen), 1+ frames sequential
+          Senmantic namer
         </button>
       </div>
 
@@ -224,7 +216,7 @@ Select one or more frames, then run “Banner + grid PNG + raw JSON → semantic
 
     <div class="row">
       <button id="html-export-btn" type="button">
-        JSON to HTML/CSS Exporter (1+ frames sequential)
+        HTML/CSS Exporter
       </button>
     </div>
 
@@ -372,8 +364,8 @@ Select one or more frames, then click “JSON to HTML/CSS Exporter”. Each fram
           Math.max(256, parseInt(String(semanticMaxTokensEl.value), 10) || 2048),
         );
         semanticMaxTokensEl.value = String(mt);
-        setStatus("Building banner + grid + raw JSON and calling backend…");
-        setPipelineLoading(true, "Building banner + grid + raw JSON and calling backend…");
+        setStatus("Calling backend…");
+        setPipelineLoading(true, "Calling backend…");
         semanticJsonResultEl.value = "…";
         parent.postMessage(
           {
@@ -423,7 +415,7 @@ Select one or more frames, then click “JSON to HTML/CSS Exporter”. Each fram
         document.getElementById("target-size").value = targetSize;
 
         setStatus("Preparing classify → retrieve → draw pipeline...");
-        setPipelineLoading(true, "Classifying banner and drawing layout…");
+        setPipelineLoading(true, "Calling backend…");
 
         parent.postMessage(
           {
