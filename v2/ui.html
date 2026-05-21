@@ -166,7 +166,7 @@
 
     <div class="row">
       <label for="backend-url">Backend URL</label>
-      <input id="backend-url" value="http://localhost:20001" />
+      <input id="backend-url" value="https://ml.geex.agency/lium" />
     </div>
 
     <div class="row">
@@ -506,7 +506,38 @@ Select one or more frames, then click “JSON to HTML/CSS Exporter”. Each fram
               "*",
             );
           };
+          const replyData = (data) => {
+            const text = JSON.stringify(data);
+            const maxChunk = 64000;
+            if (text.length <= maxChunk) {
+              reply({ ok: true, data, error: null });
+              return;
+            }
+            const total = Math.ceil(text.length / maxChunk);
+            for (let index = 0; index < total; index++) {
+              parent.postMessage(
+                {
+                  pluginMessage: {
+                    type: "semantic-json-fetch-result-chunk",
+                    id: mid,
+                    index,
+                    total,
+                    chunk: text.slice(index * maxChunk, (index + 1) * maxChunk),
+                  },
+                },
+                "*",
+              );
+            }
+            reply({ ok: true, data: null, chunked: true, error: null });
+          };
+          const reportFetchStatus = (message) => {
+            parent.postMessage(
+              { pluginMessage: { type: "semantic-json-fetch-status", id: mid, message } },
+              "*",
+            );
+          };
           (async () => {
+            let endpoint = "";
             try {
               const b64ToU8 = (b64) => {
                 const bin = atob(String(b64 || ""));
@@ -528,8 +559,27 @@ Select one or more frames, then click “JSON to HTML/CSS Exporter”. Each fram
               const base = String(msg.backendUrl || "")
                 .trim()
                 .replace(/\/+$/, "");
-              const res = await fetch(base + "/figma/convert-semantic-json", { method: "POST", body: fd });
+              endpoint = base + "/figma/convert-semantic-json";
+              reportFetchStatus("Semantic JSON: POST " + endpoint);
+              const res = await fetch(endpoint, {
+                method: "POST",
+                body: fd,
+                mode: "cors",
+                credentials: "omit",
+                redirect: "follow",
+              });
               const text = await res.text();
+              reportFetchStatus(
+                "Semantic JSON: HTTP " +
+                  String(res.status) +
+                  " " +
+                  String(res.statusText || "") +
+                  " from " +
+                  String(res.url || endpoint) +
+                  " (" +
+                  String(text.length) +
+                  " chars)",
+              );
               let body = null;
               try {
                 body = text ? JSON.parse(text) : null;
@@ -550,13 +600,18 @@ Select one or more frames, then click “JSON to HTML/CSS Exporter”. Each fram
                 reply({ ok: false, data: null, error: "Backend response missing semantic_json." });
                 return;
               }
-              reply({ ok: true, data: body, error: null });
+              replyData({
+                semantic_json: body.semantic_json,
+                warnings: Array.isArray(body.warnings) ? body.warnings : [],
+              });
             } catch (e) {
               let detail = e && e.message ? e.message : String(e);
               if (detail === "Failed to fetch") {
                 detail +=
                   " Figma only allows origins in manifest.json networkAccess (devAllowedDomains / allowedDomains). Match Backend URL exactly and reload the plugin.";
               }
+              if (endpoint) detail += " URL: " + endpoint;
+              reportFetchStatus("Semantic JSON fetch failed: " + detail);
               reply({ ok: false, data: null, error: detail });
             }
           })();

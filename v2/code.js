@@ -805,6 +805,29 @@ function hasImageFill(node) {
   return fills.some((fill) => fill && fill.type === "IMAGE");
 }
 
+function hasGradientFill(node) {
+  const fills = node && Array.isArray(node.fills) ? node.fills : [];
+  return fills.some((fill) => fill && String(fill.type || "").indexOf("GRADIENT_") === 0);
+}
+
+function sourceFrameHasGradient(sourceFrame) {
+  let found = false;
+
+  function walk(node) {
+    if (!node || found) return;
+    if (hasGradientFill(node) || /^background_gradient_/.test(String(node.name || "").trim())) {
+      found = true;
+      return;
+    }
+    if ("children" in node && Array.isArray(node.children)) {
+      for (const child of node.children) walk(child);
+    }
+  }
+
+  walk(sourceFrame);
+  return found;
+}
+
 function collectSourceContentMap(sourceFrame) {
   const textByRole = new Map();
   const textById = new Map();
@@ -907,6 +930,7 @@ const LOGO_PART_ROLES = new Set(["logo_back", "logo_fore"]);
 function collectSourceElementIndex(sourceFrame) {
   const ids = new Set();
   const roles = new Set();
+  let hasGradient = false;
 
   function pluginData(node, key) {
     try {
@@ -918,6 +942,7 @@ function collectSourceElementIndex(sourceFrame) {
 
   function walk(node) {
     if (!node) return;
+    if (hasGradientFill(node)) hasGradient = true;
     const id = String(node.id || "").trim();
     if (id) ids.add(id);
     const storedId = String(pluginData(node, "originalNodeId") || "").trim();
@@ -933,7 +958,7 @@ function collectSourceElementIndex(sourceFrame) {
   }
 
   walk(sourceFrame);
-  return { ids, roles };
+  return { ids, roles, hasGradient };
 }
 
 function jsonItemAllowedInSource(item, sourceIndex) {
@@ -943,6 +968,7 @@ function jsonItemAllowedInSource(item, sourceIndex) {
   const role = semanticRoleName(item);
   if (!role) return false;
   if (sourceIndex.roles.has(role)) return true;
+  if (sourceIndex.hasGradient && /^background_gradient_/.test(role)) return true;
   if (LOGO_PART_ROLES.has(role) && sourceIndex.roles.has("logo")) return true;
   return false;
 }
@@ -1044,6 +1070,93 @@ function countTextLines(characters) {
   return Math.max(1, parts.length);
 }
 
+function estimateWrappedTextLines(characters, fontSize, boxWidth, role) {
+  const text = String(characters == null ? "" : characters);
+  const explicitLines = text.split(/\r\n|\n|\u2028|\u2029|\u000b|\u000c|\u0085/);
+  const explicitLineCount = Math.max(1, explicitLines.length);
+  const longest = explicitLines.reduce((max, line) => Math.max(max, line.length), 0);
+  if (!longest || !fontSize || !boxWidth) return explicitLineCount;
+  const avgCharWidth = role === "headline" ? 0.54 : 0.48;
+  const estimated = Math.ceil((longest * fontSize * avgCharWidth) / Math.max(1, boxWidth));
+  return Math.max(explicitLineCount, estimated);
+}
+
+function singleLineText(value) {
+  return String(value == null ? "" : value).replace(/[\r\n\u2028\u2029\u000b\u000c\u0085]+/g, "");
+}
+
+function estimatedSingleLineTextWidth(node) {
+  const chars = String(node && node.characters ? node.characters : "");
+  const fontSize = typeof node.fontSize === "number" && Number.isFinite(node.fontSize) ? node.fontSize : 16;
+  const letterSpacing =
+    node &&
+    node.letterSpacing &&
+    typeof node.letterSpacing === "object" &&
+    node.letterSpacing.unit === "PIXELS" &&
+    typeof node.letterSpacing.value === "number"
+      ? node.letterSpacing.value
+      : 0;
+  return Math.max(1, chars.length * fontSize * 0.82 + Math.max(0, chars.length - 1) * letterSpacing + fontSize * 0.35);
+}
+
+function estimatedSingleLineTextHeight(node) {
+  const fontSize = typeof node.fontSize === "number" && Number.isFinite(node.fontSize) ? node.fontSize : 16;
+  const lineHeight =
+    node &&
+    node.lineHeight &&
+    typeof node.lineHeight === "object" &&
+    node.lineHeight.unit === "PERCENT" &&
+    typeof node.lineHeight.value === "number"
+      ? Math.max(1, node.lineHeight.value / 100)
+      : 1.05;
+  return Math.max(1, fontSize * lineHeight * 1.08);
+}
+
+function isAgeBadgeTextRole(role, parentRole) {
+  return (
+    role === "age_badge" ||
+    parentRole === "age_badge" ||
+    parentRole === "age_badge_group" ||
+    parentRole === "badge_group"
+  );
+}
+
+function ensureAgeBadgeSingleLine(node, isAgeBadgeText) {
+  if (!isAgeBadgeText || !node || !("characters" in node)) return false;
+  let changed = false;
+  const normalized = singleLineText(node.characters);
+  if (normalized !== node.characters) {
+    try {
+      node.characters = normalized;
+      changed = true;
+    } catch (e) {
+      console.warn("[AGE_BADGE_SINGLE_LINE_CHARACTERS_FAILED]", e);
+    }
+  }
+  try {
+    if ("textAutoResize" in node) {
+      node.textAutoResize = "WIDTH_AND_HEIGHT";
+      changed = true;
+    }
+  } catch (e) {
+    console.warn("[AGE_BADGE_AUTO_RESIZE_FAILED]", e);
+  }
+  const minWidth = estimatedSingleLineTextWidth(node);
+  const minHeight = estimatedSingleLineTextHeight(node);
+  if (
+    (typeof node.width === "number" && node.width < minWidth) ||
+    (typeof node.height === "number" && node.height < minHeight)
+  ) {
+    resizeNodeIfPossible(
+      node,
+      Math.max(minWidth, typeof node.width === "number" ? node.width : 1),
+      Math.max(minHeight, typeof node.height === "number" ? node.height : 1),
+    );
+    changed = true;
+  }
+  return changed;
+}
+
 function getSourceTextFontSize(sourceFrame, role) {
   const node = findTextNodeBySemanticRole(sourceFrame, role);
   if (!node) return null;
@@ -1095,6 +1208,185 @@ function normalizeAbsoluteChildBoundsInJson(root) {
   return { fixed };
 }
 
+function getRootJsonBounds(jsonTree) {
+  const b = jsonTree && jsonTree.bounds && typeof jsonTree.bounds === "object" ? jsonTree.bounds : {};
+  return {
+    x: typeof b.x === "number" ? b.x : 0,
+    y: typeof b.y === "number" ? b.y : 0,
+    width: typeof b.width === "number" ? Math.max(1, b.width) : 1,
+    height: typeof b.height === "number" ? Math.max(1, b.height) : 1,
+  };
+}
+
+function boxesIntersect(a, b) {
+  if (!a || !b) return false;
+  return a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y;
+}
+
+function clampNumber(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function keepLargeBoundsPartiallyVisible(bounds, canvas, visibleRatio) {
+  if (!bounds || !canvas) return false;
+  const ratio = Math.min(0.9, Math.max(0.1, visibleRatio || 0.4));
+  const minX = canvas.x - bounds.width * (1 - ratio);
+  const maxX = canvas.x + canvas.width - bounds.width * ratio;
+  const minY = canvas.y - bounds.height * (1 - ratio);
+  const maxY = canvas.y + canvas.height - bounds.height * ratio;
+  const nextX = Number(clampNumber(bounds.x || 0, minX, maxX).toFixed(2));
+  const nextY = Number(clampNumber(bounds.y || 0, minY, maxY).toFixed(2));
+  const changed = Math.abs((bounds.x || 0) - nextX) > 0.01 || Math.abs((bounds.y || 0) - nextY) > 0.01;
+  bounds.x = nextX;
+  bounds.y = nextY;
+  return changed;
+}
+
+function moveBoundsTo(bounds, x, y) {
+  if (!bounds) return false;
+  const nextX = Number((Number(x) || 0).toFixed(2));
+  const nextY = Number((Number(y) || 0).toFixed(2));
+  const changed = Math.abs((bounds.x || 0) - nextX) > 0.01 || Math.abs((bounds.y || 0) - nextY) > 0.01;
+  bounds.x = nextX;
+  bounds.y = nextY;
+  return changed;
+}
+
+function intersectionBottomRight(a, b) {
+  if (!a || !b) return null;
+  const right = Math.min((a.x || 0) + (a.width || 0), (b.x || 0) + (b.width || 0));
+  const bottom = Math.min((a.y || 0) + (a.height || 0), (b.y || 0) + (b.height || 0));
+  const left = Math.max(a.x || 0, b.x || 0);
+  const top = Math.max(a.y || 0, b.y || 0);
+  if (right <= left || bottom <= top) return null;
+  return { x: right, y: bottom };
+}
+
+function ensureGradientStrongStopAtEnd(node) {
+  if (!node || !Array.isArray(node.fills)) return false;
+  let changed = false;
+  for (const fill of node.fills) {
+    if (!fill || String(fill.type || "").indexOf("GRADIENT_") !== 0 || !Array.isArray(fill.gradientStops)) continue;
+    let strongest = null;
+    for (const stop of fill.gradientStops) {
+      const alpha =
+        stop && stop.color && typeof stop.color.a === "number" ? stop.color.a : 1;
+      if (!strongest || alpha > strongest.alpha) {
+        strongest = { stop, alpha };
+      }
+    }
+    if (strongest && typeof strongest.stop.position === "number" && strongest.stop.position < 0.5) {
+      fill.gradientStops = fill.gradientStops
+        .map((stop) => Object.assign({}, stop, { position: Number((1 - (Number(stop.position) || 0)).toFixed(6)) }))
+        .sort((a, b) => (a.position || 0) - (b.position || 0));
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+function hideBackgroundGradientJsonNodes(jsonTree) {
+  let hidden = 0;
+  function walk(node) {
+    if (!node || typeof node !== "object") return;
+    if (/^background_gradient_/.test(semanticRoleName(node))) {
+      if (node.visible !== false || node.opacity !== 0) hidden++;
+      node.visible = false;
+      node.opacity = 0;
+    }
+    const kids = Array.isArray(node.children) ? node.children : [];
+    for (const child of kids) walk(child);
+  }
+  walk(jsonTree);
+  return { hidden };
+}
+
+function polishDecorativeJsonBounds(finalJson, sourceFrame) {
+  if (!finalJson || typeof finalJson !== "object") {
+    return { backendGradientsPreserved: false, gradientsHidden: 0, gradientsMoved: 0, starsMoved: 0 };
+  }
+  const backendGradientsPreserved = sourceFrameHasGradient(sourceFrame);
+  const gradientHideReport = backendGradientsPreserved
+    ? { hidden: 0 }
+    : hideBackgroundGradientJsonNodes(finalJson);
+  const byRole = indexFinalJsonByRole(finalJson);
+  const canvas = getRootJsonBounds(finalJson);
+  const background = byRole.get("background_shape");
+  const backgroundBounds = background && background.bounds && typeof background.bounds === "object" ? background.bounds : null;
+  const kids = Array.isArray(finalJson.children) ? finalJson.children : [];
+  let gradientsMoved = 0;
+  let starsMoved = 0;
+
+  const anchor = backgroundBounds || canvas;
+  const gradients = kids
+    .filter((node) => /^background_gradient_/.test(semanticRoleName(node)) && node.bounds)
+    .sort((a, b) => semanticRoleName(a).localeCompare(semanticRoleName(b)));
+  if (!backendGradientsPreserved) {
+    if (gradients[0] && gradients[0].bounds) {
+      const b = gradients[0].bounds;
+      const moved = moveBoundsTo(
+        b,
+        anchor.x - b.width * 0.04,
+        anchor.y - b.height * 0.01,
+      );
+      const clamped = keepLargeBoundsPartiallyVisible(b, canvas, 0.48);
+      if (moved || clamped) gradientsMoved++;
+    }
+    if (gradients[1] && gradients[1].bounds) {
+      const b = gradients[1].bounds;
+      const corner = intersectionBottomRight(canvas, anchor) || {
+        x: canvas.x + canvas.width,
+        y: canvas.y + canvas.height,
+      };
+      const moved = moveBoundsTo(
+        b,
+        corner.x - b.width,
+        corner.y - b.height,
+      );
+      const flipped = ensureGradientStrongStopAtEnd(gradients[1]);
+      if (moved || flipped) gradientsMoved++;
+    }
+    for (let gi = 2; gi < gradients.length; gi++) {
+      const b = gradients[gi].bounds;
+      if (b && !boxesIntersect(b, canvas)) {
+        const moved = moveBoundsTo(
+          b,
+          anchor.x + anchor.width - b.width * 0.5,
+          anchor.y + anchor.height - b.height * 0.78,
+        );
+        const clamped = keepLargeBoundsPartiallyVisible(b, canvas, 0.35);
+        if (moved || clamped) gradientsMoved++;
+      }
+    }
+  }
+
+  if (backgroundBounds) {
+    const stars = kids
+      .filter((node) => /^star_decoration_/.test(semanticRoleName(node)) && node.bounds)
+      .sort((a, b) => (b.bounds.width * b.bounds.height) - (a.bounds.width * a.bounds.height));
+    const upperStar = stars[0];
+    if (upperStar && upperStar.bounds) {
+      const b = upperStar.bounds;
+      const topY = backgroundBounds.y + backgroundBounds.height * 0.07;
+      const leftX = Math.max(canvas.x + canvas.width * 0.02, backgroundBounds.x + backgroundBounds.width * 0.03);
+      if (Math.abs((b.y || 0) - topY) > 0.5 || Math.abs((b.x || 0) - leftX) > 0.5) {
+        b.x = Number(
+          clampNumber(leftX, canvas.x - b.width * 0.25, canvas.x + canvas.width - b.width * 0.35).toFixed(2),
+        );
+        b.y = Number(clampNumber(topY, canvas.y, canvas.y + canvas.height - b.height * 0.35).toFixed(2));
+        starsMoved++;
+      }
+    }
+  }
+
+  return {
+    backendGradientsPreserved,
+    gradientsHidden: gradientHideReport.hidden,
+    gradientsMoved,
+    starsMoved,
+  };
+}
+
 function estimateHeadlineFontSize(headlineItem, boxWidth, boxHeight, lineCount, maxFont) {
   const lines = Math.max(1, lineCount);
   const lh = lineHeightMultiplier(headlineItem);
@@ -1108,8 +1400,8 @@ function estimateHeadlineFontSize(headlineItem, boxWidth, boxHeight, lineCount, 
 }
 
 /**
- * Portrait-only JSON pass: stack brand → headline → subheadline, cap headline size from source scale,
- * parent-relative text bounds, TOP vertical alignment (avoids BOTTOM bleed into brand).
+ * Portrait-only JSON pass: stack brand → headline → subheadline while preserving backend headline font size,
+ * banner-absolute text bounds, TOP vertical alignment (avoids BOTTOM bleed into brand).
  */
 function polishPortraitTypographyInJson(finalJson, sourceFrame, targetResolution) {
   const targetW = Number(targetResolution && targetResolution.width);
@@ -1128,15 +1420,7 @@ function polishPortraitTypographyInJson(finalJson, sourceFrame, targetResolution
     return { applied: false, reason: "no_headline", normalized: normalizeReport.fixed };
   }
 
-  const sourceW = sourceFrame && sourceFrame.width ? sourceFrame.width : targetW;
-  const widthScale = targetW / sourceW;
-  const sourceHeadlineFont = getSourceTextFontSize(sourceFrame, "headline");
   const jsonFont = typeof headline.fontSize === "number" ? headline.fontSize : 72;
-  const scaledFromSource =
-    sourceHeadlineFont && Number.isFinite(sourceHeadlineFont)
-      ? sourceHeadlineFont * widthScale * 0.95
-      : jsonFont * widthScale;
-  const maxFont = Math.min(jsonFont, scaledFromSource, targetW * 0.078, targetH * 0.068);
 
   const marginX = Math.round(targetW * 0.05);
   const contentTop = Math.round(targetH * 0.52);
@@ -1157,42 +1441,24 @@ function polishPortraitTypographyInJson(finalJson, sourceFrame, targetResolution
       : contentTop + Math.round(targetH * 0.08);
 
   const boxW = Math.max(1, targetW - 2 * marginX);
-  const headlineLines = countTextLines(headline.characters || "");
-  const maxHeadlineHeight = Math.round(targetH * 0.22);
-  let fontSize = estimateHeadlineFontSize(
-    headline,
-    boxW - innerPad * 2,
-    maxHeadlineHeight,
-    headlineLines,
-    maxFont,
-  );
-  fontSize = Math.round(fontSize * 10) / 10;
+  const fontSize = Math.round(jsonFont * 10) / 10;
+  const textBoxW = Math.max(1, boxW - innerPad * 2);
+  const headlineLines = estimateWrappedTextLines(headline.characters || "", fontSize, textBoxW, "headline");
 
   const lhMul = lineHeightMultiplier(headline);
-  const headlineBoxH = Math.ceil(fontSize * lhMul * headlineLines * 1.06);
+  const headlineLineH = fontSize * Math.max(0.96, lhMul) * 1.04;
+  const headlineBoxH = Math.ceil(headlineLineH * headlineLines);
   const groupY = brandBottom + stackGap;
-
-  if (headlineGroup && headlineGroup.bounds) {
-    headlineGroup.bounds.x = marginX;
-    headlineGroup.bounds.y = groupY;
-    headlineGroup.bounds.width = boxW;
-  }
 
   headline.fontSize = fontSize;
   headline.textAlignHorizontal = "CENTER";
   headline.textAlignVertical = "TOP";
   headline.textAutoResize = "NONE";
-  headline.bounds = {
-    x: innerPad,
-    y: innerPad,
-    width: Math.max(1, boxW - innerPad * 2),
-    height: headlineBoxH,
-  };
 
   let subBoxH = 0;
   let subGap = 0;
   if (sub && sub.bounds) {
-    subGap = Math.round(targetH * 0.014);
+    subGap = Math.max(6, Math.round(targetH * 0.006));
     const subFontCap = Math.min(
       typeof sub.fontSize === "number" ? sub.fontSize : 40,
       fontSize * 0.58,
@@ -1202,42 +1468,60 @@ function polishPortraitTypographyInJson(finalJson, sourceFrame, targetResolution
     sub.textAlignHorizontal = "CENTER";
     sub.textAlignVertical = "TOP";
     sub.textAutoResize = "NONE";
-    subBoxH = Math.ceil(sub.fontSize * lineHeightMultiplier(sub) * 1.25);
+    subBoxH = Math.ceil(sub.fontSize * Math.max(1.02, lineHeightMultiplier(sub)) * 1.16);
+  }
+
+  const groupH = innerPad + headlineBoxH + (sub ? subGap + subBoxH : 0) + innerPad;
+  const bottomMargin = Math.round(targetH * 0.04);
+  const groupBottom = groupY + groupH;
+  let finalGroupY = groupY;
+  if (groupBottom > targetH - bottomMargin && headlineGroup && headlineGroup.bounds) {
+    const shift = groupBottom - (targetH - bottomMargin);
+    finalGroupY = Math.max(contentTop, groupY - shift);
+    if (brand && brand.bounds) brand.bounds.y = Math.max(contentTop, (brand.bounds.y || contentTop) - shift);
+  }
+  const groupX = marginX;
+
+  if (headlineGroup && headlineGroup.bounds) {
+    headlineGroup.bounds.x = groupX;
+    headlineGroup.bounds.y = finalGroupY;
+    headlineGroup.bounds.width = boxW;
+    headlineGroup.bounds.height = groupH;
+  }
+
+  headline.bounds = {
+    x: groupX + innerPad,
+    y: finalGroupY + innerPad,
+    width: Math.max(1, boxW - innerPad * 2),
+    height: headlineBoxH,
+  };
+
+  if (sub && sub.bounds) {
     sub.bounds = {
-      x: innerPad,
-      y: innerPad + headlineBoxH + subGap,
+      x: groupX + innerPad,
+      y: finalGroupY + innerPad + headlineBoxH + subGap,
       width: Math.max(1, boxW - innerPad * 2),
       height: subBoxH,
     };
   }
 
-  const groupH = innerPad + headlineBoxH + (sub ? subGap + subBoxH : 0) + innerPad;
-  if (headlineGroup && headlineGroup.bounds) {
-    headlineGroup.bounds.height = groupH;
-  }
-
-  const bottomMargin = Math.round(targetH * 0.04);
-  const groupBottom = groupY + groupH;
-  if (groupBottom > targetH - bottomMargin && headlineGroup && headlineGroup.bounds) {
-    const shift = groupBottom - (targetH - bottomMargin);
-    headlineGroup.bounds.y = Math.max(contentTop, groupY - shift);
-    if (brand && brand.bounds) brand.bounds.y = Math.max(contentTop, (brand.bounds.y || contentTop) - shift);
-  }
+  const decorationReport = polishDecorativeJsonBounds(finalJson, sourceFrame);
 
   console.log("[PORTRAIT_TYPO_POLISH]", {
     fontSize,
-    maxFont,
-    scaledFromSource,
+    source: "backend_final_json",
     headlineLines,
     groupY: headlineGroup && headlineGroup.bounds ? headlineGroup.bounds.y : null,
     groupH,
     normalized: normalizeReport.fixed,
+    decorations: decorationReport,
   });
 
   return {
     applied: true,
     fontSize,
     normalized: normalizeReport.fixed,
+    decorations: decorationReport,
     groupY: headlineGroup && headlineGroup.bounds ? headlineGroup.bounds.y : null,
   };
 }
@@ -1289,6 +1573,21 @@ async function fitFigmaTextNodeToBox(node, maxWidth, maxHeight, opts) {
   return { fitted: steps > 0, fontSize: node.fontSize, steps };
 }
 
+function applyExactTextFontSize(node, fontSize, role) {
+  if (!node || !("characters" in node) || typeof fontSize !== "number" || !Number.isFinite(fontSize)) {
+    return false;
+  }
+  const size = Math.max(1, fontSize);
+  try {
+    node.fontSize = size;
+    applyUniformTextRangeValue(node, "setRangeFontSize", "FONT_SIZE", size, role);
+    return true;
+  } catch (e) {
+    console.warn("[TEXT_EXACT_FONT_SIZE_APPLY_FAILED]", role, fontSize, e);
+    return false;
+  }
+}
+
 async function polishPortraitTypographyOnFrame(convertedFrame, finalJson, targetResolution, sourceContentMap) {
   const targetW = Number(targetResolution && targetResolution.width);
   const targetH = Number(targetResolution && targetResolution.height);
@@ -1298,28 +1597,40 @@ async function polishPortraitTypographyOnFrame(convertedFrame, finalJson, target
 
   const byRole = indexFinalJsonByRole(finalJson);
   const headlineItem = byRole.get("headline");
+  const headlineGroupItem = byRole.get("headline_group");
   const headlineNode = findTextNodeBySemanticRole(convertedFrame, "headline");
   if (!headlineItem || !headlineNode) {
     return { applied: false, reason: "no_headline_node" };
   }
 
+  function localTextPointForJsonBounds(node, bounds) {
+    if (!node || !bounds) return { x: node ? node.x : 0, y: node ? node.y : 0 };
+    const parentIsRoot = !node.parent || node.parent.id === convertedFrame.id;
+    const parentBounds =
+      !parentIsRoot && headlineGroupItem && headlineGroupItem.bounds && typeof headlineGroupItem.bounds === "object"
+        ? headlineGroupItem.bounds
+        : null;
+    return {
+      x: typeof bounds.x === "number" ? bounds.x - (parentBounds && typeof parentBounds.x === "number" ? parentBounds.x : 0) : node.x,
+      y: typeof bounds.y === "number" ? bounds.y - (parentBounds && typeof parentBounds.y === "number" ? parentBounds.y : 0) : node.y,
+    };
+  }
+
   const b = headlineItem.bounds;
   if (b) {
-    headlineNode.x = typeof b.x === "number" ? b.x : headlineNode.x;
-    headlineNode.y = typeof b.y === "number" ? b.y : headlineNode.y;
+    const p = localTextPointForJsonBounds(headlineNode, b);
+    headlineNode.x = p.x;
+    headlineNode.y = p.y;
     if (typeof b.width === "number" && typeof b.height === "number") {
       resizeNodeIfPossible(headlineNode, b.width, b.height);
     }
   }
 
-  const maxFont =
-    typeof headlineItem.fontSize === "number" ? headlineItem.fontSize : headlineNode.fontSize || 72;
-  const fitReport = await fitFigmaTextNodeToBox(
-    headlineNode,
-    b && b.width,
-    b && b.height,
-    { role: "headline", maxFont, minFont: 12, alignVertical: "TOP" },
-  );
+  const backendHeadlineFontSize =
+    typeof headlineItem.fontSize === "number" && Number.isFinite(headlineItem.fontSize)
+      ? headlineItem.fontSize
+      : headlineNode.fontSize || 72;
+  const fontSizeApplied = applyExactTextFontSize(headlineNode, backendHeadlineFontSize, "headline");
   try {
     headlineNode.textAlignVertical = "TOP";
     headlineNode.textAlignHorizontal = textAlignHorizontalForTarget(headlineItem, sourceContentMap) || "CENTER";
@@ -1331,8 +1642,9 @@ async function polishPortraitTypographyOnFrame(convertedFrame, finalJson, target
   const subNode = findTextNodeBySemanticRole(convertedFrame, "subheadline_delivery_time");
   if (subItem && subNode && subItem.bounds) {
     const sb = subItem.bounds;
-    subNode.x = typeof sb.x === "number" ? sb.x : subNode.x;
-    subNode.y = typeof sb.y === "number" ? sb.y : subNode.y;
+    const p = localTextPointForJsonBounds(subNode, sb);
+    subNode.x = p.x;
+    subNode.y = p.y;
     if (typeof sb.width === "number" && typeof sb.height === "number") {
       resizeNodeIfPossible(subNode, sb.width, sb.height);
     }
@@ -1349,7 +1661,15 @@ async function polishPortraitTypographyOnFrame(convertedFrame, finalJson, target
     }
   }
 
-  return { applied: true, headline: fitReport };
+  return {
+    applied: true,
+    headline: {
+      fitted: false,
+      fontSize: headlineNode.fontSize,
+      backendFontSize: backendHeadlineFontSize,
+      exactBackendFontSizeApplied: fontSizeApplied,
+    },
+  };
 }
 
 function figmaNodeAllowedInSource(node, sourceIndex, cloneRoot) {
@@ -2856,6 +3176,8 @@ async function loadAllFontsForTextNode(node, role) {
 async function applyFinalJsonTextStyle(node, item, parentJsonNode, sourceContentMap) {
   if (!node || !item || !("characters" in node)) return 0;
   const role = semanticRoleName(item);
+  const parentRole = semanticRoleName(parentJsonNode);
+  const isAgeBadgeText = isAgeBadgeTextRole(role, parentRole);
   const sourceChars = resolveSourceCharactersForJsonText(item, sourceContentMap);
   const requestedAutoResize = typeof item.textAutoResize === "string" ? item.textAutoResize : null;
   let loadedJsonFontName = null;
@@ -2887,7 +3209,8 @@ async function applyFinalJsonTextStyle(node, item, parentJsonNode, sourceContent
     }
   }
 
-  const finalCharacters = String(sourceChars != null ? sourceChars : item.characters || "");
+  const rawCharacters = String(sourceChars != null ? sourceChars : item.characters || "");
+  const finalCharacters = isAgeBadgeText ? singleLineText(rawCharacters) : rawCharacters;
   try {
     node.characters = finalCharacters;
   } catch (e) {
@@ -2952,13 +3275,14 @@ async function applyFinalJsonTextStyle(node, item, parentJsonNode, sourceContent
   applyJsonPropertyIfPresent(node, item, "textDecoration");
   applyJsonPropertyIfPresent(node, item, "paragraphSpacing");
   applyJsonPropertyIfPresent(node, item, "paragraphIndent");
-  if ("textAutoResize" in node && requestedAutoResize) {
+  if ("textAutoResize" in node && requestedAutoResize && !isAgeBadgeText) {
     try {
       node.textAutoResize = requestedAutoResize;
     } catch (_e) {
       /* textAutoResize is best-effort across text node variants */
     }
   }
+  ensureAgeBadgeSingleLine(node, isAgeBadgeText);
 
   if (role === "headline") {
     const boldFont = await loadHeadlineBoldFontName(loadedJsonFontName || item.fontName);
@@ -2967,6 +3291,7 @@ async function applyFinalJsonTextStyle(node, item, parentJsonNode, sourceContent
         await figma.loadFontAsync(boldFont);
         node.fontName = boldFont;
         applyUniformTextRangeValue(node, "setRangeFontName", "FONT_NAME", boldFont, role);
+        applyExactTextFontSize(node, item.fontSize, role);
       } catch (e) {
         console.warn("[TEXT_HEADLINE_BOLD_FONT_FAILED]", role, boldFont, e);
       }
@@ -3086,6 +3411,20 @@ async function createNodeFromJsonItem(item, parent, parentBounds, isRoot, source
   }
 
   node.name = String(item.name || item.type || "json_node");
+  if (typeof item.visible === "boolean") {
+    try {
+      node.visible = item.visible;
+    } catch (_e) {
+      /* visibility is best-effort across node variants */
+    }
+  }
+  if (typeof item.opacity === "number" && Number.isFinite(item.opacity)) {
+    try {
+      node.opacity = item.opacity;
+    } catch (_e) {
+      /* opacity is best-effort across node variants */
+    }
+  }
   try {
     if (item.id) node.setPluginData("originalNodeId", String(item.id));
     node.setPluginData("semanticName", String(item.name || ""));
@@ -4370,16 +4709,44 @@ function fetchSemanticJsonThroughUi(payload) {
 }
 
 figma.ui.onmessage = async (msg) => {
+  if (msg.type === "semantic-json-fetch-result-chunk") {
+    const entry = semanticJsonUiFetchWaiters.get(msg.id);
+    if (!entry) return;
+    const total = Math.max(1, Number(msg.total) || 1);
+    const index = Math.max(0, Number(msg.index) || 0);
+    if (!entry.chunks || entry.total !== total) {
+      entry.chunks = new Array(total);
+      entry.total = total;
+    }
+    entry.chunks[index] = String(msg.chunk || "");
+    return;
+  }
+
   if (msg.type === "semantic-json-fetch-result") {
     const entry = semanticJsonUiFetchWaiters.get(msg.id);
     if (!entry) return;
     clearTimeout(entry.timeout);
     semanticJsonUiFetchWaiters.delete(msg.id);
-    if (msg.ok && msg.data && typeof msg.data === "object" && "semantic_json" in msg.data) {
-      entry.resolve(msg.data);
+    let data = msg.data;
+    if (msg.ok && msg.chunked) {
+      try {
+        const chunks = entry.chunks || [];
+        data = JSON.parse(chunks.join(""));
+      } catch (e) {
+        entry.reject(new Error("Semantic JSON chunked response could not be parsed: " + String(e && e.message ? e.message : e)));
+        return;
+      }
+    }
+    if (msg.ok && data && typeof data === "object" && "semantic_json" in data) {
+      entry.resolve(data);
     } else {
       entry.reject(new Error(msg.error || "Semantic JSON request failed."));
     }
+    return;
+  }
+
+  if (msg.type === "semantic-json-fetch-status") {
+    postStatus(String(msg.message || ""));
     return;
   }
 

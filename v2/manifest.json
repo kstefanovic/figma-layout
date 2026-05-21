@@ -6,9 +6,9 @@
   "ui": "ui.html",
   "editorType": ["figma"],
   "networkAccess": {
-    "allowedDomains": ["https://ml.geex.agent"],
+    "allowedDomains": ["https://ml.geex.agency"],
     "devAllowedDomains": [
-      "http://localhost:20001"
+      "https://ml.geex.agency"
     ]
   }
 }
