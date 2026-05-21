@@ -4,6 +4,7 @@
  * - ``POST …/api/layout-transformer-v2`` — selected rich semantic JSON + target size → V2 Layout Transformer output; plugin clones beside the original and applies returned ``final_json``.
  * - ``POST …/figma/convert-semantic-json`` — banner + grid PNG + raw JSON → Qwen (multipart sent from the plugin UI iframe with ``FormData``, same as ``frontend/figma.html``); server merges ``{names:{id:…}}`` into full semantic JSON; main thread clones beside the original, reparents to match JSON hierarchy, then renames from that JSON.
  * - HTML/CSS export from serialized JSON + assets (local).
+ * - Rich JSON export — full ``serializeNode`` tree for selected frame(s), downloaded from the UI.
  */
 figma.showUI(__html__, { width: 400, height: 760 });
 
@@ -4747,6 +4748,92 @@ figma.ui.onmessage = async (msg) => {
 
   if (msg.type === "semantic-json-fetch-status") {
     postStatus(String(msg.message || ""));
+    return;
+  }
+
+  if (msg.type === "export-selected-frame-rich-json") {
+    const selection = figma.currentPage.selection;
+    const frames = collectFrameNodesFromSelection(selection);
+    if (frames.length === 0) {
+      postError("Select one or more frames (only FRAME nodes are exported).");
+      figma.ui.postMessage({ type: "rich-json-export-result", ok: false });
+      sendSelectionInfo();
+      return;
+    }
+
+    const origSel = selection.slice();
+    var richOk = 0;
+    var richFail = 0;
+    for (var ri = 0; ri < frames.length; ri++) {
+      var richFrame = frames[ri];
+      try {
+        figma.currentPage.selection = [richFrame];
+        postStatus(
+          "Rich JSON export (" +
+            String(ri + 1) +
+            "/" +
+            String(frames.length) +
+            "): serializing " +
+            richFrame.name +
+            "...",
+        );
+        stampOriginalNodeIds(richFrame);
+        const origin = getOrigin(richFrame);
+        const richJson = serializeNode(richFrame, origin, "");
+        richJson.templateId = "figma_plugin_rich_json_export";
+        const jsonText = JSON.stringify(richJson, null, 2);
+        const safeBase =
+          `${richFrame.name || "figma-export"}-${Math.round(richFrame.width)}x${Math.round(richFrame.height)}`;
+        figma.ui.postMessage({
+          type: "rich-json-export-result",
+          ok: true,
+          jsonText: jsonText,
+          fileName: safeBase,
+          batch: frames.length > 1,
+          batchIndex: ri,
+          batchTotal: frames.length,
+        });
+        postStatus(
+          "Rich JSON export (" +
+            String(ri + 1) +
+            "/" +
+            String(frames.length) +
+            "): ok — " +
+            String(jsonText.length) +
+            " chars.",
+        );
+        richOk++;
+      } catch (err) {
+        console.error("Rich JSON export failed:", err);
+        richFail++;
+        const em = String(err && err.message ? err.message : err);
+        postStatus(
+          "Rich JSON export (" +
+            String(ri + 1) +
+            "/" +
+            String(frames.length) +
+            ") skipped: " +
+            richFrame.name +
+            " — " +
+            em,
+        );
+        figma.ui.postMessage({
+          type: "rich-json-export-result",
+          ok: false,
+          batch: frames.length > 1,
+          batchIndex: ri,
+          batchTotal: frames.length,
+          error: em,
+          frameName: richFrame.name,
+        });
+      }
+    }
+    figma.currentPage.selection = origSel;
+    sendSelectionInfo();
+    postStatus("Rich JSON batch done: " + String(richOk) + " ok, " + String(richFail) + " failed.");
+    if (richFail > 0 && richOk === 0) {
+      postError("All rich JSON exports in the batch failed. See status above.");
+    }
     return;
   }
 
