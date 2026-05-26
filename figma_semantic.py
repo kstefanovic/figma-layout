@@ -312,6 +312,776 @@ Output exactly:
 ).strip()
 
 
+TOP_LEVEL_SEMANTIC_NAMES = (
+    "background_group",
+    "background_shape",
+    "background_gradient",
+    "background_gradient_1",
+    "background_gradient_2",
+    "background_gradient_3",
+    "background_gradient_4",
+    "background_gradient_5",
+    "hero_group",
+    "product_group",
+    "text_group",
+    "brand_group",
+    "headline_group",
+    "legal_group",
+    "badge_group",
+    "decoration_group",
+    "cta_group",
+    "offer_group",
+    "price_group",
+    "discount_badge_group",
+    "star_decoration",
+    "star_decoration_1",
+    "star_decoration_2",
+    "star_decoration_3",
+    "star_decoration_4",
+    "star_decoration_5",
+    "foreground_group",
+    "unknown_group",
+)
+
+TOP_LEVEL_SEMANTIC_ALIASES = {
+    "background": "background_group",
+    "background_shape": "background_shape",
+    "base_background": "background_shape",
+    "color_panel": "background_group",
+    "gradient_shape": "background_gradient",
+    "background_gradient": "background_gradient",
+    "background_gradient_1": "background_gradient_1",
+    "background_gradient_2": "background_gradient_2",
+    "background_gradient_3": "background_gradient_3",
+    "background_gradient_4": "background_gradient_4",
+    "background_gradient_5": "background_gradient_5",
+    "hero": "hero_group",
+    "hero_image": "hero_group",
+    "main_image": "hero_group",
+    "image_zone": "hero_group",
+    "main_visual": "hero_group",
+    "product": "product_group",
+    "product_image": "product_group",
+    "product_packshot": "product_group",
+    "food_image": "product_group",
+    "drink_image": "product_group",
+    "text": "text_group",
+    "copy_group": "text_group",
+    "headline": "headline_group",
+    "headline_text": "headline_group",
+    "subheadline": "headline_group",
+    "brand": "brand_group",
+    "logo": "brand_group",
+    "brand_name": "brand_group",
+    "legal": "legal_group",
+    "legal_text": "legal_group",
+    "legal_text_group": "legal_group",
+    "badge": "badge_group",
+    "age_badge": "badge_group",
+    "age_badge_group": "badge_group",
+    "discount_badge": "discount_badge_group",
+    "discount_badge_group": "discount_badge_group",
+    "discount_text": "discount_badge_group",
+    "decoration": "decoration_group",
+    "decorations": "decoration_group",
+    "star": "star_decoration",
+    "star_decoration": "star_decoration",
+    "star_decoration_1": "star_decoration_1",
+    "star_decoration_2": "star_decoration_2",
+    "star_decoration_3": "star_decoration_3",
+    "star_decoration_4": "star_decoration_4",
+    "star_decoration_5": "star_decoration_5",
+    "sparkle": "star_decoration",
+    "sparkle_1": "star_decoration_1",
+    "sparkle_2": "star_decoration_2",
+    "ornament": "decoration_group",
+    "cta": "cta_group",
+    "button": "cta_group",
+    "call_to_action": "cta_group",
+    "offer": "offer_group",
+    "price": "price_group",
+    "price_text": "price_group",
+}
+
+TOP_LEVEL_SEMANTIC_SYSTEM_PROMPT = (
+    "You output exactly one compact JSON object with this shape: "
+    '{"top_level_names":[{"index":0,"path":"0","id":"...","semantic_name":"hero_group","confidence":0.0}]}. '
+    "Name ONLY direct children of the root Figma frame. Do not name nested children. "
+    "Do not invent ids or paths. Use ONLY these semantic_name values: "
+    + ", ".join(TOP_LEVEL_SEMANTIC_NAMES)
+    + ". No markdown, no commentary."
+)
+
+
+def normalize_top_level_semantic_name(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    text = re.sub(r"[^a-z0-9]+", "_", text)
+    text = re.sub(r"_+", "_", text).strip("_")
+    text = TOP_LEVEL_SEMANTIC_ALIASES.get(text, text)
+    if text not in TOP_LEVEL_SEMANTIC_NAMES:
+        return "unknown_group"
+    return text
+
+
+def _compact_top_level_child_json(
+    node: Any,
+    *,
+    depth: int = 0,
+    max_depth: int = 3,
+    max_children: int = 30,
+) -> Any:
+    if not isinstance(node, dict):
+        return node
+    keep = {
+        "id",
+        "path",
+        "name",
+        "type",
+        "bounds",
+        "visible",
+        "opacity",
+        "characters",
+        "fontSize",
+        "fontName",
+        "fills",
+    }
+    out = {k: copy.deepcopy(v) for k, v in node.items() if k in keep}
+    children = node.get("children")
+    if isinstance(children, list):
+        out["child_count"] = len(children)
+        if depth < max_depth and children:
+            out["children"] = [
+                _compact_top_level_child_json(
+                    child,
+                    depth=depth + 1,
+                    max_depth=max_depth,
+                    max_children=max_children,
+                )
+                for child in children[:max_children]
+            ]
+            if len(children) > max_children:
+                out["children_truncated"] = len(children) - max_children
+    else:
+        out["child_count"] = 0
+    return out
+
+
+def build_top_level_semantic_user_text(top_children_payload: dict[str, Any]) -> str:
+    root = top_children_payload.get("root")
+    prompt_children: list[dict[str, Any]] = []
+    for child in top_children_payload.get("children") or []:
+        if not isinstance(child, dict):
+            continue
+        prompt_children.append(
+            {
+                "index": child.get("index"),
+                "id": child.get("id"),
+                "path": child.get("path"),
+                "original_name": child.get("original_name"),
+                "type": child.get("type"),
+                "bounds": child.get("bounds"),
+                "file_name": child.get("file_name"),
+                "json": _compact_top_level_child_json(child.get("json")),
+            }
+        )
+
+    payload = {
+        "root_context_do_not_output": _compact_top_level_child_json(root, max_depth=1),
+        "direct_children": prompt_children,
+    }
+    return (
+        "You are naming ONLY direct_children. Do NOT name the root frame.\n"
+        "The root_context_do_not_output.id is shown only for context and is FORBIDDEN in output.\n"
+        "Every output item id MUST be copied from direct_children[i].id.\n"
+        "Every output path MUST be copied from direct_children[i].path.\n"
+        "You must output exactly one item for every direct_children entry.\n\n"
+        "Images provided before this text:\n"
+        "1. First image = full banner screenshot.\n"
+        "2. Following images = one PNG per direct child, in the same order as direct_children.\n\n"
+        "Task:\n"
+        "- Assign one semantic group name to each direct child.\n"
+        "- Do NOT name nested children.\n"
+        "- Do NOT create groups.\n"
+        "- Do NOT change hierarchy.\n"
+        "- If unsure, use unknown_group.\n\n"
+        "Role rules:\n"
+        "- Use background_shape for large solid background plates, panels, or abstract solid shapes.\n"
+        "- Use background_gradient_1, background_gradient_2, ... for soft gradient/fade/glow rectangles or overlays.\n"
+        "- If there are multiple background gradients, assign numbers by position: top/upper first, bottom/lower second.\n"
+        "- Use discount_badge_group for visible discount badges like \"-54%\" or \"–54%\".\n"
+        "- Use decoration_group for groups of decorative stars/sparkles/ornaments.\n"
+        "- If a star/sparkle itself is a direct top-level child, use star_decoration_1, star_decoration_2, ... by top-to-bottom then left-to-right.\n"
+        "- Do not classify large solid background shapes as hero_group unless there is a real photo/person/product image.\n"
+        "- Do not classify stars/decorations as background_group.\n"
+        "- Do not classify gradients as background_group.\n"
+        "- Do not classify discount badges as foreground_group.\n\n"
+        "Allowed semantic names:\n"
+        + ", ".join(TOP_LEVEL_SEMANTIC_NAMES)
+        + "\n\n"
+        "Return ONLY compact JSON with exactly this shape:\n"
+        '{"top_level_names":[{"index":0,"path":"0","id":"COPY_DIRECT_CHILD_ID","semantic_name":"hero_group","confidence":0.95}]}\n\n'
+        "Forbidden:\n"
+        f"- Never output root id: {root.get('id') if isinstance(root, dict) else ''}\n"
+        "- Never output only one child unless direct_children has length 1.\n"
+        "- Never output markdown.\n\n"
+        "Input JSON:\n"
+        + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    )
+
+
+def parse_top_level_names_object(
+    text: str,
+    top_children_payload: dict[str, Any],
+    warnings: list[str],
+) -> list[dict[str, Any]]:
+    parsed = extract_first_json_value(text)
+
+    raw_items: list[Any] = []
+
+    if isinstance(parsed, dict) and isinstance(parsed.get("top_level_names"), list):
+        raw_items = parsed["top_level_names"]
+    elif isinstance(parsed, dict) and isinstance(parsed.get("names"), dict):
+        children = top_children_payload.get("children") if isinstance(top_children_payload, dict) else []
+        children = children if isinstance(children, list) else []
+        by_id = {str(k): v for k, v in parsed["names"].items()}
+        for i, child in enumerate(children):
+            if not isinstance(child, dict):
+                continue
+            cid = str(child.get("id") or "")
+            if cid in by_id:
+                raw_items.append(
+                    {
+                        "index": child.get("index", i),
+                        "path": str(child.get("path", i)),
+                        "id": cid,
+                        "semantic_name": by_id[cid],
+                        "confidence": None,
+                    }
+                )
+    else:
+        raise ValueError("Expected JSON with top_level_names list or names object.")
+
+    children = top_children_payload.get("children") if isinstance(top_children_payload, dict) else []
+    children = children if isinstance(children, list) else []
+
+    child_by_index: dict[int, dict[str, Any]] = {}
+    child_by_path: dict[str, dict[str, Any]] = {}
+    child_by_id: dict[str, dict[str, Any]] = {}
+
+    for i, child in enumerate(children):
+        if not isinstance(child, dict):
+            continue
+
+        try:
+            idx = int(child.get("index", i))
+        except (TypeError, ValueError):
+            idx = i
+
+        path = str(child.get("path", idx)).strip()
+        cid = str(child.get("id") or "").strip()
+
+        child_by_index[idx] = child
+        child_by_path[path] = child
+        if cid:
+            child_by_id[cid] = child
+
+    out: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+
+        raw_sid = str(item.get("id") or "").strip()
+        raw_path = str(item.get("path") or "").strip()
+        raw_index = item.get("index")
+
+        if "/" in raw_path:
+            warnings.append(f"ignored_nested_top_level_path:{raw_path}")
+            continue
+
+        matched_child: dict[str, Any] | None = None
+
+        if raw_path and raw_path in child_by_path:
+            matched_child = child_by_path[raw_path]
+
+        if matched_child is None and raw_index is not None:
+            try:
+                matched_child = child_by_index.get(int(raw_index))
+            except (TypeError, ValueError):
+                matched_child = None
+
+        if matched_child is None and raw_sid:
+            matched_child = child_by_id.get(raw_sid)
+
+        if matched_child is None:
+            warnings.append(
+                f"ignored_unmatched_top_level_item:path={raw_path}:index={raw_index}:id={raw_sid}"
+            )
+            continue
+
+        try:
+            correct_index = int(matched_child.get("index", 0))
+        except (TypeError, ValueError):
+            correct_index = 0
+
+        correct_path = str(matched_child.get("path", correct_index)).strip()
+        correct_id = str(matched_child.get("id") or "").strip()
+
+        if raw_sid and correct_id and raw_sid != correct_id:
+            warnings.append(f"corrected_top_level_id:{raw_sid}->{correct_id}:path={correct_path}")
+
+        semantic_name = normalize_top_level_semantic_name(
+            item.get("semantic_name") or item.get("name") or item.get("role")
+        )
+
+        if correct_path in seen_paths:
+            warnings.append(f"duplicate_top_level_path_ignored:{correct_path}")
+            continue
+
+        clean: dict[str, Any] = {
+            "index": correct_index,
+            "path": correct_path,
+            "id": correct_id,
+            "semantic_name": semantic_name,
+        }
+
+        if item.get("confidence") is not None:
+            try:
+                clean["confidence"] = max(0.0, min(1.0, float(item["confidence"])))
+            except (TypeError, ValueError):
+                pass
+
+        seen_paths.add(correct_path)
+        out.append(clean)
+
+    return out
+
+
+def _walk_json_descendants(node: Any) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+
+    def walk(n: Any) -> None:
+        if not isinstance(n, dict):
+            return
+        out.append(n)
+        children = n.get("children")
+        if isinstance(children, list):
+            for c in children:
+                walk(c)
+
+    walk(node)
+    return out
+
+
+def _node_has_fill_type(node: dict[str, Any], fill_type: str) -> bool:
+    fills = node.get("fills") if isinstance(node.get("fills"), list) else []
+    target = fill_type.upper()
+    for f in fills:
+        if not isinstance(f, dict):
+            continue
+        t = str(f.get("type") or "").upper()
+        if target == "GRADIENT" and "GRADIENT" in t:
+            return True
+        if t == target:
+            return True
+    return False
+
+
+def _all_text_from_json(node: Any) -> str:
+    parts: list[str] = []
+    for n in _walk_json_descendants(node):
+        chars = n.get("characters")
+        if isinstance(chars, str) and chars.strip():
+            parts.append(chars.strip())
+    return " ".join(parts)
+
+
+def infer_fallback_top_level_name(child_or_json: Any) -> str:
+    child = child_or_json if isinstance(child_or_json, dict) else {}
+    typ = str(child.get("type") or "").lower()
+    text = _all_text_from_json(child)
+    low = text.lower()
+
+    descendants = _walk_json_descendants(child)
+
+    has_image = any(_node_has_fill_type(n, "IMAGE") for n in descendants)
+    has_gradient = any(_node_has_fill_type(n, "GRADIENT") for n in descendants)
+
+    if text.replace(" ", "").strip() in {"0+", "3+", "6+", "12+", "16+", "18+"}:
+        return "badge_group"
+
+    if any(x in low for x in ["ооо", "огрн", "инн", "акция", "количество товаров", "реклама", "рекламодатель"]):
+        return "legal_group"
+
+    if "₽" in text or "руб" in low or re.search(r"\b\d{2,4}\s*₽", text):
+        return "offer_group"
+
+    if has_image:
+        return "hero_group"
+
+    if typ == "text":
+        return "headline_group"
+
+    if has_gradient:
+        return "background_group"
+
+    bounds = child.get("bounds") if isinstance(child.get("bounds"), dict) else {}
+    try:
+        w = float(bounds.get("width") or 0)
+        h = float(bounds.get("height") or 0)
+        if h > 0 and w / h >= 3.0:
+            return "brand_group"
+    except (TypeError, ValueError):
+        pass
+
+    if typ in ("vector", "rectangle"):
+        return "background_group"
+
+    if typ in ("frame", "group"):
+        return "foreground_group"
+
+    return "unknown_group"
+
+
+def fill_missing_top_level_names(
+    top_level_names: list[dict[str, Any]],
+    top_children_payload: dict[str, Any],
+    warnings: list[str],
+) -> list[dict[str, Any]]:
+    children = top_children_payload.get("children") if isinstance(top_children_payload, dict) else []
+    children = children if isinstance(children, list) else []
+
+    existing_paths = {
+        str(item.get("path") or "").strip()
+        for item in top_level_names
+        if isinstance(item, dict)
+    }
+
+    out = list(top_level_names)
+
+    for i, child in enumerate(children):
+        if not isinstance(child, dict):
+            continue
+
+        path = str(child.get("path", i)).strip()
+        if path in existing_paths:
+            continue
+
+        child_json = child.get("json") if isinstance(child.get("json"), dict) else child
+        fallback_name = normalize_top_level_semantic_name(infer_fallback_top_level_name(child_json))
+
+        out.append(
+            {
+                "index": child.get("index", i),
+                "path": path,
+                "id": str(child.get("id") or ""),
+                "semantic_name": fallback_name,
+                "confidence": 0.0,
+            }
+        )
+        warnings.append(f"fallback_top_level_name:{path}:{fallback_name}")
+
+    return out
+
+
+def _bounds_dict(node: Any) -> dict[str, Any]:
+    return node.get("bounds") if isinstance(node, dict) and isinstance(node.get("bounds"), dict) else {}
+
+
+def _bounds_center(node: Any) -> tuple[float, float]:
+    b = _bounds_dict(node)
+    try:
+        x = float(b.get("x") or 0)
+        y = float(b.get("y") or 0)
+        w = float(b.get("width") or 0)
+        h = float(b.get("height") or 0)
+        return x + w / 2.0, y + h / 2.0
+    except (TypeError, ValueError):
+        return 0.0, 0.0
+
+
+def _bounds_area(node: Any) -> float:
+    b = _bounds_dict(node)
+    try:
+        return max(0.0, float(b.get("width") or 0) * float(b.get("height") or 0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _node_fill_types(node: Any) -> list[str]:
+    if not isinstance(node, dict):
+        return []
+    fills = node.get("fills") if isinstance(node.get("fills"), list) else []
+    out = []
+    for f in fills:
+        if isinstance(f, dict):
+            out.append(str(f.get("type") or "").upper())
+    return out
+
+
+def _has_gradient_fill_deep(node: Any) -> bool:
+    return any(
+        any("GRADIENT" in ft for ft in _node_fill_types(n))
+        for n in _walk_json_descendants(node)
+    )
+
+
+def _has_direct_gradient_fill(node: Any) -> bool:
+    return any("GRADIENT" in ft for ft in _node_fill_types(node))
+
+
+def _has_image_fill_deep(node: Any) -> bool:
+    return any(
+        any(ft == "IMAGE" for ft in _node_fill_types(n))
+        for n in _walk_json_descendants(node)
+    )
+
+
+def _has_text_deep(node: Any) -> bool:
+    return any(
+        isinstance(n, dict) and isinstance(n.get("characters"), str) and n.get("characters").strip()
+        for n in _walk_json_descendants(node)
+    )
+
+
+def _has_solid_fill_deep(node: Any) -> bool:
+    return any(
+        any(ft == "SOLID" for ft in _node_fill_types(n))
+        for n in _walk_json_descendants(node)
+    )
+
+
+def _star_node_count(node: Any) -> int:
+    count = 0
+    for n in _walk_json_descendants(node):
+        if not isinstance(n, dict):
+            continue
+        typ = str(n.get("type") or "").lower()
+        name = str(n.get("name") or "").lower()
+        if typ == "star" or "star" in name or "sparkle" in name:
+            count += 1
+    return count
+
+
+def _discount_text_present(node: Any) -> bool:
+    text = _all_text_from_json(node)
+    if not text:
+        return False
+    return bool(re.search(r"[-–−]\s*\d+\s*%", text)) or bool(re.search(r"\d+\s*%", text))
+
+
+def _looks_like_background_shape(node: Any, root_w: float, root_h: float) -> bool:
+    if not isinstance(node, dict):
+        return False
+    if _has_text_deep(node):
+        return False
+    if _has_image_fill_deep(node):
+        return False
+    if _has_gradient_fill_deep(node):
+        return False
+    if _star_node_count(node) > 0:
+        return False
+    if not _has_solid_fill_deep(node):
+        return False
+
+    area = _bounds_area(node)
+    canvas_area = max(1.0, root_w * root_h)
+    b = _bounds_dict(node)
+    try:
+        w = float(b.get("width") or 0)
+        h = float(b.get("height") or 0)
+        x = float(b.get("x") or 0)
+        y = float(b.get("y") or 0)
+    except (TypeError, ValueError):
+        return False
+
+    if area / canvas_area >= 0.15:
+        return True
+    if w >= root_w * 0.35 or h >= root_h * 0.35:
+        return True
+    if x < 0 or y < 0:
+        return True
+    return False
+
+
+def postprocess_top_level_semantic_names(
+    top_level_names: list[dict[str, Any]],
+    top_children_payload: dict[str, Any],
+    warnings: list[str],
+) -> list[dict[str, Any]]:
+    children = top_children_payload.get("children") if isinstance(top_children_payload, dict) else []
+    children = children if isinstance(children, list) else []
+
+    root = top_children_payload.get("root") if isinstance(top_children_payload, dict) else {}
+    root_bounds = _bounds_dict(root)
+    try:
+        root_w = float((root or {}).get("width") or root_bounds.get("width") or 1)
+        root_h = float((root or {}).get("height") or root_bounds.get("height") or 1)
+    except (TypeError, ValueError):
+        root_w, root_h = 1.0, 1.0
+
+    by_path = {
+        str(item.get("path") or "").strip(): dict(item)
+        for item in top_level_names
+        if isinstance(item, dict)
+    }
+
+    for i, child in enumerate(children):
+        if not isinstance(child, dict):
+            continue
+        path = str(child.get("path", i)).strip()
+        if path not in by_path:
+            by_path[path] = {
+                "index": child.get("index", i),
+                "path": path,
+                "id": str(child.get("id") or ""),
+                "semantic_name": "unknown_group",
+                "confidence": 0.0,
+            }
+
+    gradient_candidates: list[tuple[float, float, str]] = []
+    star_top_candidates: list[tuple[float, float, str]] = []
+
+    for i, child in enumerate(children):
+        if not isinstance(child, dict):
+            continue
+
+        path = str(child.get("path", i)).strip()
+        child_json = child.get("json") if isinstance(child.get("json"), dict) else child
+        item = by_path.get(path)
+        if item is None:
+            continue
+
+        cx, cy = _bounds_center(child_json)
+
+        if _discount_text_present(child_json):
+            old = item.get("semantic_name")
+            item["semantic_name"] = "discount_badge_group"
+            item["confidence"] = max(float(item.get("confidence") or 0.0), 0.99)
+            warnings.append(f"postprocess_top_level:{path}:{old}->discount_badge_group")
+            continue
+
+        if _has_image_fill_deep(child_json):
+            old = item.get("semantic_name")
+            if old in ("background_group", "background_shape", "background_gradient", "foreground_group", "unknown_group"):
+                item["semantic_name"] = "hero_group"
+                item["confidence"] = max(float(item.get("confidence") or 0.0), 0.9)
+                warnings.append(f"postprocess_top_level:{path}:{old}->hero_group")
+            continue
+
+        if (
+            (_has_direct_gradient_fill(child_json) or _has_gradient_fill_deep(child_json))
+            and not _has_text_deep(child_json)
+            and _star_node_count(child_json) == 0
+        ):
+            gradient_candidates.append((cy, cx, path))
+            continue
+
+        star_count = _star_node_count(child_json)
+        if star_count > 0 and not _has_text_deep(child_json) and not _has_image_fill_deep(child_json):
+            typ = str(child_json.get("type") or "").lower()
+            if typ == "star" or star_count == 1:
+                star_top_candidates.append((cy, cx, path))
+            else:
+                old = item.get("semantic_name")
+                item["semantic_name"] = "decoration_group"
+                item["confidence"] = max(float(item.get("confidence") or 0.0), 0.95)
+                warnings.append(f"postprocess_top_level:{path}:{old}->decoration_group")
+            continue
+
+        if _looks_like_background_shape(child_json, root_w, root_h):
+            old = item.get("semantic_name")
+            if old == "brand_group":
+                continue
+            item["semantic_name"] = "background_shape"
+            item["confidence"] = max(float(item.get("confidence") or 0.0), 0.95)
+            warnings.append(f"postprocess_top_level:{path}:{old}->background_shape")
+            continue
+
+        by_path[path] = item
+
+    gradient_candidates.sort(key=lambda t: (t[0], t[1]))
+    for n, (_cy, _cx, path) in enumerate(gradient_candidates, start=1):
+        item = by_path.get(path)
+        if not item:
+            continue
+        old = item.get("semantic_name")
+        role = f"background_gradient_{n}"
+        item["semantic_name"] = role
+        item["confidence"] = max(float(item.get("confidence") or 0.0), 0.99)
+        warnings.append(f"postprocess_top_level:{path}:{old}->{role}")
+
+    star_top_candidates.sort(key=lambda t: (t[0], t[1]))
+    for n, (_cy, _cx, path) in enumerate(star_top_candidates, start=1):
+        item = by_path.get(path)
+        if not item:
+            continue
+        old = item.get("semantic_name")
+        role = f"star_decoration_{n}"
+        item["semantic_name"] = role
+        item["confidence"] = max(float(item.get("confidence") or 0.0), 0.99)
+        warnings.append(f"postprocess_top_level:{path}:{old}->{role}")
+
+    out: list[dict[str, Any]] = []
+    for i, child in enumerate(children):
+        if not isinstance(child, dict):
+            continue
+        path = str(child.get("path", i)).strip()
+        item = by_path.get(path)
+        if item:
+            item["semantic_name"] = normalize_top_level_semantic_name(item.get("semantic_name"))
+            out.append(item)
+
+    return out
+
+
+def apply_top_level_semantic_names_to_raw(
+    raw: Any,
+    top_level_names: list[dict[str, Any]],
+    warnings: list[str],
+) -> Any:
+    tree = copy.deepcopy(raw)
+    if isinstance(tree, list):
+        if not tree or not isinstance(tree[0], dict):
+            raise ValueError("Raw JSON list must contain a root object at index 0")
+        root = tree[0]
+    elif isinstance(tree, dict):
+        root = tree
+    else:
+        raise ValueError("Raw JSON must be a root object or list with root object at index 0")
+
+    children = root.get("children")
+    if not isinstance(children, list):
+        raise ValueError("Raw root must contain a children list")
+
+    renamed = 0
+    for item in top_level_names:
+        try:
+            idx = int(item.get("index"))
+        except (TypeError, ValueError):
+            warnings.append(f"ignored_apply_invalid_top_level_index:{item.get('index')}")
+            continue
+        if idx < 0 or idx >= len(children) or not isinstance(children[idx], dict):
+            warnings.append(f"ignored_apply_unknown_top_level_index:{idx}")
+            continue
+        child = children[idx]
+        if item.get("id") is not None and child.get("id") is not None and str(child.get("id")) != str(item["id"]):
+            warnings.append(f"ignored_apply_mismatched_top_level_id:{idx}:{item.get('id')}")
+            continue
+        semantic_name = normalize_top_level_semantic_name(item.get("semantic_name"))
+        child["original_name"] = child.get("name")
+        child["semantic_name"] = semantic_name
+        child["name"] = semantic_name
+        child["semantic_level"] = "top"
+        if "confidence" in item:
+            child["semantic_confidence"] = item["confidence"]
+        renamed += 1
+
+    root["semantic_top_level_named_count"] = renamed
+    return tree
+
+
 def _is_leaf(node: dict[str, Any]) -> bool:
     ch = node.get("children")
     return not ch
@@ -796,6 +1566,8 @@ def collect_allowed_ids_from_mid(mid_blocks: list[dict[str, Any]]) -> set[str]:
 def _bounds_area(bounds: Any) -> float:
     if not isinstance(bounds, dict):
         return 0.0
+    if isinstance(bounds.get("bounds"), dict):
+        bounds = bounds["bounds"]
     try:
         w = float(bounds.get("width") or 0)
         h = float(bounds.get("height") or 0)

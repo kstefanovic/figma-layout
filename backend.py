@@ -21,15 +21,21 @@ from pydantic import BaseModel, Field
 from figma_semantic import (
     FIGMA_CONVERT_PROMPT,
     FIGMA_CONVERT_SYSTEM_PROMPT,
+    TOP_LEVEL_SEMANTIC_SYSTEM_PROMPT,
+    apply_top_level_semantic_names_to_raw,
     apply_semantic_names,
+    build_top_level_semantic_user_text,
     build_naming_user_prompt,
     chunk_list,
     collect_allowed_ids_from_mid,
     extract_first_json_value,
+    fill_missing_top_level_names,
     flatten_raw_to_mid,
     mid_node_prompt_slice,
     missing_name_ids,
     normalize_convert_semantic_output,
+    postprocess_top_level_semantic_names,
+    parse_top_level_names_object,
     parse_names_object,
     raw_fig_tree_to_mid_blocks,
 )
@@ -40,13 +46,6 @@ from figma_semantic_strict import (
     build_qwen_ambiguous_user_text,
     build_semantic_json_from_strict_names,
     extract_node_features,
-    run_strict_semantic_naming,
-)
-from figma_semantic_strict import (
-    STRICT_QWEN_SYSTEM_PROMPT,
-    assert_rich_metadata_preserved,
-    build_qwen_ambiguous_user_text,
-    build_semantic_json_from_strict_names,
     run_strict_semantic_naming,
 )
 from json_embedding import (
@@ -98,6 +97,7 @@ FIGMA_BANNER_PIPELINE_RUNS_DIR = Path(
 # Max long edge (px) for images sent to Qwen on /figma/convert-semantic-json (0 = disable).
 FIGMA_SEMANTIC_BANNER_MAX_EDGE = int(os.getenv("FIGMA_SEMANTIC_BANNER_MAX_EDGE", "1024"))
 FIGMA_SEMANTIC_GRID_MAX_EDGE = int(os.getenv("FIGMA_SEMANTIC_GRID_MAX_EDGE", "1024"))
+FIGMA_TOP_LEVEL_CHILD_MAX_EDGE = int(os.getenv("FIGMA_TOP_LEVEL_CHILD_MAX_EDGE", "768"))
 # When false (0/no/false), skip writing per-request run folders (faster I/O; no artifacts for debugging).
 FIGMA_SEMANTIC_STRICT_MODE = os.getenv("FIGMA_SEMANTIC_STRICT_MODE", "1").strip().lower() not in (
     "0",
@@ -2069,6 +2069,342 @@ async def figma_semantic_mid_json(
         frame_index=frame_index,
         used_reference_grid=used_grid,
         warnings=warnings,
+    )
+
+
+@app.post("/figma/semantic-top-level-children", response_model=FigmaConvertSemanticResponse)
+async def figma_semantic_top_level_children(
+    banner: UploadFile = File(..., description="Full Figma banner export image"),
+    raw_json: UploadFile = File(..., description="Raw Figma layout JSON"),
+    top_children_json: UploadFile = File(..., description="Top-level child metadata JSON"),
+    top_child_pngs: list[UploadFile] = File(..., description="One PNG per top-level child"),
+    max_new_tokens: int = Form(4096, ge=256, le=8192),
+) -> FigmaConvertSemanticResponse:
+    warnings: list[str] = []
+    run_id = _new_figma_semantic_run_id()
+    run_dir = FIGMA_SEMANTIC_RUNS_DIR / run_id
+    meta_base: dict[str, Any] | None = None
+
+    raw_bytes = await raw_json.read()
+    if len(raw_bytes) > FIGMA_MAX_JSON_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"raw_json exceeds limit of {FIGMA_MAX_JSON_BYTES} bytes.",
+        )
+
+    banner_body = await banner.read()
+    top_children_bytes = await top_children_json.read()
+    uploaded_children: list[dict[str, Any]] = []
+    for upload in top_child_pngs:
+        body = await upload.read()
+        if body:
+            uploaded_children.append({"upload": upload, "body": body})
+
+    if not banner_body:
+        raise HTTPException(status_code=400, detail="banner must be a non-empty file.")
+    if not top_children_bytes:
+        raise HTTPException(status_code=400, detail="top_children_json must be a non-empty file.")
+    if not uploaded_children:
+        raise HTTPException(status_code=400, detail="At least one non-empty top_child_png is required.")
+
+    def _safe_artifact_name(value: str | None, fallback: str) -> str:
+        base = os.path.basename((value or "").strip()) or fallback
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", base).strip("._")
+        return safe or fallback
+
+    if FIGMA_SEMANTIC_PERSIST_RUNS:
+        try:
+            run_dir.mkdir(parents=True, exist_ok=True)
+            (run_dir / "input_banner.png").write_bytes(banner_body)
+            (run_dir / "input_raw.json").write_bytes(raw_bytes)
+            (run_dir / "input_top_children.json").write_bytes(top_children_bytes)
+            child_dir = run_dir / "top_child_pngs"
+            child_dir.mkdir(parents=True, exist_ok=True)
+            child_files: list[dict[str, Any]] = []
+            used_names: set[str] = set()
+            for idx, item in enumerate(uploaded_children):
+                upload = item["upload"]
+                filename = _safe_artifact_name(upload.filename, f"top_child_{idx}.png")
+                if filename in used_names:
+                    stem = filename.rsplit(".", 1)[0]
+                    ext = "." + filename.rsplit(".", 1)[1] if "." in filename else ".png"
+                    filename = f"{stem}_{idx}{ext}"
+                used_names.add(filename)
+                rel = f"top_child_pngs/{filename}"
+                (run_dir / rel).write_bytes(item["body"])
+                child_files.append(
+                    {
+                        "file": rel,
+                        "bytes": len(item["body"]),
+                        "content_type": upload.content_type or "",
+                        "upload_filename": upload.filename,
+                    }
+                )
+            meta_base = {
+                "run_id": run_id,
+                "run_dir": str(run_dir),
+                "endpoint": "/figma/semantic-top-level-children",
+                "started_at_utc": datetime.now(timezone.utc).isoformat(),
+                "max_new_tokens": max_new_tokens,
+                "upload_filenames": {
+                    "banner": (banner.filename or "").strip() or None,
+                    "raw_json": (raw_json.filename or "").strip() or None,
+                    "top_children_json": (top_children_json.filename or "").strip() or None,
+                    "top_child_pngs": [
+                        (item["upload"].filename or "").strip() or None for item in uploaded_children
+                    ],
+                },
+                "input_files": {
+                    "input_banner.png": {
+                        "bytes": len(banner_body),
+                        "content_type": banner.content_type or "",
+                    },
+                    "input_raw.json": {"bytes": len(raw_bytes)},
+                    "input_top_children.json": {"bytes": len(top_children_bytes)},
+                    "top_child_pngs": child_files,
+                },
+            }
+        except OSError as exc:
+            warnings.append(f"Run artifacts not saved under {run_dir}: {exc}")
+            meta_base = None
+    else:
+        warnings.append("FIGMA_SEMANTIC_PERSIST_RUNS disabled: run inputs/output not saved to disk.")
+
+    try:
+        raw = json.loads(raw_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        if meta_base is not None:
+            try:
+                _write_figma_semantic_run_meta(
+                    run_dir,
+                    {
+                        **meta_base,
+                        "status": "error",
+                        "error": "invalid_raw_json",
+                        "detail": str(exc),
+                    },
+                )
+            except OSError:
+                pass
+        raise HTTPException(status_code=400, detail=f"Invalid raw_json: {exc}") from exc
+
+    if isinstance(raw, list):
+        raw_root = raw[0] if raw and isinstance(raw[0], dict) else None
+    else:
+        raw_root = raw if isinstance(raw, dict) else None
+    if raw_root is None or not isinstance(raw_root.get("children"), list):
+        raise HTTPException(
+            status_code=400,
+            detail="raw_json must be a root object, or a list with root object at index 0, containing children.",
+        )
+
+    try:
+        top_children_payload = json.loads(top_children_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        if meta_base is not None:
+            try:
+                _write_figma_semantic_run_meta(
+                    run_dir,
+                    {
+                        **meta_base,
+                        "status": "error",
+                        "error": "invalid_top_children_json",
+                        "detail": str(exc),
+                    },
+                )
+            except OSError:
+                pass
+        raise HTTPException(status_code=400, detail=f"Invalid top_children_json: {exc}") from exc
+
+    if not isinstance(top_children_payload, dict) or not isinstance(
+        top_children_payload.get("children"), list
+    ):
+        raise HTTPException(status_code=400, detail="top_children_json must contain a children list.")
+
+    children = [c for c in top_children_payload["children"] if isinstance(c, dict)]
+    if not children:
+        raise HTTPException(status_code=400, detail="top_children_json children list must be non-empty.")
+
+    banner_model_bytes, banner_resize_info = _resize_raster_max_long_edge(
+        banner_body, FIGMA_SEMANTIC_BANNER_MAX_EDGE
+    )
+    banner_mime = (
+        "image/png"
+        if banner_resize_info.get("resized")
+        else (banner.content_type or "image/png")
+    )
+    banner_uri = _data_uri(banner_model_bytes, banner_mime)
+
+    uploads_by_name: dict[str, tuple[int, dict[str, Any]]] = {}
+    for idx, item in enumerate(uploaded_children):
+        upload_name = os.path.basename((item["upload"].filename or "").strip())
+        if upload_name and upload_name not in uploads_by_name:
+            uploads_by_name[upload_name] = (idx, item)
+
+    child_content: list[ContentItem] = []
+    child_image_debug: list[dict[str, Any]] = []
+    used_upload_indexes: set[int] = set()
+    for child_index, child in enumerate(children):
+        file_name = os.path.basename(str(child.get("file_name") or "").strip())
+        match: tuple[int, dict[str, Any]] | None = None
+        match_mode = "filename"
+        if file_name:
+            by_name = uploads_by_name.get(file_name)
+            if by_name is not None and by_name[0] not in used_upload_indexes:
+                match = by_name
+        if match is None:
+            match_mode = "index"
+            if child_index < len(uploaded_children) and child_index not in used_upload_indexes:
+                match = (child_index, uploaded_children[child_index])
+                if file_name:
+                    warnings.append(f"top_child_png filename match failed for {file_name}; used index {child_index}.")
+                else:
+                    warnings.append(f"top_child_png file_name missing for child {child_index}; used index fallback.")
+        if match is None:
+            warnings.append(f"Missing top_child_png for child index {child_index}; skipped image.")
+            continue
+
+        upload_index, item = match
+        used_upload_indexes.add(upload_index)
+        model_bytes, resize_info = _resize_raster_max_long_edge(
+            item["body"], FIGMA_TOP_LEVEL_CHILD_MAX_EDGE
+        )
+        mime = (
+            "image/png"
+            if resize_info.get("resized")
+            else (item["upload"].content_type or "image/png")
+        )
+        child_content.append(ContentItem(type="image", image=_data_uri(model_bytes, mime)))
+        child_image_debug.append(
+            {
+                "child_index": child_index,
+                "child_id": child.get("id"),
+                "child_path": child.get("path"),
+                "expected_file_name": child.get("file_name"),
+                "upload_filename": item["upload"].filename,
+                "match_mode": match_mode,
+                "resize": resize_info,
+            }
+        )
+
+    if not child_content:
+        raise HTTPException(status_code=400, detail="No top_child_png files matched top_children_json children.")
+
+    if meta_base is not None:
+        meta_base["model_image_resize"] = {
+            "banner": banner_resize_info,
+            "top_child_pngs": child_image_debug,
+        }
+
+    user_text = build_top_level_semantic_user_text(top_children_payload)
+    user_content: list[ContentItem] = [
+        ContentItem(type="image", image=banner_uri),
+        *child_content,
+        ContentItem(type="text", text=user_text),
+    ]
+    semantic_messages = [
+        ChatMessage(role="system", content=TOP_LEVEL_SEMANTIC_SYSTEM_PROMPT),
+        ChatMessage(role="user", content=user_content),
+    ]
+    semantic_payload = {
+        "messages": [m.model_dump(exclude_none=True) for m in semantic_messages],
+        "max_new_tokens": max_new_tokens,
+    }
+
+    response_text = ""
+    try:
+        result = _call_model(semantic_payload, timeout=FIGMA_CONVERT_TIMEOUT)
+        response_text = result.get("response", "")
+        top_level_names = parse_top_level_names_object(response_text, top_children_payload, warnings)
+        top_level_names = fill_missing_top_level_names(
+            top_level_names,
+            top_children_payload,
+            warnings,
+        )
+        top_level_names = postprocess_top_level_semantic_names(
+            top_level_names,
+            top_children_payload,
+            warnings,
+        )
+        semantic_json = apply_top_level_semantic_names_to_raw(raw, top_level_names, warnings)
+    except HTTPException as he:
+        if meta_base is not None:
+            try:
+                detail = he.detail
+                if not isinstance(detail, str):
+                    detail = json.dumps(detail, ensure_ascii=False)
+                _write_figma_semantic_run_meta(
+                    run_dir,
+                    {
+                        **meta_base,
+                        "status": "error",
+                        "error": "model_service_http",
+                        "http_status": he.status_code,
+                        "detail": detail,
+                    },
+                )
+            except OSError:
+                pass
+        raise
+    except ValueError as exc:
+        if meta_base is not None:
+            try:
+                (run_dir / "model_response_raw.txt").write_text(
+                    response_text,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                _write_figma_semantic_run_meta(
+                    run_dir,
+                    {
+                        **meta_base,
+                        "status": "error",
+                        "error": "semantic_top_level_json_parse_failed",
+                        "detail": str(exc),
+                        "output_files": ["model_response_raw.txt"],
+                    },
+                )
+            except OSError:
+                pass
+        snippet = response_text[:1200]
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not parse top-level semantic model output: {exc}. Output starts with: {snippet!r}",
+        ) from exc
+
+    semantic_debug = {
+        "mode": "top_level_children_only",
+        "run_id": run_id,
+        "model_response": response_text[:4000],
+        "top_level_names_count": len(top_level_names),
+        "top_level_names": top_level_names,
+        "named_paths": [str(x.get("path")) for x in top_level_names if isinstance(x, dict)],
+        "child_images": child_image_debug,
+        "warnings": warnings,
+    }
+
+    if meta_base is not None:
+        try:
+            (run_dir / "output_semantic.json").write_text(
+                json.dumps(semantic_json, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            _write_figma_semantic_run_meta(
+                run_dir,
+                {
+                    **meta_base,
+                    "status": "ok",
+                    "output_files": ["output_semantic.json"],
+                    "semantic_debug": semantic_debug,
+                },
+            )
+        except OSError as exc:
+            warnings.append(f"Run output not written to {run_dir}: {exc}")
+
+    return FigmaConvertSemanticResponse(
+        semantic_json=semantic_json,
+        warnings=warnings,
+        semantic_debug=semantic_debug,
     )
 
 
