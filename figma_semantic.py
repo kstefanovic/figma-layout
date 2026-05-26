@@ -508,9 +508,13 @@ def build_top_level_semantic_user_text(top_children_payload: dict[str, Any]) -> 
         "- Use background_shape for large solid background plates, panels, or abstract solid shapes.\n"
         "- Use background_gradient_1, background_gradient_2, ... for soft gradient/fade/glow rectangles or overlays.\n"
         "- If there are multiple background gradients, assign numbers by position: top/upper first, bottom/lower second.\n"
-        "- Use discount_badge_group for visible discount badges like \"-54%\" or \"–54%\".\n"
+        "- Use discount_badge_group only for compact standalone discount badges whose text is just a number/percent like \"-54%\" or \"–54%\" on its own small background.\n"
+        "- Discount explanation or promotional copy is headline_group, not discount_badge_group.\n"
         "- Use decoration_group for groups of decorative stars/sparkles/ornaments.\n"
         "- If a star/sparkle itself is a direct top-level child, use star_decoration_1, star_decoration_2, ... by top-to-bottom then left-to-right.\n"
+        "- Use brand_group only for company/brand identity: company name, wordmark, logo, or logo mark.\n"
+        "- Use headline_group for product/offer description text: what the product is, main marketing copy, title, or subtitle.\n"
+        "- Do not classify product-description text as brand_group.\n"
         "- Do not classify large solid background shapes as hero_group unless there is a real photo/person/product image.\n"
         "- Do not classify stars/decorations as background_group.\n"
         "- Do not classify gradients as background_group.\n"
@@ -868,7 +872,54 @@ def _discount_text_present(node: Any) -> bool:
     text = _all_text_from_json(node)
     if not text:
         return False
-    return bool(re.search(r"[-–−]\s*\d+\s*%", text)) or bool(re.search(r"\d+\s*%", text))
+    compact = re.sub(r"\s+", "", text)
+    return bool(re.fullmatch(r"[-–−]?\d{1,3}%", compact))
+
+
+def _age_badge_text_present(node: Any) -> bool:
+    text = _all_text_from_json(node)
+    return text.replace(" ", "").strip() in {"0+", "3+", "6+", "12+", "16+", "18+"}
+
+
+def _legal_text_present(node: Any) -> bool:
+    low = _all_text_from_json(node).lower()
+    if not low:
+        return False
+    return any(
+        marker in low
+        for marker in (
+            "ооо",
+            "огрн",
+            "инн",
+            "акция",
+            "количество товаров",
+            "реклама",
+            "рекламодатель",
+            "продавец",
+        )
+    )
+
+
+def _price_or_offer_text_present(node: Any) -> bool:
+    text = _all_text_from_json(node)
+    low = text.lower()
+    return "₽" in text or "руб" in low or bool(re.search(r"\b\d{2,4}\s*₽", text))
+
+
+def _looks_like_product_headline_text(node: Any) -> bool:
+    text = _all_text_from_json(node)
+    if not text.strip():
+        return False
+    if _age_badge_text_present(node) or _legal_text_present(node) or _discount_text_present(node):
+        return False
+    if _price_or_offer_text_present(node):
+        return False
+    if _has_image_fill_deep(node):
+        return False
+    words = re.findall(r"[A-Za-zА-Яа-яЁё0-9]+", text)
+    if len(words) >= 2:
+        return True
+    return len(text.strip()) >= 10
 
 
 def _looks_like_background_shape(node: Any, root_w: float, root_h: float) -> bool:
@@ -903,6 +954,47 @@ def _looks_like_background_shape(node: Any, root_w: float, root_h: float) -> boo
     if x < 0 or y < 0:
         return True
     return False
+
+
+def _looks_like_brand_identity_group(node: Any, root_w: float, root_h: float) -> bool:
+    if not isinstance(node, dict):
+        return False
+    if _has_text_deep(node):
+        text = _all_text_from_json(node).lower()
+        if _looks_like_product_headline_text(node) or _price_or_offer_text_present(node):
+            return False
+        return any(marker in text for marker in ("яндекс", "лавка", "еда"))
+
+    typ = str(node.get("type") or "").lower()
+    if typ not in ("frame", "group", "instance"):
+        return False
+    if _has_image_fill_deep(node) or _has_gradient_fill_deep(node) or _star_node_count(node) > 0:
+        return False
+
+    area = _bounds_area(node)
+    canvas_area = max(1.0, root_w * root_h)
+    b = _bounds_dict(node)
+    try:
+        w = float(b.get("width") or 0)
+        h = float(b.get("height") or 0)
+    except (TypeError, ValueError):
+        return False
+    if w <= 0 or h <= 0:
+        return False
+    if area / canvas_area > 0.12:
+        return False
+    if root_h > 0 and h > root_h * 0.35:
+        return False
+    if w / h < 2.0:
+        return False
+
+    descendants = _walk_json_descendants(node)
+    vectorish = [
+        n
+        for n in descendants
+        if isinstance(n, dict) and str(n.get("type") or "").lower() in ("vector", "boolean_operation", "group")
+    ]
+    return len(vectorish) >= 2
 
 
 def postprocess_top_level_semantic_names(
@@ -962,6 +1054,38 @@ def postprocess_top_level_semantic_names(
             warnings.append(f"postprocess_top_level:{path}:{old}->discount_badge_group")
             continue
 
+        if _age_badge_text_present(child_json):
+            old = item.get("semantic_name")
+            item["semantic_name"] = "badge_group"
+            item["confidence"] = max(float(item.get("confidence") or 0.0), 0.99)
+            if old != "badge_group":
+                warnings.append(f"postprocess_top_level:{path}:{old}->badge_group")
+            continue
+
+        if _legal_text_present(child_json):
+            old = item.get("semantic_name")
+            item["semantic_name"] = "legal_group"
+            item["confidence"] = max(float(item.get("confidence") or 0.0), 0.99)
+            if old != "legal_group":
+                warnings.append(f"postprocess_top_level:{path}:{old}->legal_group")
+            continue
+
+        if _price_or_offer_text_present(child_json):
+            old = item.get("semantic_name")
+            if old in ("brand_group", "headline_group", "text_group", "foreground_group", "unknown_group", "background_group"):
+                item["semantic_name"] = "offer_group"
+                item["confidence"] = max(float(item.get("confidence") or 0.0), 0.95)
+                warnings.append(f"postprocess_top_level:{path}:{old}->offer_group")
+            continue
+
+        if _looks_like_product_headline_text(child_json):
+            old = item.get("semantic_name")
+            if old in ("brand_group", "text_group", "foreground_group", "unknown_group", "background_group"):
+                item["semantic_name"] = "headline_group"
+                item["confidence"] = max(float(item.get("confidence") or 0.0), 0.95)
+                warnings.append(f"postprocess_top_level:{path}:{old}->headline_group")
+            continue
+
         if _has_image_fill_deep(child_json):
             old = item.get("semantic_name")
             if old in ("background_group", "background_shape", "background_gradient", "foreground_group", "unknown_group"):
@@ -992,7 +1116,7 @@ def postprocess_top_level_semantic_names(
 
         if _looks_like_background_shape(child_json, root_w, root_h):
             old = item.get("semantic_name")
-            if old == "brand_group":
+            if old == "brand_group" and _looks_like_brand_identity_group(child_json, root_w, root_h):
                 continue
             item["semantic_name"] = "background_shape"
             item["confidence"] = max(float(item.get("confidence") or 0.0), 0.95)
