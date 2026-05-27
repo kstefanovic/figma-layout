@@ -315,12 +315,30 @@ Output exactly:
 TOP_LEVEL_SEMANTIC_NAMES = (
     "background_group",
     "background_shape",
+    "background_shape_2",
+    "background_shape_3",
+    "background_shape_4",
+    "background_shape_5",
+    "background_shape_6",
+    "background_shape_7",
+    "background_shape_8",
+    "background_shape_9",
+    "background_shape_10",
+    "background_shape_11",
+    "background_shape_12",
     "background_gradient",
     "background_gradient_1",
     "background_gradient_2",
     "background_gradient_3",
     "background_gradient_4",
     "background_gradient_5",
+    "background_gradient_6",
+    "background_gradient_7",
+    "background_gradient_8",
+    "background_gradient_9",
+    "background_gradient_10",
+    "background_gradient_11",
+    "background_gradient_12",
     "hero_group",
     "product_group",
     "text_group",
@@ -346,6 +364,18 @@ TOP_LEVEL_SEMANTIC_NAMES = (
 TOP_LEVEL_SEMANTIC_ALIASES = {
     "background": "background_group",
     "background_shape": "background_shape",
+    "background_shape_1": "background_shape",
+    "background_shape_2": "background_shape_2",
+    "background_shape_3": "background_shape_3",
+    "background_shape_4": "background_shape_4",
+    "background_shape_5": "background_shape_5",
+    "background_shape_6": "background_shape_6",
+    "background_shape_7": "background_shape_7",
+    "background_shape_8": "background_shape_8",
+    "background_shape_9": "background_shape_9",
+    "background_shape_10": "background_shape_10",
+    "background_shape_11": "background_shape_11",
+    "background_shape_12": "background_shape_12",
     "base_background": "background_shape",
     "color_panel": "background_group",
     "gradient_shape": "background_gradient",
@@ -355,6 +385,13 @@ TOP_LEVEL_SEMANTIC_ALIASES = {
     "background_gradient_3": "background_gradient_3",
     "background_gradient_4": "background_gradient_4",
     "background_gradient_5": "background_gradient_5",
+    "background_gradient_6": "background_gradient_6",
+    "background_gradient_7": "background_gradient_7",
+    "background_gradient_8": "background_gradient_8",
+    "background_gradient_9": "background_gradient_9",
+    "background_gradient_10": "background_gradient_10",
+    "background_gradient_11": "background_gradient_11",
+    "background_gradient_12": "background_gradient_12",
     "hero": "hero_group",
     "hero_image": "hero_group",
     "main_image": "hero_group",
@@ -606,7 +643,13 @@ def parse_top_level_names_object(
 
         matched_child: dict[str, Any] | None = None
 
-        if raw_path and raw_path in child_by_path:
+        if raw_sid and raw_sid in child_by_id:
+            matched_child = child_by_id[raw_sid]
+            raw_child_path = str(matched_child.get("path", "")).strip()
+            if raw_path and raw_child_path and raw_path != raw_child_path:
+                warnings.append(f"corrected_top_level_path:{raw_path}->{raw_child_path}:id={raw_sid}")
+
+        if matched_child is None and raw_path and raw_path in child_by_path:
             matched_child = child_by_path[raw_path]
 
         if matched_child is None and raw_index is not None:
@@ -614,9 +657,6 @@ def parse_top_level_names_object(
                 matched_child = child_by_index.get(int(raw_index))
             except (TypeError, ValueError):
                 matched_child = None
-
-        if matched_child is None and raw_sid:
-            matched_child = child_by_id.get(raw_sid)
 
         if matched_child is None:
             warnings.append(
@@ -813,6 +853,60 @@ def _bounds_area(node: Any) -> float:
         return 0.0
 
 
+def _top_level_sort_metrics(child: Any, fallback_index: int = 0) -> tuple[float, float, float, int]:
+    """Return stable visual ordering data: center y, center x, negative area, fallback index."""
+    cx, cy = _bounds_center(child)
+    return cy, cx, -_bounds_area(child), fallback_index
+
+
+def _renumber_top_level_series(
+    by_path: dict[str, dict[str, Any]],
+    children: list[dict[str, Any]],
+    *,
+    base_role: str,
+    keep_unsuffixed_first: bool,
+    warnings: list[str],
+) -> None:
+    pattern = re.compile(rf"^{re.escape(base_role)}(?:_(\d+))?$")
+    candidates: list[tuple[float, float, float, int, str]] = []
+    for i, child in enumerate(children):
+        if not isinstance(child, dict):
+            continue
+        path = str(child.get("path", i)).strip()
+        item = by_path.get(path)
+        if not item:
+            continue
+        role = normalize_top_level_semantic_name(item.get("semantic_name"))
+        if not pattern.match(role):
+            continue
+        child_json = child.get("json") if isinstance(child.get("json"), dict) else child
+        cy, cx, neg_area, fallback_index = _top_level_sort_metrics(child_json, i)
+        candidates.append((cy, cx, neg_area, fallback_index, path))
+
+    if len(candidates) <= 1:
+        return
+
+    if keep_unsuffixed_first:
+        candidates.sort(key=lambda t: (t[2], t[0], t[1], t[3]))
+    else:
+        candidates.sort(key=lambda t: (t[0], t[1], t[3]))
+
+    for n, (_cy, _cx, _neg_area, _fallback_index, path) in enumerate(candidates, start=1):
+        item = by_path.get(path)
+        if not item:
+            continue
+        old = item.get("semantic_name")
+        role = base_role if keep_unsuffixed_first and n == 1 else f"{base_role}_{n}"
+        item["semantic_name"] = normalize_top_level_semantic_name(role)
+        if old != item["semantic_name"]:
+            warnings.append(f"postprocess_top_level_unique:{path}:{old}->{item['semantic_name']}")
+
+
+def _is_top_level_role_family(role: Any, base_role: str) -> bool:
+    text = normalize_top_level_semantic_name(role)
+    return bool(re.fullmatch(rf"{re.escape(base_role)}(?:_\d+)?", text))
+
+
 def _node_fill_types(node: Any) -> list[str]:
     if not isinstance(node, dict):
         return []
@@ -866,6 +960,49 @@ def _star_node_count(node: Any) -> int:
         if typ == "star" or "star" in name or "sparkle" in name:
             count += 1
     return count
+
+
+def _looks_like_decoration_cluster(node: Any, root_w: float, root_h: float) -> bool:
+    if not isinstance(node, dict):
+        return False
+    if _has_text_deep(node) or _has_image_fill_deep(node):
+        return False
+    if _looks_like_brand_identity_group(node, root_w, root_h):
+        return False
+
+    descendants = _walk_json_descendants(node)
+    vectorish = [
+        n
+        for n in descendants
+        if isinstance(n, dict)
+        and str(n.get("type") or "").lower().replace("_", " ")
+        in ("vector", "boolean operation", "ellipse", "star")
+    ]
+    framed_pieces = [
+        n
+        for n in descendants
+        if isinstance(n, dict)
+        and str(n.get("type") or "").lower() in ("frame", "group", "instance")
+        and 0 < _bounds_area(n) <= max(1.0, root_w * root_h) * 0.05
+    ]
+    if len(vectorish) < 6 or len(framed_pieces) < 3:
+        return False
+    if not (_has_gradient_fill_deep(node) or _star_node_count(node) > 0):
+        return False
+
+    area = _bounds_area(node)
+    canvas_area = max(1.0, root_w * root_h)
+    b = _bounds_dict(node)
+    try:
+        x = float(b.get("x") or 0)
+        y = float(b.get("y") or 0)
+        w = float(b.get("width") or 0)
+        h = float(b.get("height") or 0)
+    except (TypeError, ValueError):
+        return False
+
+    off_canvas = x < 0 or y < 0 or x + w > root_w or y + h > root_h
+    return off_canvas or area / canvas_area <= 0.35
 
 
 def _discount_text_present(node: Any) -> bool:
@@ -1072,7 +1209,11 @@ def postprocess_top_level_semantic_names(
 
         if _price_or_offer_text_present(child_json):
             old = item.get("semantic_name")
-            if old in ("brand_group", "headline_group", "text_group", "foreground_group", "unknown_group", "background_group"):
+            if (
+                old in ("brand_group", "headline_group", "text_group", "foreground_group", "unknown_group", "background_group")
+                or _is_top_level_role_family(old, "background_shape")
+                or _is_top_level_role_family(old, "background_gradient")
+            ):
                 item["semantic_name"] = "offer_group"
                 item["confidence"] = max(float(item.get("confidence") or 0.0), 0.95)
                 warnings.append(f"postprocess_top_level:{path}:{old}->offer_group")
@@ -1080,7 +1221,11 @@ def postprocess_top_level_semantic_names(
 
         if _looks_like_product_headline_text(child_json):
             old = item.get("semantic_name")
-            if old in ("brand_group", "text_group", "foreground_group", "unknown_group", "background_group"):
+            if (
+                old in ("brand_group", "text_group", "foreground_group", "unknown_group", "background_group")
+                or _is_top_level_role_family(old, "background_shape")
+                or _is_top_level_role_family(old, "background_gradient")
+            ):
                 item["semantic_name"] = "headline_group"
                 item["confidence"] = max(float(item.get("confidence") or 0.0), 0.95)
                 warnings.append(f"postprocess_top_level:{path}:{old}->headline_group")
@@ -1088,10 +1233,37 @@ def postprocess_top_level_semantic_names(
 
         if _has_image_fill_deep(child_json):
             old = item.get("semantic_name")
-            if old in ("background_group", "background_shape", "background_gradient", "foreground_group", "unknown_group"):
+            if (
+                old in ("background_group", "foreground_group", "unknown_group")
+                or _is_top_level_role_family(old, "background_shape")
+                or _is_top_level_role_family(old, "background_gradient")
+            ):
                 item["semantic_name"] = "hero_group"
                 item["confidence"] = max(float(item.get("confidence") or 0.0), 0.9)
                 warnings.append(f"postprocess_top_level:{path}:{old}->hero_group")
+            continue
+
+        if _looks_like_brand_identity_group(child_json, root_w, root_h):
+            old = item.get("semantic_name")
+            if (
+                old in ("background_group", "foreground_group", "unknown_group", "hero_group")
+                or _is_top_level_role_family(old, "background_shape")
+            ):
+                item["semantic_name"] = "brand_group"
+                item["confidence"] = max(float(item.get("confidence") or 0.0), 0.95)
+                warnings.append(f"postprocess_top_level:{path}:{old}->brand_group")
+            continue
+
+        if _looks_like_decoration_cluster(child_json, root_w, root_h):
+            old = item.get("semantic_name")
+            if (
+                old in ("background_group", "foreground_group", "unknown_group", "hero_group")
+                or _is_top_level_role_family(old, "background_shape")
+                or _is_top_level_role_family(old, "background_gradient")
+            ):
+                item["semantic_name"] = "decoration_group"
+                item["confidence"] = max(float(item.get("confidence") or 0.0), 0.95)
+                warnings.append(f"postprocess_top_level:{path}:{old}->decoration_group")
             continue
 
         if (
@@ -1146,6 +1318,21 @@ def postprocess_top_level_semantic_names(
         item["semantic_name"] = role
         item["confidence"] = max(float(item.get("confidence") or 0.0), 0.99)
         warnings.append(f"postprocess_top_level:{path}:{old}->{role}")
+
+    _renumber_top_level_series(
+        by_path,
+        children,
+        base_role="background_gradient",
+        keep_unsuffixed_first=False,
+        warnings=warnings,
+    )
+    _renumber_top_level_series(
+        by_path,
+        children,
+        base_role="background_shape",
+        keep_unsuffixed_first=True,
+        warnings=warnings,
+    )
 
     out: list[dict[str, Any]] = []
     for i, child in enumerate(children):

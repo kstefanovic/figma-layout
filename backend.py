@@ -62,6 +62,7 @@ from json_embedding import (
     select_frame,
 )
 from layout_engine.convert import convert_banner
+from layout_training.model.inference import predict_top_level_layout_json
 from layout_transformer_v2.src.predict import LayoutTransformerV2Service
 from layout_transformer_v2.src.prototypes import load_prototypes, select_prototype
 from layout_transformer_v2.src.rich_utils import load_frames
@@ -148,6 +149,30 @@ LAYOUT_TRANSFORMER_RICH_FAMILIES_DIR = Path(
     os.getenv("LAYOUT_TRANSFORMER_RICH_FAMILIES_DIR", "layout_transformer/data/clean_families_rich"),
 ).resolve()
 LAYOUT_TRANSFORMER_DEVICE = os.getenv("LAYOUT_TRANSFORMER_DEVICE", "").strip() or None
+TOP_LEVEL_LAYOUT_MODEL_CHECKPOINT = os.getenv(
+    "TOP_LEVEL_LAYOUT_MODEL_CHECKPOINT",
+    "layout_training/checkpoints/top_level_layout_v1.pt",
+)
+TOP_LEVEL_LAYOUT_MODEL_DEVICE = os.getenv(
+    "TOP_LEVEL_LAYOUT_MODEL_DEVICE",
+    "auto",
+)
+TOP_LEVEL_LAYOUT_RETRIEVAL_ENABLED = os.getenv(
+    "TOP_LEVEL_LAYOUT_RETRIEVAL_ENABLED",
+    "1",
+).lower() not in ("0", "false", "no")
+TOP_LEVEL_LAYOUT_RETRIEVAL_RECORDS = os.getenv(
+    "TOP_LEVEL_LAYOUT_RETRIEVAL_RECORDS",
+    "layout_training/data/layout_records/top_level_records.jsonl",
+)
+TOP_LEVEL_LAYOUT_RETRIEVAL_K = int(os.getenv(
+    "TOP_LEVEL_LAYOUT_RETRIEVAL_K",
+    "5",
+))
+TOP_LEVEL_LAYOUT_RETRIEVAL_BLEND = os.getenv(
+    "TOP_LEVEL_LAYOUT_RETRIEVAL_BLEND",
+    "1",
+).lower() not in ("0", "false", "no")
 FRONTEND_DIR = Path(__file__).resolve().parent / "frontend"
 UNSUPPORTED_CLASS_NUMBER = -1
 CLASS_TO_PROTOTYPE_FAMILY = {
@@ -380,6 +405,21 @@ class LayoutTransformerResponse(BaseModel):
     debug: LayoutTransformerDebug
 
 
+class FigmaTopLevelLayoutPredictRequest(BaseModel):
+    semantic_json: dict[str, Any]
+    target_width: int = Field(..., ge=1, le=20000)
+    target_height: int = Field(..., ge=1, le=20000)
+    checkpoint: str | None = None
+    retrieval_enabled: bool | None = None
+    retrieval_k: int | None = Field(default=None, ge=1, le=100)
+
+
+class FigmaTopLevelLayoutPredictResponse(BaseModel):
+    final_json: dict[str, Any]
+    warnings: list[str] = Field(default_factory=list)
+    debug: dict[str, Any] = Field(default_factory=dict)
+
+
 app = FastAPI(title="Public Qwen2.5-VL Backend")
 app.add_middleware(
     CORSMiddleware,
@@ -418,6 +458,22 @@ def load_layout_transformer_service() -> None:
 
 def _model_url(path: str) -> str:
     return f"{MODEL_SERVICE_URL.rstrip('/')}/{path.lstrip('/')}"
+
+
+def _resolve_top_level_layout_checkpoint_path(value: str | None) -> Path:
+    raw = (value or "").strip() or TOP_LEVEL_LAYOUT_MODEL_CHECKPOINT
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = (Path(__file__).resolve().parent / path).resolve()
+    return path
+
+
+def _resolve_top_level_layout_retrieval_records_path(value: str | None) -> Path:
+    raw = (value or "").strip() or TOP_LEVEL_LAYOUT_RETRIEVAL_RECORDS
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = (Path(__file__).resolve().parent / path).resolve()
+    return path
 
 
 def _content_from_request(request: ChatRequest) -> list[dict[str, Any]]:
@@ -2405,6 +2461,61 @@ async def figma_semantic_top_level_children(
         semantic_json=semantic_json,
         warnings=warnings,
         semantic_debug=semantic_debug,
+    )
+
+
+@app.get("/figma/top-level-layout-predict/health")
+async def figma_top_level_layout_predict_health() -> dict[str, Any]:
+    path = _resolve_top_level_layout_checkpoint_path(None)
+    retrieval_path = _resolve_top_level_layout_retrieval_records_path(None)
+    return {
+        "ok": path.exists(),
+        "checkpoint": str(path),
+        "device": TOP_LEVEL_LAYOUT_MODEL_DEVICE,
+        "retrieval_enabled": TOP_LEVEL_LAYOUT_RETRIEVAL_ENABLED,
+        "retrieval_records": str(retrieval_path),
+        "retrieval_records_exists": retrieval_path.exists(),
+        "retrieval_k": TOP_LEVEL_LAYOUT_RETRIEVAL_K,
+    }
+
+
+@app.post("/figma/top-level-layout-predict", response_model=FigmaTopLevelLayoutPredictResponse)
+async def figma_top_level_layout_predict(
+    req: FigmaTopLevelLayoutPredictRequest,
+) -> FigmaTopLevelLayoutPredictResponse:
+    checkpoint_path = _resolve_top_level_layout_checkpoint_path(req.checkpoint)
+    retrieval_path = _resolve_top_level_layout_retrieval_records_path(None)
+    if not checkpoint_path.exists():
+        raise HTTPException(
+            status_code=503,
+            detail=f"Top-level layout checkpoint not found: {checkpoint_path}",
+        )
+    retrieval_enabled = TOP_LEVEL_LAYOUT_RETRIEVAL_ENABLED if req.retrieval_enabled is None else req.retrieval_enabled
+    retrieval_k = TOP_LEVEL_LAYOUT_RETRIEVAL_K if req.retrieval_k is None else req.retrieval_k
+    try:
+        result = predict_top_level_layout_json(
+            semantic_json=req.semantic_json,
+            target_width=req.target_width,
+            target_height=req.target_height,
+            checkpoint_path=str(checkpoint_path),
+            device=TOP_LEVEL_LAYOUT_MODEL_DEVICE,
+            retrieval_enabled=retrieval_enabled,
+            retrieval_records_path=str(retrieval_path),
+            retrieval_k=retrieval_k,
+            retrieval_blend=TOP_LEVEL_LAYOUT_RETRIEVAL_BLEND,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ImportError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Top-level layout prediction failed: {exc}") from exc
+    return FigmaTopLevelLayoutPredictResponse(
+        final_json=result["final_json"],
+        warnings=result.get("warnings", []),
+        debug=result.get("debug", {}),
     )
 
 

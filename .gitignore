@@ -24,3 +24,5 @@ layout_transformer_v2/data/dataset
 
 layout_transformer_v2/previews
 layout_transformer_v2/data/prototypes
+layout_training/data/
+layout_training/checkpoints/
