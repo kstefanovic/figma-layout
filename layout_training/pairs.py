@@ -135,3 +135,102 @@ def build_pairs(records: list[dict[str, Any]], families_path: str | Path | None 
                 )
     return pairs
 
+
+def _role_occurrence_from_token_id(token_id: str) -> tuple[str, int | None]:
+    clean = str(token_id or "")
+    if "#" not in clean:
+        return clean, None
+    role, raw_idx = clean.rsplit("#", 1)
+    return role, int(raw_idx) if raw_idx.isdigit() else None
+
+
+def _lookup_core_target(target_tokens: list[dict[str, Any]]) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]], dict[tuple[str, int], dict[str, Any]]]:
+    by_token_id = {str(t.get("token_id")): t for t in target_tokens}
+    by_role: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    by_role_occurrence: dict[tuple[str, int], dict[str, Any]] = {}
+    for token in target_tokens:
+        role = str(token.get("train_role") or "")
+        by_role[role].append(token)
+        _role, occurrence = _role_occurrence_from_token_id(str(token.get("token_id") or ""))
+        if occurrence is not None:
+            by_role_occurrence[(role, occurrence)] = token
+    unique_by_role = {role: rows[0] for role, rows in by_role.items() if len(rows) == 1}
+    return by_token_id, unique_by_role, by_role_occurrence
+
+
+def build_core_pairs(records: list[dict[str, Any]], families_path: str | Path | None = None, min_matched_tokens: int = 3) -> list[dict[str, Any]]:
+    pairs, _stats = build_core_pairs_with_stats(records, families_path, min_matched_tokens=min_matched_tokens)
+    return pairs
+
+
+def build_core_pairs_with_stats(records: list[dict[str, Any]], families_path: str | Path | None = None, min_matched_tokens: int = 3) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    pairs: list[dict[str, Any]] = []
+    families = group_records_by_family(records, families_path)
+    total_candidate_pairs = 0
+    skipped_pairs = 0
+    skipped_reason_counts: dict[str, int] = defaultdict(int)
+    matched_role_counts: dict[str, int] = defaultdict(int)
+    matched_tokens_total = 0
+    for family_id, recs in families.items():
+        for source in recs:
+            for target in recs:
+                if source is target or _canvas_size_key(source) == _canvas_size_key(target):
+                    continue
+                total_candidate_pairs += 1
+                tgt_by_id, tgt_unique_by_role, tgt_by_role_occ = _lookup_core_target(target.get("tokens") or [])
+                pair_tokens: list[dict[str, Any]] = []
+                matched = 0
+                for src_token in source.get("tokens") or []:
+                    token_id = str(src_token.get("token_id") or "")
+                    train_role = str(src_token.get("train_role") or "")
+                    _role, occurrence = _role_occurrence_from_token_id(token_id)
+                    tgt = tgt_by_id.get(token_id)
+                    if tgt is None:
+                        tgt = tgt_unique_by_role.get(train_role)
+                    if tgt is None and occurrence is not None:
+                        tgt = tgt_by_role_occ.get((train_role, occurrence))
+                    has_target = tgt is not None
+                    if has_target:
+                        matched += 1
+                        matched_role_counts[train_role] += 1
+                    pair_tokens.append(
+                        {
+                            "token_id": token_id,
+                            "train_role": train_role,
+                            "source": src_token,
+                            "target_center_size_norm": (tgt or {}).get("center_size_norm"),
+                            "target_bottom_y_norm": (
+                                ((tgt or {}).get("center_size_norm") or [None, None, None, None])[1]
+                                + (((tgt or {}).get("center_size_norm") or [None, None, None, None])[3] or 0.0) / 2.0
+                            )
+                            if has_target and train_role == "legal_group"
+                            else None,
+                            "has_target": has_target,
+                        }
+                    )
+                if matched < min_matched_tokens:
+                    skipped_pairs += 1
+                    skipped_reason_counts["fewer_than_3_matched_core_tokens"] += 1
+                    continue
+                matched_tokens_total += matched
+                pairs.append(
+                    {
+                        "pair_id": f"{family_id}:{source.get('id')}->{target.get('id')}",
+                        "family_id": family_id,
+                        "source_id": source.get("id"),
+                        "target_id": target.get("id"),
+                        "source_canvas": source.get("canvas"),
+                        "target_canvas": target.get("canvas"),
+                        "tokens": pair_tokens,
+                    }
+                )
+    stats = {
+        "total_candidate_pairs": total_candidate_pairs,
+        "valid_pairs": len(pairs),
+        "skipped_pairs": skipped_pairs,
+        "skipped_reason_counts": dict(skipped_reason_counts),
+        "average_matched_tokens": (matched_tokens_total / len(pairs)) if pairs else 0.0,
+        "matched_role_counts": dict(matched_role_counts),
+        "pair_count_by_family": dict(sorted((family_id, sum(1 for pair in pairs if str(pair.get("family_id")) == family_id)) for family_id in families)),
+    }
+    return pairs, stats

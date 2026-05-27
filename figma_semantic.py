@@ -357,6 +357,7 @@ TOP_LEVEL_SEMANTIC_NAMES = (
     "star_decoration_3",
     "star_decoration_4",
     "star_decoration_5",
+    "word_vector_group",
     "foreground_group",
     "unknown_group",
 )
@@ -432,6 +433,17 @@ TOP_LEVEL_SEMANTIC_ALIASES = {
     "sparkle_1": "star_decoration_1",
     "sparkle_2": "star_decoration_2",
     "ornament": "decoration_group",
+    "word_vector": "word_vector_group",
+    "word_vector_group": "word_vector_group",
+    "word_art": "word_vector_group",
+    "word_art_group": "word_vector_group",
+    "decorative_word": "word_vector_group",
+    "decorative_word_group": "word_vector_group",
+    "mnogo": "word_vector_group",
+    "mnogo_word": "word_vector_group",
+    "mnogo_vector": "word_vector_group",
+    "repeated_word": "word_vector_group",
+    "repeated_word_vector": "word_vector_group",
     "cta": "cta_group",
     "button": "cta_group",
     "call_to_action": "cta_group",
@@ -446,7 +458,11 @@ TOP_LEVEL_SEMANTIC_SYSTEM_PROMPT = (
     "Name ONLY direct children of the root Figma frame. Do not name nested children. "
     "Do not invent ids or paths. Use ONLY these semantic_name values: "
     + ", ".join(TOP_LEVEL_SEMANTIC_NAMES)
-    + ". No markdown, no commentary."
+    + ". Use word_vector_group for large decorative vectorized repeated-word art "
+    'like "МНОГО"/"MNOGO" strips near top/bottom or left/right edges. '
+    "Do not use word_vector_group for brand logos/brand_group, logo+brand text, product images, "
+    "price/legal text, background gradients, or solid background plates. "
+    "No markdown, no commentary."
 )
 
 
@@ -549,6 +565,9 @@ def build_top_level_semantic_user_text(top_children_payload: dict[str, Any]) -> 
         "- Discount explanation or promotional copy is headline_group, not discount_badge_group.\n"
         "- Use decoration_group for groups of decorative stars/sparkles/ornaments.\n"
         "- If a star/sparkle itself is a direct top-level child, use star_decoration_1, star_decoration_2, ... by top-to-bottom then left-to-right.\n"
+        "- Use word_vector_group for large decorative vectorized repeated-word art (for example repeated \"МНОГО\"/\"MNOGO\") near banner outer edges.\n"
+        "- If decorative word-art vectors are separate from brand identity, use word_vector_group, not background_shape.\n"
+        "- Do not use word_vector_group for brand logos, brand_group, logo+brand text, product images, price/legal text, background gradients, or solid background plates.\n"
         "- Use brand_group only for company/brand identity: company name, wordmark, logo, or logo mark.\n"
         "- Use headline_group for product/offer description text: what the product is, main marketing copy, title, or subtitle.\n"
         "- Do not classify product-description text as brand_group.\n"
@@ -950,6 +969,129 @@ def _has_solid_fill_deep(node: Any) -> bool:
     )
 
 
+def _is_vectorish_deep(node: Any) -> bool:
+    if not isinstance(node, dict):
+        return False
+    descendants = _walk_json_descendants(node)
+    has_required = False
+    for n in descendants:
+        typ = str((n or {}).get("type") or "").lower().replace("_", " ")
+        if typ in ("vector", "boolean operation"):
+            has_required = True
+        elif typ not in ("group", "frame", "instance"):
+            continue
+    return has_required
+
+
+def _visible_node_and_fill(node: Any, fill: Any) -> bool:
+    if not isinstance(node, dict) or not isinstance(fill, dict):
+        return False
+    node_visible = bool(node.get("visible", True))
+    fill_visible = bool(fill.get("visible", True))
+    return node_visible and fill_visible
+
+
+def _solid_fill_count_deep(node: Any) -> int:
+    count = 0
+    for n in _walk_json_descendants(node):
+        fills = n.get("fills") if isinstance(n, dict) and isinstance(n.get("fills"), list) else []
+        for f in fills:
+            if not _visible_node_and_fill(n, f):
+                continue
+            if str(f.get("type") or "").upper() == "SOLID":
+                count += 1
+    return count
+
+
+def _gradient_fill_count_deep(node: Any) -> int:
+    count = 0
+    for n in _walk_json_descendants(node):
+        fills = n.get("fills") if isinstance(n, dict) and isinstance(n.get("fills"), list) else []
+        for f in fills:
+            if not _visible_node_and_fill(n, f):
+                continue
+            if "GRADIENT" in str(f.get("type") or "").upper():
+                count += 1
+    return count
+
+
+def _image_fill_count_deep(node: Any) -> int:
+    count = 0
+    for n in _walk_json_descendants(node):
+        fills = n.get("fills") if isinstance(n, dict) and isinstance(n.get("fills"), list) else []
+        for f in fills:
+            if not _visible_node_and_fill(n, f):
+                continue
+            if str(f.get("type") or "").upper() == "IMAGE":
+                count += 1
+    return count
+
+
+def _text_node_count_deep(node: Any) -> int:
+    return sum(
+        1
+        for n in _walk_json_descendants(node)
+        if isinstance(n, dict) and isinstance(n.get("characters"), str) and n.get("characters").strip()
+    )
+
+
+def _looks_like_word_vector_group(node: Any, root_w: float, root_h: float) -> bool:
+    if not isinstance(node, dict):
+        return False
+    if not _is_vectorish_deep(node):
+        return False
+    text_count = _text_node_count_deep(node)
+    if text_count > 0:
+        return False
+    if _image_fill_count_deep(node) > 0:
+        return False
+
+    solid_count = _solid_fill_count_deep(node)
+    gradient_count = _gradient_fill_count_deep(node)
+    if solid_count <= 0:
+        return False
+    if gradient_count > 0 and solid_count <= 0:
+        return False
+
+    b = _bounds_dict(node)
+    try:
+        x = float(b.get("x") or 0)
+        y = float(b.get("y") or 0)
+        w = float(b.get("width") or 0)
+        h = float(b.get("height") or 0)
+    except (TypeError, ValueError):
+        return False
+    if w <= 1 or h <= 1 or root_w <= 1 or root_h <= 1:
+        return False
+
+    area_ratio = (w * h) / max(1.0, root_w * root_h)
+    if area_ratio < 0.015 or area_ratio > 0.35:
+        return False
+
+    edge_margin_x = root_w * 0.08
+    edge_margin_y = root_h * 0.08
+    bleed_x = root_w * 0.03
+    bleed_y = root_h * 0.03
+
+    near_top = y <= edge_margin_y + bleed_y
+    near_bottom = (y + h) >= (root_h - edge_margin_y - bleed_y)
+    near_left = x <= edge_margin_x + bleed_x
+    near_right = (x + w) >= (root_w - edge_margin_x - bleed_x)
+
+    horizontal_strip = w >= root_w * 0.45 and h <= root_h * 0.25 and (near_top or near_bottom)
+    vertical_strip = h >= root_h * 0.45 and w <= root_w * 0.25 and (near_left or near_right)
+    if not horizontal_strip and not vertical_strip:
+        return False
+
+    if not (near_top or near_bottom or near_left or near_right):
+        return False
+
+    if w < root_w * 0.22 and h < root_h * 0.12:
+        return False
+
+    return True
+
+
 def _star_node_count(node: Any) -> int:
     count = 0
     for n in _walk_json_descendants(node):
@@ -1222,10 +1364,10 @@ def postprocess_top_level_semantic_names(
         if _looks_like_product_headline_text(child_json):
             old = item.get("semantic_name")
             if (
-                old in ("brand_group", "text_group", "foreground_group", "unknown_group", "background_group")
+                old in ("brand_group", "text_group", "foreground_group", "unknown_group", "background_group", "hero_group")
                 or _is_top_level_role_family(old, "background_shape")
                 or _is_top_level_role_family(old, "background_gradient")
-            ):
+            ) and not _has_image_fill_deep(child_json):
                 item["semantic_name"] = "headline_group"
                 item["confidence"] = max(float(item.get("confidence") or 0.0), 0.95)
                 warnings.append(f"postprocess_top_level:{path}:{old}->headline_group")
@@ -1284,6 +1426,27 @@ def postprocess_top_level_semantic_names(
                 item["semantic_name"] = "decoration_group"
                 item["confidence"] = max(float(item.get("confidence") or 0.0), 0.95)
                 warnings.append(f"postprocess_top_level:{path}:{old}->decoration_group")
+            continue
+
+        if _looks_like_word_vector_group(child_json, root_w, root_h):
+            old = item.get("semantic_name")
+            if old in (
+                "background_group",
+                "background_shape",
+                "foreground_group",
+                "decoration_group",
+                "unknown_group",
+            ) or str(old).startswith("background_"):
+                item["semantic_name"] = "word_vector_group"
+                item["confidence"] = max(float(item.get("confidence") or 0.0), 0.98)
+                warnings.append(f"postprocess_top_level:{path}:{old}->word_vector_group")
+            elif old == "brand_group":
+                # Recover from low-confidence fallback brand_group on large edge strip vectors.
+                old_conf = float(item.get("confidence") or 0.0)
+                if old_conf <= 0.2 and not _looks_like_brand_identity_group(child_json, root_w, root_h):
+                    item["semantic_name"] = "word_vector_group"
+                    item["confidence"] = max(old_conf, 0.98)
+                    warnings.append(f"postprocess_top_level:{path}:{old}->word_vector_group")
             continue
 
         if _looks_like_background_shape(child_json, root_w, root_h):

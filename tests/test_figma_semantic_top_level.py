@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import unittest
 
-from figma_semantic import parse_top_level_names_object, postprocess_top_level_semantic_names
+from figma_semantic import (
+    _looks_like_word_vector_group,
+    parse_top_level_names_object,
+    postprocess_top_level_semantic_names,
+)
 
 
 def _child(
@@ -54,6 +58,92 @@ def _text_child(index: int, node_id: str, role: str, characters: str) -> tuple[d
 
 
 class TestFigmaSemanticTopLevel(unittest.TestCase):
+    def test_word_vector_group_detector_top_strip_true(self) -> None:
+        node = {
+            "type": "vector",
+            "bounds": {"x": 16, "y": -1, "width": 1166, "height": 230},
+            "fills": [{"type": "SOLID"}],
+        }
+        self.assertTrue(_looks_like_word_vector_group(node, 1200, 1920))
+
+    def test_word_vector_group_detector_brandlike_center_false(self) -> None:
+        node = {
+            "type": "group",
+            "bounds": {"x": 280, "y": 340, "width": 620, "height": 145},
+            "fills": [],
+            "children": [
+                {"type": "vector", "bounds": {"x": 280, "y": 340, "width": 620, "height": 145}, "fills": [{"type": "SOLID"}]}
+            ],
+        }
+        self.assertFalse(_looks_like_word_vector_group(node, 1200, 1920))
+
+    def test_word_vector_group_detector_large_plate_false(self) -> None:
+        node = {
+            "type": "rectangle",
+            "bounds": {"x": 0, "y": 0, "width": 1200, "height": 1000},
+            "fills": [{"type": "SOLID"}],
+            "children": [{"type": "vector", "bounds": {"x": 0, "y": 0, "width": 1200, "height": 1000}, "fills": [{"type": "SOLID"}]}],
+        }
+        self.assertFalse(_looks_like_word_vector_group(node, 1200, 1920))
+
+    def test_word_vector_group_detector_gradient_only_false(self) -> None:
+        node = {
+            "type": "vector",
+            "bounds": {"x": 16, "y": -1, "width": 1166, "height": 230},
+            "fills": [{"type": "GRADIENT_LINEAR"}],
+        }
+        self.assertFalse(_looks_like_word_vector_group(node, 1200, 1920))
+
+    def test_word_vector_group_postprocess_overrides_background_shape(self) -> None:
+        child, name = _child(7, "wvg", "background_shape", x=16.61, y=-1, width=1166.27, height=230.62)
+        child["json"]["type"] = "vector"
+        child["json"]["fills"] = [{"type": "SOLID"}]
+        warnings: list[str] = []
+        out = postprocess_top_level_semantic_names(
+            [name],
+            {"root": {"width": 1200, "height": 1920}, "children": [child]},
+            warnings,
+        )
+        self.assertEqual(out[0]["semantic_name"], "word_vector_group")
+
+    def test_word_vector_group_does_not_override_brand_group(self) -> None:
+        child, name = _child(6, "brand", "brand_group", x=66, y=54, width=567, height=87)
+        child["json"]["type"] = "group"
+        child["json"]["children"] = [
+            {"id": "word_1", "type": "vector", "bounds": {"x": 66, "y": 67, "width": 244, "height": 71}, "fills": [{"type": "SOLID"}]},
+            {"id": "word_2", "type": "vector", "bounds": {"x": 420, "y": 67, "width": 208, "height": 62}, "fills": [{"type": "SOLID"}]},
+            {
+                "id": "logo",
+                "type": "frame",
+                "bounds": {"x": 325, "y": 57, "width": 81, "height": 81},
+                "fills": [{"type": "SOLID", "visible": False}],
+                "children": [
+                    {"id": "logo_back", "type": "vector", "bounds": {"x": 325, "y": 57, "width": 81, "height": 81}, "fills": [{"type": "SOLID"}]},
+                    {"id": "logo_fore", "type": "vector", "bounds": {"x": 341, "y": 78, "width": 49, "height": 45}, "fills": [{"type": "SOLID"}]},
+                ],
+            },
+        ]
+        warnings: list[str] = []
+        out = postprocess_top_level_semantic_names(
+            [name],
+            {"root": {"width": 1080, "height": 1080}, "children": [child]},
+            warnings,
+        )
+        self.assertEqual(out[0]["semantic_name"], "brand_group")
+
+    def test_word_vector_group_recovers_low_confidence_false_brand_group(self) -> None:
+        child, name = _child(8, "wvg", "brand_group", x=0.75, y=-2, width=598.83, height=125.43)
+        child["json"]["type"] = "vector"
+        child["json"]["fills"] = [{"type": "SOLID"}]
+        name["confidence"] = 0.0
+        warnings: list[str] = []
+        out = postprocess_top_level_semantic_names(
+            [name],
+            {"root": {"width": 600, "height": 1024}, "children": [child]},
+            warnings,
+        )
+        self.assertEqual(out[0]["semantic_name"], "word_vector_group")
+
     def test_duplicate_model_gradient_names_are_renumbered_by_position(self) -> None:
         top_child_0, name_0 = _child(0, "top", "background_gradient_1", x=100, y=10, width=300, height=120)
         top_child_1, name_1 = _child(1, "bottom", "background_gradient_1", x=40, y=400, width=300, height=120)
@@ -107,6 +197,40 @@ class TestFigmaSemanticTopLevel(unittest.TestCase):
         )
 
         self.assertEqual(out[0]["semantic_name"], "offer_group")
+
+    def test_text_only_headline_overrides_false_hero_group(self) -> None:
+        child, name = _child(0, "headline", "hero_group", x=149, y=190.39, width=782.13, height=245.84)
+        child["json"]["type"] = "frame"
+        child["json"]["children"] = [
+            {
+                "id": "t1",
+                "type": "text",
+                "characters": "Розыгрыш",
+                "bounds": {"x": 160, "y": 200, "width": 200, "height": 60},
+                "fills": [{"type": "SOLID"}],
+            },
+            {
+                "id": "t2",
+                "type": "text",
+                "characters": "20 000 бонусов",
+                "bounds": {"x": 160, "y": 260, "width": 420, "height": 80},
+                "fills": [{"type": "SOLID"}],
+            },
+            {
+                "id": "t3",
+                "type": "text",
+                "characters": "при заказе в ПВЗ Золотого Яблока",
+                "bounds": {"x": 160, "y": 340, "width": 620, "height": 60},
+                "fills": [{"type": "SOLID"}],
+            },
+        ]
+        warnings: list[str] = []
+        out = postprocess_top_level_semantic_names(
+            [name],
+            {"root": {"width": 1080, "height": 1350}, "children": [child]},
+            warnings,
+        )
+        self.assertEqual(out[0]["semantic_name"], "headline_group")
 
     def test_compact_vector_wordmark_row_overrides_background_shape(self) -> None:
         child, name = _child(0, "brand", "background_group", x=40, y=36, width=377, height=55)

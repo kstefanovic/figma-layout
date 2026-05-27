@@ -62,7 +62,9 @@ from json_embedding import (
     select_frame,
 )
 from layout_engine.convert import convert_banner
+from layout_training.core.inference import predict_core_top_level_layout_json
 from layout_training.model.inference import predict_top_level_layout_json
+from layout_training.ralf.inference import get_ralf_retrieval_index_status, predict_ralf_top_level_layout_json
 from layout_transformer_v2.src.predict import LayoutTransformerV2Service
 from layout_transformer_v2.src.prototypes import load_prototypes, select_prototype
 from layout_transformer_v2.src.rich_utils import load_frames
@@ -173,6 +175,30 @@ TOP_LEVEL_LAYOUT_RETRIEVAL_BLEND = os.getenv(
     "TOP_LEVEL_LAYOUT_RETRIEVAL_BLEND",
     "1",
 ).lower() not in ("0", "false", "no")
+TOP_LEVEL_LAYOUT_ENGINE = os.getenv(
+    "TOP_LEVEL_LAYOUT_ENGINE",
+    "core",
+).strip().lower()
+TOP_LEVEL_LAYOUT_CORE_CHECKPOINT = os.getenv(
+    "TOP_LEVEL_LAYOUT_CORE_CHECKPOINT",
+    "layout_training/checkpoints/top_level_layout_core_v1.pt",
+)
+TOP_LEVEL_LAYOUT_RALF_CHECKPOINT = os.getenv(
+    "TOP_LEVEL_LAYOUT_RALF_CHECKPOINT",
+    "layout_training/checkpoints/top_level_layout_ralf_v1.pt",
+)
+TOP_LEVEL_LAYOUT_RALF_RECORDS = os.getenv(
+    "TOP_LEVEL_LAYOUT_RALF_RECORDS",
+    "layout_training/data/layout_records/top_level_records.jsonl",
+)
+TOP_LEVEL_LAYOUT_RALF_INDEX = os.getenv(
+    "TOP_LEVEL_LAYOUT_RALF_INDEX",
+    "layout_training/data/layout_records/top_level_retrieval_index.pt",
+)
+TOP_LEVEL_LAYOUT_RALF_K = int(os.getenv(
+    "TOP_LEVEL_LAYOUT_RALF_K",
+    "5",
+))
 FRONTEND_DIR = Path(__file__).resolve().parent / "frontend"
 UNSUPPORTED_CLASS_NUMBER = -1
 CLASS_TO_PROTOTYPE_FAMILY = {
@@ -410,6 +436,7 @@ class FigmaTopLevelLayoutPredictRequest(BaseModel):
     target_width: int = Field(..., ge=1, le=20000)
     target_height: int = Field(..., ge=1, le=20000)
     checkpoint: str | None = None
+    engine: Literal["ralf", "model"] | None = None
     retrieval_enabled: bool | None = None
     retrieval_k: int | None = Field(default=None, ge=1, le=100)
 
@@ -468,8 +495,40 @@ def _resolve_top_level_layout_checkpoint_path(value: str | None) -> Path:
     return path
 
 
+def _resolve_top_level_layout_core_checkpoint_path(value: str | None) -> Path:
+    raw = (value or "").strip() or TOP_LEVEL_LAYOUT_CORE_CHECKPOINT
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = (Path(__file__).resolve().parent / path).resolve()
+    return path
+
+
 def _resolve_top_level_layout_retrieval_records_path(value: str | None) -> Path:
     raw = (value or "").strip() or TOP_LEVEL_LAYOUT_RETRIEVAL_RECORDS
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = (Path(__file__).resolve().parent / path).resolve()
+    return path
+
+
+def _resolve_top_level_layout_ralf_checkpoint_path(value: str | None) -> Path:
+    raw = (value or "").strip() or TOP_LEVEL_LAYOUT_RALF_CHECKPOINT
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = (Path(__file__).resolve().parent / path).resolve()
+    return path
+
+
+def _resolve_top_level_layout_ralf_records_path(value: str | None) -> Path:
+    raw = (value or "").strip() or TOP_LEVEL_LAYOUT_RALF_RECORDS
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = (Path(__file__).resolve().parent / path).resolve()
+    return path
+
+
+def _resolve_top_level_layout_ralf_index_path(value: str | None) -> Path:
+    raw = (value or "").strip() or TOP_LEVEL_LAYOUT_RALF_INDEX
     path = Path(raw).expanduser()
     if not path.is_absolute():
         path = (Path(__file__).resolve().parent / path).resolve()
@@ -1129,6 +1188,8 @@ def health() -> dict[str, Any]:
     except requests.RequestException as exc:
         model_health = {"status": "unreachable", "error": str(exc)}
 
+    ralf_index = _resolve_top_level_layout_ralf_index_path(None)
+    ralf_index_status = get_ralf_retrieval_index_status(str(ralf_index))
     return {
         "status": "ok",
         "model_service_url": MODEL_SERVICE_URL,
@@ -1143,6 +1204,10 @@ def health() -> dict[str, Any]:
             "loaded": layout_transformer_service is not None,
             "roles": (layout_transformer_service.model_roles if layout_transformer_service else LAYOUT_TRANSFORMER_V2_ROLES),
         },
+        "ralf_index": str(ralf_index),
+        "ralf_index_exists": ralf_index.exists(),
+        "ralf_index_loaded_in_memory": bool(ralf_index_status.get("loaded_in_memory")),
+        "ralf_index_record_count": ralf_index_status.get("record_count"),
     }
 
 
@@ -2467,15 +2532,31 @@ async def figma_semantic_top_level_children(
 @app.get("/figma/top-level-layout-predict/health")
 async def figma_top_level_layout_predict_health() -> dict[str, Any]:
     path = _resolve_top_level_layout_checkpoint_path(None)
+    core_ckpt = _resolve_top_level_layout_core_checkpoint_path(None)
     retrieval_path = _resolve_top_level_layout_retrieval_records_path(None)
+    ralf_ckpt = _resolve_top_level_layout_ralf_checkpoint_path(None)
+    ralf_records = _resolve_top_level_layout_ralf_records_path(None)
+    ralf_index = _resolve_top_level_layout_ralf_index_path(None)
+    ralf_index_status = get_ralf_retrieval_index_status(str(ralf_index))
     return {
-        "ok": path.exists(),
+        "ok": core_ckpt.exists() if TOP_LEVEL_LAYOUT_ENGINE == "core" else path.exists(),
         "checkpoint": str(path),
+        "core_checkpoint": str(core_ckpt),
+        "core_checkpoint_exists": core_ckpt.exists(),
         "device": TOP_LEVEL_LAYOUT_MODEL_DEVICE,
+        "engine": TOP_LEVEL_LAYOUT_ENGINE,
         "retrieval_enabled": TOP_LEVEL_LAYOUT_RETRIEVAL_ENABLED,
         "retrieval_records": str(retrieval_path),
         "retrieval_records_exists": retrieval_path.exists(),
         "retrieval_k": TOP_LEVEL_LAYOUT_RETRIEVAL_K,
+        "ralf_checkpoint": str(ralf_ckpt),
+        "ralf_checkpoint_exists": ralf_ckpt.exists(),
+        "ralf_index": str(ralf_index),
+        "ralf_index_exists": ralf_index.exists(),
+        "loaded_in_memory": bool(ralf_index_status.get("loaded_in_memory")),
+        "record_count": ralf_index_status.get("record_count"),
+        "records_path": str(ralf_records),
+        "records_exists": ralf_records.exists(),
     }
 
 
@@ -2483,27 +2564,72 @@ async def figma_top_level_layout_predict_health() -> dict[str, Any]:
 async def figma_top_level_layout_predict(
     req: FigmaTopLevelLayoutPredictRequest,
 ) -> FigmaTopLevelLayoutPredictResponse:
+    engine = (req.engine or TOP_LEVEL_LAYOUT_ENGINE or "core").strip().lower()
     checkpoint_path = _resolve_top_level_layout_checkpoint_path(req.checkpoint)
+    core_checkpoint = _resolve_top_level_layout_core_checkpoint_path(req.checkpoint if engine == "core" else None)
     retrieval_path = _resolve_top_level_layout_retrieval_records_path(None)
-    if not checkpoint_path.exists():
+    ralf_checkpoint = _resolve_top_level_layout_ralf_checkpoint_path(req.checkpoint if engine == "ralf" else None)
+    ralf_records = _resolve_top_level_layout_ralf_records_path(None)
+    ralf_index = _resolve_top_level_layout_ralf_index_path(None)
+    if engine == "model" and not checkpoint_path.exists():
         raise HTTPException(
             status_code=503,
             detail=f"Top-level layout checkpoint not found: {checkpoint_path}",
         )
+    if engine == "core" and not core_checkpoint.exists():
+        raise HTTPException(
+            status_code=503,
+            detail=f"CORE top-level layout checkpoint not found: {core_checkpoint}",
+        )
+    if not checkpoint_path.exists():
+        if engine not in {"ralf", "core"}:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Top-level layout checkpoint not found: {checkpoint_path}",
+            )
     retrieval_enabled = TOP_LEVEL_LAYOUT_RETRIEVAL_ENABLED if req.retrieval_enabled is None else req.retrieval_enabled
     retrieval_k = TOP_LEVEL_LAYOUT_RETRIEVAL_K if req.retrieval_k is None else req.retrieval_k
+    if engine == "ralf":
+        retrieval_k = TOP_LEVEL_LAYOUT_RALF_K if req.retrieval_k is None else req.retrieval_k
+        if not ralf_checkpoint.exists():
+            raise HTTPException(status_code=503, detail=f"RALF checkpoint not found: {ralf_checkpoint}")
+        if not ralf_index.exists() and not ralf_records.exists():
+            raise HTTPException(
+                status_code=503,
+                detail=f"RALF retrieval index not found: {ralf_index}; fallback records not found: {ralf_records}",
+            )
     try:
-        result = predict_top_level_layout_json(
-            semantic_json=req.semantic_json,
-            target_width=req.target_width,
-            target_height=req.target_height,
-            checkpoint_path=str(checkpoint_path),
-            device=TOP_LEVEL_LAYOUT_MODEL_DEVICE,
-            retrieval_enabled=retrieval_enabled,
-            retrieval_records_path=str(retrieval_path),
-            retrieval_k=retrieval_k,
-            retrieval_blend=TOP_LEVEL_LAYOUT_RETRIEVAL_BLEND,
-        )
+        if engine == "ralf":
+            result = predict_ralf_top_level_layout_json(
+                semantic_json=req.semantic_json,
+                target_width=req.target_width,
+                target_height=req.target_height,
+                checkpoint_path=str(ralf_checkpoint),
+                records_path=str(ralf_records),
+                index_path=str(ralf_index),
+                retrieval_k=retrieval_k,
+                device=TOP_LEVEL_LAYOUT_MODEL_DEVICE,
+            )
+        elif engine == "core":
+            result = predict_core_top_level_layout_json(
+                semantic_json=req.semantic_json,
+                target_width=req.target_width,
+                target_height=req.target_height,
+                checkpoint_path=str(core_checkpoint),
+                device=TOP_LEVEL_LAYOUT_MODEL_DEVICE,
+            )
+        else:
+            result = predict_top_level_layout_json(
+                semantic_json=req.semantic_json,
+                target_width=req.target_width,
+                target_height=req.target_height,
+                checkpoint_path=str(checkpoint_path),
+                device=TOP_LEVEL_LAYOUT_MODEL_DEVICE,
+                retrieval_enabled=retrieval_enabled,
+                retrieval_records_path=str(retrieval_path),
+                retrieval_k=retrieval_k,
+                retrieval_blend=TOP_LEVEL_LAYOUT_RETRIEVAL_BLEND,
+            )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except FileNotFoundError as exc:
@@ -2512,10 +2638,19 @@ async def figma_top_level_layout_predict(
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Top-level layout prediction failed: {exc}") from exc
+    debug = result.get("debug", {})
+    print(
+        "[top_level_layout_predict]"
+        f" requested_engine={engine}"
+        f" debug_engine={debug.get('engine')}"
+        f" checkpoint={debug.get('checkpoint')}"
+        f" retrieval_index_type={debug.get('retrieval_index_type')}",
+        flush=True,
+    )
     return FigmaTopLevelLayoutPredictResponse(
         final_json=result["final_json"],
         warnings=result.get("warnings", []),
-        debug=result.get("debug", {}),
+        debug=debug,
     )
 
 

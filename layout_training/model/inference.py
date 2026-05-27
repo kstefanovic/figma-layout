@@ -174,7 +174,7 @@ def predict_top_level_layout_json(
         warnings=warnings,
     )
     debug = {
-        "engine": "ralf_top_level_layout_v1",
+        "engine": "top_level_layout_transformer_v1",
         "checkpoint": str(bundle["checkpoint_path"]),
         "target_width": int(target_width),
         "target_height": int(target_height),

@@ -24,6 +24,14 @@ module.exports = {
       kill_timeout: 5000,
       env: {
         PYTHONUNBUFFERED: "1",
+        BACKEND_PORT: "20001",
+        TOP_LEVEL_LAYOUT_ENGINE: "ralf",
+        TOP_LEVEL_LAYOUT_RALF_CHECKPOINT:
+          "layout_training/checkpoints/top_level_layout_ralf_v1.pt",
+        TOP_LEVEL_LAYOUT_RALF_INDEX:
+          "layout_training/data/layout_records/top_level_retrieval_index.pt",
+        TOP_LEVEL_LAYOUT_RALF_RECORDS:
+          "layout_training/data/layout_records/top_level_records.jsonl",
       },
     },
   ],
